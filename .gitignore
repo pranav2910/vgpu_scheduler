@@ -50,3 +50,10 @@ vendor/
 
 # Concatenated source dumps (regenerate as needed)
 ycombinator_debug.txt
+
+# More backup directory patterns (Phase 2.2a era)
+.phase22a_*/
+.pluginfix_*/
+.layer2_*/
+.l2_*/
+.holdback_*/
