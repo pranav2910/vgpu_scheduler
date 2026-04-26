@@ -36,16 +36,6 @@ func NewSliceScheduler(cache *VRAMCache, k8sClient client.Client) *SliceSchedule
 func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, sliceUID string, reqBytes int64, bestEffort bool) (string, error) {
 	log.Printf("Scheduling cycle started for Slice %s (req: %d bytes)", nn, reqBytes)
 
-	// Layer 2 Phase 2.2a: enforce VGPUQuota before searching for nodes.
-	// "no quota = unlimited" — Check returns allowed=true when no quota matches.
-	if s.QuotaChecker != nil {
-		if ok, reason, msg := s.QuotaChecker.Check(ctx, nn.Namespace, reqBytes); !ok {
-			log.Printf("Scheduling rejected for Slice %s by quota: %s — %s",
-				nn, reason, msg)
-			return "", &SchedulingError{Reason: reason, Message: msg}
-		}
-	}
-
 	var validNodes []string
 	for _, node := range s.Cache.ListNodes() {
 		fits, _, _ := s.Cache.CanFit(node, reqBytes)

@@ -64,14 +64,6 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		log.Fatalf("setting up VGPUJobReconciler: %v", err)
 	}
-
-	// Layer 2 Phase 2.2a: VGPUQuotaReconciler refreshes namespace usage every 30s.
-	if err := (&controller.VGPUQuotaReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		log.Fatalf("setting up VGPUQuotaReconciler: %v", err)
-	}
 	if err := (&controller.VGPUSliceReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 		log.Fatalf("setting up VGPUSlice reconciler: %v", err)
 	}

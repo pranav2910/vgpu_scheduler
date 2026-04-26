@@ -57,8 +57,6 @@ func main() {
 
 	cache := scheduler.NewVRAMCache()
 	sched := scheduler.NewSliceScheduler(cache, mgr.GetClient())
-	// Layer 2 Phase 2.2a: wire VGPUQuota enforcement.
-	sched.SetQuotaChecker(scheduler.NewQuotaChecker(mgr.GetClient()))
 
 	// Bug D fix: seed the cache as a Runnable so it fires AFTER the informer
 	// cache has synced. Calling mgr.GetClient() before mgr.Start() blocks.
@@ -325,24 +323,12 @@ func makePriorityFunc(c client.Client) func(reconcile.Request) int {
 			}
 		}
 
-		// Layer 2 Phase 2.2a: bounded wait-time aging.
-		// Older pending slices gain priority over time so they don't get
-		// permanently starved. +1 priority per 30 seconds waited, capped at +50.
-		age := time.Since(slice.CreationTimestamp.Time)
-		agingBonus := int(age.Seconds() / 30)
-		if agingBonus > 50 {
-			agingBonus = 50
-		}
-		finalPriority := basePriority + agingBonus
-
 		if basePriority == pq.PriorityGuaranteed {
-			log.Printf("[priorityFn] %s/%s: tier=Guaranteed base=%d aging=%d → priority=%d",
-				req.Namespace, req.Name, basePriority, agingBonus, finalPriority)
+			log.Printf("[priorityFn] %s/%s: tier=Guaranteed → priority=%d", req.Namespace, req.Name, basePriority)
 		} else {
-			log.Printf("[priorityFn] %s/%s: tier=BestEffort base=%d aging=%d → priority=%d",
-				req.Namespace, req.Name, basePriority, agingBonus, finalPriority)
+			log.Printf("[priorityFn] %s/%s: tier=BestEffort → priority=%d", req.Namespace, req.Name, basePriority)
 		}
-		return finalPriority
+		return basePriority
 	}
 }
 

@@ -1,0 +1,70 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vgpuquotas.infrastructure.pranav2910.com
+spec:
+  group: infrastructure.pranav2910.com
+  names:
+    kind: VGPUQuota
+    listKind: VGPUQuotaList
+    plural: vgpuquotas
+    singular: vgpuquota
+    shortNames:
+      - vquota
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetNamespace, maxVramBytes]
+              properties:
+                targetNamespace:
+                  type: string
+                  minLength: 1
+                maxVramBytes:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                description:
+                  type: string
+            status:
+              type: object
+              properties:
+                usedVramBytes:
+                  type: integer
+                  format: int64
+                lastUpdated:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+                      observedGeneration: { type: integer }
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Namespace
+          type: string
+          jsonPath: .spec.targetNamespace
+        - name: Max
+          type: integer
+          jsonPath: .spec.maxVramBytes
+        - name: Used
+          type: integer
+          jsonPath: .status.usedVramBytes
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
