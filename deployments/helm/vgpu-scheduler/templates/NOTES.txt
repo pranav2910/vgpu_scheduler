@@ -1,0 +1,6 @@
+vGPU scheduler installed.
+
+The CRDs, RBAC, Deployments, DaemonSet, Service, and webhook configs are
+all template-rendered from values.yaml. The legitimate source of truth for
+the manifests is deployments/manifests/ — the templates wrap those with
+a Release.Namespace override.

@@ -1,0 +1,14 @@
+# Pinned Go toolchain for reproducible builds.
+FROM golang:1.25.0-bookworm AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o scheduler ./cmd/scheduler/main.go
+
+# Distroless nonroot: UID 65532 is pre-defined, no shell, minimal attack surface.
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /
+COPY --from=builder /app/scheduler /scheduler
+USER 65532:65532
+ENTRYPOINT ["/scheduler"]

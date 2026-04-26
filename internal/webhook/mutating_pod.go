@@ -1,0 +1,88 @@
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/pranav2910/vgpu-scheduler/internal/security"
+)
+
+const (
+	// VGPUClaimAnnotation carries the claim name the pod is bound to.
+	VGPUClaimAnnotation = "infrastructure.pranav2910.com/claim-ref"
+	// VGPUClaimLabel is the K8s label used by the webhook's objectSelector.
+	// Required because admission webhooks can only select on labels, not annotations.
+	VGPUClaimLabel = "vgpu-claim"
+	// CDIAnnotationPrefix is the containerd CDI injection annotation prefix.
+	// Bug #39: we inject via the CDI annotation that containerd honours,
+	// not via NVIDIA_VISIBLE_DEVICES (the legacy container-toolkit path).
+	CDIAnnotationKey = "cdi.k8s.io/vgpu-pranav2910-com"
+)
+
+// PodMutator carries a K8s client so the webhook can resolve the bound slice.
+type PodMutator struct {
+	Client client.Client
+}
+
+// MutatePod injects the CDI device reference resolved from the bound slice.
+func (m *PodMutator) MutatePod(ctx context.Context, pod *corev1.Pod) error {
+	// Claim can come from an annotation (preferred, carries the name) or
+	// from the matching label (which only asserts "this pod wants a vGPU").
+	claimName, exists := pod.Annotations[VGPUClaimAnnotation]
+	if !exists {
+		// Fall back to the label — in which case the label value IS the claim name.
+		claimName = pod.Labels[VGPUClaimLabel]
+	}
+	if claimName == "" {
+		return nil
+	}
+
+	if err := security.ValidatePodSecurity(pod); err != nil {
+		return err
+	}
+	if m.Client == nil {
+		return fmt.Errorf("pod mutator not wired with a K8s client")
+	}
+
+	sliceName := claimName + "-slice"
+	var slice vgpuv1alpha1.VGPUSlice
+	if err := m.Client.Get(ctx, types.NamespacedName{Name: sliceName, Namespace: pod.Namespace}, &slice); err != nil {
+		return fmt.Errorf("resolving vGPU slice %s/%s: %w", pod.Namespace, sliceName, err)
+	}
+	if slice.Status.AllocationID == "" {
+		return fmt.Errorf("vGPU slice %s/%s not yet allocated (phase=%s)", pod.Namespace, sliceName, slice.Status.Phase)
+	}
+
+	// Bug #39: CDI injection via annotation, not env var.
+	// Format: "<vendor>/<class>=<device-name>"
+	cdiDevice := fmt.Sprintf("infrastructure.pranav2910.com/vgpu=%s", slice.Status.AllocationID)
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	// Merge with any existing CDI annotation value.
+	if existing, ok := pod.Annotations[CDIAnnotationKey]; ok && existing != "" {
+		pod.Annotations[CDIAnnotationKey] = existing + "," + cdiDevice
+	} else {
+		pod.Annotations[CDIAnnotationKey] = cdiDevice
+	}
+
+	// Also surface the allocation for workloads that want to read it.
+	// Informational only — not used for device binding.
+	payload, _ := json.Marshal(map[string]string{
+		"allocationId": slice.Status.AllocationID,
+		"deviceUuid":   slice.Status.DeviceUUID,
+		"sliceName":    slice.Name,
+	})
+	pod.Annotations["infrastructure.pranav2910.com/allocation-info"] = string(payload)
+
+	log.Printf("Pod %s/%s mutated for vGPU claim %s (alloc=%s)",
+		pod.Namespace, pod.Name, claimName, slice.Status.AllocationID)
+	return nil
+}

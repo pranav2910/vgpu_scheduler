@@ -1,0 +1,52 @@
+# Build artifacts
+bin/
+*.log
+*.tar
+*.tar.gz
+*.zip
+
+# Backup directories from fix scripts (auto-generated, redundant)
+.bug_fix_backup_*/
+.bugfix-backup/
+.cachefix_*/
+.flagfix_*/
+.holdback_*/
+.layer2_*/
+.layer3_backup_*/
+.metrics_patch_backup_*/
+.fix_backup_*/
+.fix_runtime_backup_*/
+.testfix_*/
+.pqfix_*/
+.pqdebug_*/
+.rbacfix_*/
+.rbacfix2_*/
+
+# Test result files
+test_results*.txt
+test_followups_results.txt
+layer2_apply.log
+pq_apply.log
+
+# Editor / OS
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.Zone.Identifier
+
+# Go
+vendor/
+
+# Credentials (defensive — shouldn't be there but just in case)
+*.pem
+*.key
+*.crt
+
+# Windows download metadata
+*Zone.Identifier
+
+# Concatenated source dumps (regenerate as needed)
+ycombinator_debug.txt

@@ -1,0 +1,25 @@
+# Requires cert-manager to be installed. If you aren't using cert-manager,
+# generate a cert out-of-band and create a TLS secret named
+# "vgpu-controller-webhook-cert" in the vgpu-system namespace manually.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: vgpu-selfsigned
+  namespace: vgpu-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: vgpu-controller-webhook
+  namespace: vgpu-system
+spec:
+  secretName: vgpu-controller-webhook-cert
+  issuerRef:
+    name: vgpu-selfsigned
+    kind: Issuer
+  dnsNames:
+    - vgpu-controller-webhook.vgpu-system.svc
+    - vgpu-controller-webhook.vgpu-system.svc.cluster.local

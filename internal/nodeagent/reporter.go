@@ -1,0 +1,58 @@
+package nodeagent
+
+import (
+	"context"
+	"fmt"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/nvml"
+	"github.com/pranav2910/vgpu-scheduler/internal/state"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// Reporter patches VGPUSlice status back to the Kubernetes API after each
+// hardware event. Bug #1 fix: previously the Update calls were commented out
+// and the entire lifecycle stalled at Scheduled.
+type Reporter struct {
+	client client.Client
+}
+
+func NewReporter(k8sClient client.Client) *Reporter {
+	return &Reporter{client: k8sClient}
+}
+
+// TransitionToAllocating is called by the Manager before it begins NVML work,
+// so the controller and operators can see that hardware allocation has started.
+func (r *Reporter) TransitionToAllocating(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
+	if err := state.TransitionSlicePhase(slice, state.SlicePhaseAllocating, "", "NodeAgent beginning hardware allocation"); err != nil {
+		return fmt.Errorf("state transition to Allocating: %w", err)
+	}
+	if r.client == nil {
+		return nil // test mode
+	}
+	return r.client.Status().Update(ctx, slice)
+}
+
+func (r *Reporter) ReportAllocationReady(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice, result *nvml.AllocationResult) error {
+	if err := state.MarkSliceReady(slice, result.AllocationID, result.DeviceUUID, result.AllocatedBytes); err != nil {
+		return fmt.Errorf("marking slice Ready: %w", err)
+	}
+	if r.client == nil {
+		return nil
+	}
+	return r.client.Status().Update(ctx, slice)
+}
+
+func (r *Reporter) ReportReleaseComplete(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
+	if err := state.TransitionSlicePhase(slice, state.SlicePhaseReleased, "CleanupComplete", "Hardware freed"); err != nil {
+		return fmt.Errorf("state transition to Released: %w", err)
+	}
+	// Invariant: Released slices must not retain any allocation info.
+	slice.Status.DeviceUUID = ""
+	slice.Status.AllocationID = ""
+	slice.Status.AllocatedBytes = 0
+	if r.client == nil {
+		return nil
+	}
+	return r.client.Status().Update(ctx, slice)
+}

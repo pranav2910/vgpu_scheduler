@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgpu-scheduler
+  namespace: vgpu-system
+  labels:
+    control-plane: vgpu-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: vgpu-scheduler
+  template:
+    metadata:
+      labels:
+        control-plane: vgpu-scheduler
+    spec:
+      serviceAccountName: vgpu-scheduler-sa
+      containers:
+      - name: manager
+        image: vgpu-scheduler:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi # Scheduler needs a bit more RAM for the in-memory cache
+          requests:
+            cpu: 100m
+            memory: 128Mi

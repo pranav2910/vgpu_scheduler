@@ -1,0 +1,22 @@
+# NodeAgent needs CGO for NVML. Use the bookworm-slim runtime with libnvidia-ml.
+FROM golang:1.25.0-bookworm AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# CGO enabled for the NVIDIA NVML bindings.
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o nodeagent ./cmd/nodeagent/main.go
+
+# Pinned debian slim for a stable runtime surface.
+FROM debian:bookworm-slim
+# Minimal tooling: ca-certificates for K8s API calls; runtime NVML injection
+# happens at daemon-set deployment time via the NVIDIA container toolkit.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+# Create a non-root user even though the daemonset runs privileged; this keeps
+# other code paths (health probes, init containers) from running as root.
+RUN useradd -u 65532 -M -N vgpu-nodeagent
+WORKDIR /
+COPY --from=builder /app/nodeagent /nodeagent
+ENTRYPOINT ["/nodeagent"]

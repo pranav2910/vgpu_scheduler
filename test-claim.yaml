@@ -1,0 +1,8 @@
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUClaim
+metadata:
+  name: test-llama-model
+  namespace: default
+spec:
+  requestedVramBytes: 8589934592   # 8 GiB
+  serviceTier: Guaranteed

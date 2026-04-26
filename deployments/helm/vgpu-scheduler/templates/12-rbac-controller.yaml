@@ -1,0 +1,39 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vgpu-controller-role
+rules:
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuclaims", "vgpuslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuclaims/status", "vgpuslices/status"]
+    verbs: ["get", "update", "patch"]
+  # Bug #17: finalizer subresource required for OwnerReferencesPermissionEnforcement.
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuclaims/finalizers", "vgpuslices/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Webhook needs to read pods (for the mutating admission path).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vgpu-controller-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vgpu-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: vgpu-controller-sa
+    namespace: vgpu-system

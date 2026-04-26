@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'vgpu-scheduler'
+    static_configs:
+      # This points to the port we exposed in our Go cmd/scheduler/main.go
+      - targets: ['host.docker.internal:8080'] 
