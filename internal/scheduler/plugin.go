@@ -16,6 +16,7 @@ import (
 // SliceScheduler is the stateful scheduling engine.
 type SliceScheduler struct {
 	QuotaChecker *QuotaChecker
+	Preemptor    *Preemptor
 	Cache     *VRAMCache
 	Reserver  *ReservationManager
 	K8sClient client.Client
@@ -56,6 +57,14 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 
 	if len(validNodes) == 0 {
 		telemetry.RecordScheduleAttempt(false)
+		// Layer 2 Phase 2.3: try preemption before declaring capacity failure.
+		if s.Preemptor != nil {
+			if plan, err := s.tryPreemptionForSlice(ctx, nn, reqBytes); err == nil && plan != nil {
+				return "", &PreemptionInProgressError{Plan: plan}
+			} else if err != nil {
+				log.Printf("[preemption] TryPreempt failed for %s: %v", nn, err)
+			}
+		}
 		return "", fmt.Errorf("no node has sufficient VRAM for %d bytes", reqBytes)
 	}
 
@@ -136,3 +145,32 @@ type SchedulingError struct {
 }
 
 func (e *SchedulingError) Error() string { return e.Reason + ": " + e.Message }
+
+// SetPreemptor wires preemption into the scheduler.
+func (s *SliceScheduler) SetPreemptor(p *Preemptor) {
+	s.Preemptor = p
+}
+
+// tryPreemptionForSlice resolves the requester's priority and invokes the
+// Preemptor. The Preemptor handles eligibility + victim selection + marking.
+func (s *SliceScheduler) tryPreemptionForSlice(ctx context.Context, nn types.NamespacedName, neededBytes int64) (*PreemptionPlan, error) {
+	var slice vgpuv1alpha1.VGPUSlice
+	if err := s.K8sClient.Get(ctx, nn, &slice); err != nil {
+		return nil, err
+	}
+
+	var requesterPriority int32 = 50
+	var claim vgpuv1alpha1.VGPUClaim
+	if slice.Spec.ClaimRef != "" {
+		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: slice.Namespace, Name: slice.Spec.ClaimRef}, &claim); err == nil {
+			if claim.Spec.JobRef != "" {
+				var job vgpuv1alpha1.VGPUJob
+				if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: slice.Namespace, Name: claim.Spec.JobRef}, &job); err == nil {
+					requesterPriority = job.Spec.Priority
+				}
+			}
+		}
+	}
+
+	return s.Preemptor.TryPreempt(ctx, &slice, requesterPriority, &claim, neededBytes)
+}

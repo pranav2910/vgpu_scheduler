@@ -60,6 +60,14 @@ type VGPUJobSpec struct {
 	// +kubebuilder:default=false
 	Preemptible bool `json:"preemptible,omitempty"`
 
+	// PreemptionGraceSeconds is how long a victim slice stays in the
+	// Preempting phase before being deleted. Used only when Preemptible=true.
+	// Default: 30 seconds. Range: 1-3600 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	PreemptionGraceSeconds *int32 `json:"preemptionGraceSeconds,omitempty"`
+
 	// ClaimTemplate is the VGPUClaim that this Job will materialize.
 	ClaimTemplate VGPUClaimTemplate `json:"claimTemplate"`
 }
@@ -151,3 +159,24 @@ func (l *VGPUJobList) DeepCopyInto(out *VGPUJobList) {
 		}
 	}
 }
+
+// DeepCopy returns a deep copy of VGPUJob.
+func (j *VGPUJob) DeepCopy() *VGPUJob {
+	if j == nil {
+		return nil
+	}
+	out := new(VGPUJob)
+	j.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopy returns a deep copy of VGPUJobList.
+func (l *VGPUJobList) DeepCopy() *VGPUJobList {
+	if l == nil {
+		return nil
+	}
+	out := new(VGPUJobList)
+	l.DeepCopyInto(out)
+	return out
+}
+

@@ -41,6 +41,11 @@ spec:
                 preemptible:
                   type: boolean
                   default: false
+                preemptionGraceSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 3600
+                  default: 30
                 claimTemplate:
                   type: object
                   required:

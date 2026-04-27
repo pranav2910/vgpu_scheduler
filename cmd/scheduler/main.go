@@ -60,6 +60,9 @@ func main() {
 	// Layer 2 Phase 2.2a: wire VGPUQuota enforcement.
 	sched.SetQuotaChecker(scheduler.NewQuotaChecker(mgr.GetClient()))
 
+	// Layer 2 Phase 2.3: wire preemption.
+	sched.SetPreemptor(scheduler.NewPreemptor(mgr.GetClient()))
+
 	// Bug D fix: seed the cache as a Runnable so it fires AFTER the informer
 	// cache has synced. Calling mgr.GetClient() before mgr.Start() blocks.
 	if err := mgr.Add(&seedRunnable{client: mgr.GetClient(), cache: cache}); err != nil {

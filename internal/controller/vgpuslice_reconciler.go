@@ -35,6 +35,48 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, fmt.Errorf("fetching VGPUSlice: %w", err)
 	}
 
+	// Layer 2 Phase 2.3: Preempting phase has its own lifecycle.
+	// Honour per-Job grace period (default 30s, configurable up to 3600s),
+	// then transition to Released so existing cleanup runs.
+	if string(slice.Status.Phase) == "Preempting" {
+		grace := 30 * time.Second
+		if slice.Spec.ClaimRef != "" {
+			var claim vgpuv1alpha1.VGPUClaim
+			if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: slice.Spec.ClaimRef}, &claim); err == nil {
+				if claim.Spec.JobRef != "" {
+					var job vgpuv1alpha1.VGPUJob
+					if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: claim.Spec.JobRef}, &job); err == nil {
+						if job.Spec.PreemptionGraceSeconds != nil && *job.Spec.PreemptionGraceSeconds > 0 {
+							grace = time.Duration(*job.Spec.PreemptionGraceSeconds) * time.Second
+						}
+					}
+				}
+			}
+		}
+		var since time.Time
+		for _, c := range slice.Status.Conditions {
+			if c.Type == "Preempting" {
+				since = c.LastTransitionTime.Time
+				break
+			}
+		}
+		if since.IsZero() {
+			since = time.Now()
+		}
+		elapsed := time.Since(since)
+		if elapsed < grace {
+			remaining := grace - elapsed
+			log.Printf("[preempting] %s/%s grace remaining %v", slice.Namespace, slice.Name, remaining.Round(time.Second))
+			return reconcile.Result{RequeueAfter: remaining}, nil
+		}
+		log.Printf("[preempting] %s/%s grace expired -> Released", slice.Namespace, slice.Name)
+		slice.Status.Phase = state.SlicePhaseReleased
+		if err := r.Client.Status().Update(ctx, &slice); err != nil {
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{Requeue: true}, nil
+	}
+
 	if err := r.reconcileSlice(ctx, &slice); err != nil {
 		return reconcile.Result{}, err
 	}

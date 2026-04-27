@@ -57,3 +57,23 @@ ycombinator_debug.txt
 .layer2_*/
 .l2_*/
 .holdback_*/
+
+# Phase 2.3 fix backup directories
+.preemptdedup_*/
+.preempt2_*/
+.toctou_*/
+.claimfix_*/
+.phase23fix3_*/
+
+# Phase 2.3 backup directories (created by fix scripts)
+.phase23*/
+.phase22*/
+.preempt*/
+.toctou*/
+.claimfix*/
+.pluginfix*/
+.rbacfix*/
+.preemptdedup*/
+
+# Local build artifacts
+bin/

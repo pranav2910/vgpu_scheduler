@@ -81,3 +81,6 @@ type VGPUSliceList struct {
 func init() {
 	SchemeBuilder.Register(&VGPUSlice{}, &VGPUSliceList{})
 }
+
+// PhasePreempting is the slice phase during graceful pre-eviction (Phase 2.3).
+const PhasePreempting = "Preempting"

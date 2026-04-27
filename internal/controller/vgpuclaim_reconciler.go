@@ -13,6 +13,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"time"
 )
 
 type VGPUClaimReconciler struct {
@@ -22,6 +23,11 @@ type VGPUClaimReconciler struct {
 func (r *VGPUClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vgpuv1alpha1.VGPUClaim{}).
+		// Bug fix: watch derived slices so a slice deletion fires a claim
+		// reconcile, allowing handleClaimDelete to remove the claim
+		// finalizer once its slice is gone. Without this, the claim
+		// orphans forever with claim-cleanup finalizer stuck.
+		Owns(&vgpuv1alpha1.VGPUSlice{}).
 		Complete(r)
 }
 
@@ -37,6 +43,24 @@ func (r *VGPUClaimReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	if err := r.reconcileClaim(ctx, &claim); err != nil {
 		return reconcile.Result{}, err
 	}
+
+	// Safety: if claim is mid-delete and still has its finalizer, requeue
+	// after 5s. The Owns(&VGPUSlice{}) watch should already fire on slice
+	// deletion, but this is a belt-and-suspenders cover for any edge case
+	// where the slice was already gone before our watch was active.
+	if !claim.DeletionTimestamp.IsZero() {
+		hasFinalizer := false
+		for _, f := range claim.Finalizers {
+			if f == ClaimFinalizerName {
+				hasFinalizer = true
+				break
+			}
+		}
+		if hasFinalizer {
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
 	return reconcile.Result{}, nil
 }
 

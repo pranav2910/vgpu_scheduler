@@ -114,3 +114,24 @@ func (l *VGPUQuotaList) DeepCopyInto(out *VGPUQuotaList) {
 		}
 	}
 }
+
+// DeepCopy returns a deep copy of VGPUQuota.
+func (q *VGPUQuota) DeepCopy() *VGPUQuota {
+	if q == nil {
+		return nil
+	}
+	out := new(VGPUQuota)
+	q.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopy returns a deep copy of VGPUQuotaList.
+func (l *VGPUQuotaList) DeepCopy() *VGPUQuotaList {
+	if l == nil {
+		return nil
+	}
+	out := new(VGPUQuotaList)
+	l.DeepCopyInto(out)
+	return out
+}
+
