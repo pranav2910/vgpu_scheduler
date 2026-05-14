@@ -76,12 +76,28 @@ func main() {
 		log.Fatalf("setting up VGPUSlice reconciler: %v", err)
 	}
 
+	// Layer 2 Phase 2.4a: gang scheduling.
+	if err := (&controller.VGPUGangJobReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Fatalf("setting up VGPUGangJobReconciler: %v", err)
+	}
+	if err := (&controller.VGPUGangReservationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Fatalf("setting up VGPUGangReservationReconciler: %v", err)
+	}
+
 	// Bug #16: register admission webhooks.
 	decoder := admission.NewDecoder(scheme)
 	mgr.GetWebhookServer().Register("/mutate-v1-pod",
 		&webhookserver.Admission{Handler: webhook.NewPodMutatorHandler(mgr.GetClient(), decoder)})
 	mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpuclaim",
 		&webhookserver.Admission{Handler: webhook.NewClaimValidatorHandler(decoder)})
+	mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpugangjob",
+		&webhookserver.Admission{Handler: webhook.NewGangJobValidatorHandler(decoder)})
 	log.Println("Webhook server registered on :9443")
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -381,3 +381,28 @@ func snapshotOf(node *NodeState) NodeSnapshot {
 		Healthy:            node.Healthy,
 	}
 }
+
+// IsAssumed reports whether sliceUID has a held speculative reservation.
+// Returns the held node and bytes for callers that want to rebuild a Tx.
+// Option B (hold-the-reservation gang gate).
+func (c *VRAMCache) IsAssumed(sliceUID string) (string, int64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if a, ok := c.assumedBySlice[sliceUID]; ok {
+		return a.NodeName, a.RequestedVRAMBytes, true
+	}
+	return "", 0, false
+}
+
+// RefreshAssumption extends ExpiresAt for an existing held reservation.
+// Returns true if the slice was actually held (and refreshed), false if no
+// held reservation exists. Option B (hold-the-reservation gang gate).
+func (c *VRAMCache) RefreshAssumption(sliceUID string, ttl time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a, ok := c.assumedBySlice[sliceUID]; ok {
+		a.ExpiresAt = time.Now().Add(ttl)
+		return true
+	}
+	return false
+}

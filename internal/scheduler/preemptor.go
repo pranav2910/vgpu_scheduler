@@ -18,12 +18,15 @@ const (
 	PreemptionCooldown    = 60 * time.Second
 	PreemptionPriorityGap = int32(100)
 	DefaultGraceSeconds   = int32(30)
+	// MaxGraceSeconds bounds the in-flight window so a misconfigured
+	// VGPUJob can't lock out preemption for unbounded time.
+	MaxGraceSeconds = int32(3600)
 
-	// PreemptionInFlightWindow is how long after a plan was created we
-	// suppress new preemption attempts for the same requester. Set to
-	// MaxGraceSeconds + buffer; any preemption with a longer custom grace
-	// will still be correctly blocked because original victims remain in
-	// Preempting phase (not Ready) until they drain.
+	// PreemptionInFlightWindow is the *floor* on the dedup gate — short
+	// preemptions still get at least this much protection. The gate also
+	// considers the requester's actual grace setting (see
+	// effectiveInFlightWindow) so long-grace configs can't stack a
+	// second wave before victims have drained.
 	PreemptionInFlightWindow = 60 * time.Second
 
 	// AnnotationPreemptionTriggeredAt is set on a requester slice when its
@@ -34,11 +37,11 @@ const (
 
 // PreemptionPlan describes a planned eviction.
 type PreemptionPlan struct {
-	Requester    *vgpuv1alpha1.VGPUSlice
-	Victims      []VictimSelection
-	FreedBytes   int64
-	NeededBytes  int64
-	CreatedAt    time.Time
+	Requester   *vgpuv1alpha1.VGPUSlice
+	Victims     []VictimSelection
+	FreedBytes  int64
+	NeededBytes int64
+	CreatedAt   time.Time
 }
 
 // VictimSelection is one slice marked for eviction in a plan.
@@ -71,10 +74,22 @@ type Preemptor struct {
 
 // NewPreemptor constructs a Preemptor.
 func NewPreemptor(c client.Client) *Preemptor {
-	return &Preemptor{
+	p := &Preemptor{
 		client:   c,
 		cooldown: make(map[string]time.Time),
 	}
+	// Background reaper for stale cooldown entries. The map would
+	// otherwise grow unbounded over the scheduler's lifetime — every
+	// preempt pass adds entries and nothing was clearing them.
+	// Lives for the process; clean shutdown is a v0.2 concern.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			p.CleanupCooldown()
+		}
+	}()
+	return p
 }
 
 // TryPreempt attempts to free neededBytes of capacity by evicting eligible
@@ -284,6 +299,10 @@ func (p *Preemptor) TryPreempt(
 }
 
 func (p *Preemptor) markVictimsPreempting(ctx context.Context, plan *PreemptionPlan) error {
+	// Track successfully-marked victims so we can roll them back on partial
+	// failure. Without this, a mid-loop error would leave N-1 victims evicted
+	// for nothing.
+	marked := make([]int, 0, len(plan.Victims))
 	for i := range plan.Victims {
 		v := &plan.Victims[i]
 		key := client.ObjectKey{Namespace: v.Slice.Namespace, Name: v.Slice.Name}
@@ -300,9 +319,9 @@ func (p *Preemptor) markVictimsPreempting(ctx context.Context, plan *PreemptionP
 			fresh.Status.Phase = "Preempting"
 
 			cond := metav1.Condition{
-				Type:               "Preempting",
-				Status:             metav1.ConditionTrue,
-				Reason:             "HigherPriorityWorkload",
+				Type:   "Preempting",
+				Status: metav1.ConditionTrue,
+				Reason: "HigherPriorityWorkload",
 				Message: fmt.Sprintf("Preempted by %s/%s; grace=%ds",
 					plan.Requester.Namespace, plan.Requester.Name, v.GraceSeconds),
 				LastTransitionTime: metav1.Now(),
@@ -314,8 +333,13 @@ func (p *Preemptor) markVictimsPreempting(ctx context.Context, plan *PreemptionP
 		if err != nil {
 			log.Printf("[preemptor] failed to mark victim %s/%s: %v",
 				v.Slice.Namespace, v.Slice.Name, err)
+			// Roll back already-marked victims back to Ready (best-effort).
+			// If rollback also fails, the next reconcile will heal it once
+			// the in-flight annotation expires.
+			p.rollbackPreemptingMarks(ctx, plan.Victims, marked)
 			return err
 		}
+		marked = append(marked, i)
 	}
 	return nil
 }
@@ -332,10 +356,11 @@ func upsertCondition(conds []metav1.Condition, c metav1.Condition) []metav1.Cond
 
 // claimPlanOwnership atomically reserves the right to generate a preemption
 // plan for this requester. Returns:
-//   (true,  nil) — we won the race and stamped the annotation; proceed.
-//   (false, nil) — another reconcile already has a fresh annotation; skip.
-//   (false, err) — resource changed under us (conflict) or other error;
-//                  caller should treat this as "skip to be safe".
+//
+//	(true,  nil) — we won the race and stamped the annotation; proceed.
+//	(false, nil) — another reconcile already has a fresh annotation; skip.
+//	(false, err) — resource changed under us (conflict) or other error;
+//	               caller should treat this as "skip to be safe".
 //
 // This is the atomic alternative to a separate read-then-stamp dedup,
 // which had a TOCTOU race window where two concurrent reconciles could
@@ -351,7 +376,7 @@ func (p *Preemptor) claimPlanOwnership(ctx context.Context, requester *vgpuv1alp
 	if fresh.Annotations != nil {
 		if ts, ok := fresh.Annotations[AnnotationPreemptionTriggeredAt]; ok {
 			if t, perr := time.Parse(time.RFC3339, ts); perr == nil {
-				if time.Since(t) < PreemptionInFlightWindow {
+				if time.Since(t) < p.effectiveInFlightWindow(ctx, requester) {
 					return false, nil
 				}
 			}
@@ -384,4 +409,79 @@ func (p *Preemptor) CleanupCooldown() {
 			delete(p.cooldown, k)
 		}
 	}
+}
+
+// rollbackPreemptingMarks reverts already-marked victims from Preempting
+// back to Ready. Called when markVictimsPreempting fails partway through.
+// Best-effort: failures are logged but not propagated, since the caller
+// is already returning an error and the in-flight annotation will expire,
+// allowing the next reconcile to retry cleanly.
+func (p *Preemptor) rollbackPreemptingMarks(ctx context.Context, victims []VictimSelection, indices []int) {
+	for _, idx := range indices {
+		v := &victims[idx]
+		key := client.ObjectKey{Namespace: v.Slice.Namespace, Name: v.Slice.Name}
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var fresh vgpuv1alpha1.VGPUSlice
+			if err := p.client.Get(ctx, key, &fresh); err != nil {
+				return err
+			}
+			if fresh.Status.Phase != "Preempting" {
+				return nil // someone else already moved it
+			}
+			fresh.Status.Phase = "Ready"
+			// Strip the Preempting condition we added.
+			out := fresh.Status.Conditions[:0]
+			for _, c := range fresh.Status.Conditions {
+				if c.Type != "Preempting" {
+					out = append(out, c)
+				}
+			}
+			fresh.Status.Conditions = out
+			return p.client.Status().Update(ctx, &fresh)
+		})
+		if err != nil {
+			log.Printf("[preemptor] WARN: rollback of victim %s/%s failed: %v (will heal on next reconcile)",
+				v.Slice.Namespace, v.Slice.Name, err)
+		}
+	}
+}
+
+// effectiveInFlightWindow returns the dedup-gate duration for this requester.
+// PreemptionInFlightWindow is a floor; the actual window is the longer of
+// that floor and the longest grace period configured on any preemptible
+// VGPUJob in the requester's namespace, plus a 30-second buffer.
+//
+// Without this, a job with grace=600s could be the victim of a preemption,
+// and 60s later (when the static window expired) a second preemption wave
+// could fire on top of the first while the original victims were still
+// draining.
+func (p *Preemptor) effectiveInFlightWindow(ctx context.Context, requester *vgpuv1alpha1.VGPUSlice) time.Duration {
+	floor := PreemptionInFlightWindow
+
+	var jobs vgpuv1alpha1.VGPUJobList
+	if err := p.client.List(ctx, &jobs, client.InNamespace(requester.Namespace)); err != nil {
+		return floor
+	}
+	maxGrace := DefaultGraceSeconds
+	for i := range jobs.Items {
+		j := &jobs.Items[i]
+		if !j.Spec.Preemptible {
+			continue
+		}
+		grace := DefaultGraceSeconds
+		if j.Spec.PreemptionGraceSeconds != nil {
+			grace = *j.Spec.PreemptionGraceSeconds
+		}
+		if grace > MaxGraceSeconds {
+			grace = MaxGraceSeconds
+		}
+		if grace > maxGrace {
+			maxGrace = grace
+		}
+	}
+	dynamic := time.Duration(maxGrace+30) * time.Second
+	if dynamic > floor {
+		return dynamic
+	}
+	return floor
 }

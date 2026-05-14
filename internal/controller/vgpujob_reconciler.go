@@ -81,11 +81,13 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 // createClaim materializes the VGPUClaim from the Job's claimTemplate and
 // sets OwnerReference for cascade-delete. JobRef is stamped in spec for
 // the scheduler to walk back to the Job during scoring.
+// gang-wiring fix applied: propagate gang annotations from Job to Claim.
 func (r *VGPUJobReconciler) createClaim(ctx context.Context, job *vgpuv1alpha1.VGPUJob) error {
 	claim := &vgpuv1alpha1.VGPUClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      claimNameForJob(job.Name),
-			Namespace: job.Namespace,
+			Name:        claimNameForJob(job.Name),
+			Namespace:   job.Namespace,
+			Annotations: FilterGangAnnotations(job.Annotations),
 		},
 		Spec: job.Spec.ClaimTemplate.Spec,
 	}

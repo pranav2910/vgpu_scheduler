@@ -16,6 +16,12 @@ rules:
   - apiGroups: ["infrastructure.pranav2910.com"]
     resources: ["vgpuquotas"]
     verbs: ["get", "list", "watch"]
+  # gang-wiring fix: scheduler reads VGPUGangReservation via the gang gate.
+  # controller-runtime's typed client requires list+watch for the informer
+  # cache; without these the cache sync hangs and no reconciler runs.
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpugangreservations"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["infrastructure.pranav2910.com"]
     resources: ["vgpuslices/status"]
     verbs: ["get", "patch", "update"]

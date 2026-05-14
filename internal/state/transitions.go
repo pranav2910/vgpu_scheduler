@@ -10,11 +10,12 @@ import (
 
 // legalSliceTransitions is the absolute DAG for the system.
 var legalSliceTransitions = map[string]map[string]bool{
-	"":                   {SlicePhasePending: true, SlicePhaseReleasing: true},
-	SlicePhasePending:    {SlicePhaseScheduled: true, SlicePhaseReleasing: true, SlicePhaseFailed: true},
+	// state-machine fix applied: tightened DAG
+	"":                   {SlicePhasePending: true},
+	SlicePhasePending:    {SlicePhaseScheduled: true, SlicePhaseFailed: true},
 	SlicePhaseScheduled:  {SlicePhaseAllocating: true, SlicePhaseFailed: true, SlicePhaseReleasing: true},
 	SlicePhaseAllocating: {SlicePhaseReady: true, SlicePhaseFailed: true, SlicePhaseReleasing: true},
-	SlicePhaseReady:      {SlicePhaseReleasing: true, SlicePhaseReleased: true, SlicePhaseFailed: true},
+	SlicePhaseReady:      {SlicePhaseReleasing: true, SlicePhaseFailed: true},
 	SlicePhaseReleasing:  {SlicePhaseReleased: true, SlicePhaseFailed: true},
 	SlicePhaseReleased:   {},                          // Terminal state
 	SlicePhaseFailed:     {SlicePhaseReleasing: true}, // Failed is terminal-except-release; retry requires a backoff counter in spec (not implemented yet)

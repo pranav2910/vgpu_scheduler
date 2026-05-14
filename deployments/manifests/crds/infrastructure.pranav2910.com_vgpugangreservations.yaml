@@ -1,0 +1,103 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vgpugangreservations.infrastructure.pranav2910.com
+spec:
+  group: infrastructure.pranav2910.com
+  names:
+    kind: VGPUGangReservation
+    listKind: VGPUGangReservationList
+    plural: vgpugangreservations
+    singular: vgpugangreservation
+    shortNames:
+      - vrsv
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - gangRef
+                - gangSize
+                - childClaims
+              properties:
+                gangRef:
+                  type: string
+                gangSize:
+                  type: integer
+                  minimum: 2
+                  maximum: 256
+                childClaims:
+                  type: array
+                  items:
+                    type: string
+                deadlineSeconds:
+                  type: integer
+                  minimum: 10
+                  maximum: 600
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                reservedSlots:
+                  type: integer
+                failedSlots:
+                  type: integer
+                committedSlots:
+                  type: integer
+                perSliceState:
+                  type: object
+                  additionalProperties:
+                    type: string
+                firstReservingTime:
+                  type: string
+                  format: date-time
+                failureReason:
+                  type: string
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+                      observedGeneration: { type: integer }
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Gang
+          type: string
+          jsonPath: .spec.gangRef
+        - name: Size
+          type: integer
+          jsonPath: .spec.gangSize
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Reserved
+          type: integer
+          jsonPath: .status.reservedSlots
+        - name: Failed
+          type: integer
+          jsonPath: .status.failedSlots
+        - name: Committed
+          type: integer
+          jsonPath: .status.committedSlots
+        - name: Reason
+          type: string
+          jsonPath: .status.failureReason
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

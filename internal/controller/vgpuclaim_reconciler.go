@@ -7,9 +7,9 @@ import (
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/state"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -97,10 +97,12 @@ func (r *VGPUClaimReconciler) ensureSliceExists(ctx context.Context, claim *vgpu
 	// OwnerReference so Kubernetes GC propagates correctly and the claim
 	// cannot vanish before the slice's finalizer runs.
 	truePtr := true
+	// gang-wiring fix applied: propagate gang annotations from Claim to Slice.
 	slice := &vgpuv1alpha1.VGPUSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sliceName,
-			Namespace: claim.Namespace,
+			Name:        sliceName,
+			Namespace:   claim.Namespace,
+			Annotations: FilterGangAnnotations(claim.Annotations),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion:         vgpuv1alpha1.GroupVersion.String(),

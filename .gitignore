@@ -77,3 +77,7 @@ ycombinator_debug.txt
 
 # Local build artifacts
 bin/
+
+# Session artifacts
+*.bak.*
+real_world_report.md

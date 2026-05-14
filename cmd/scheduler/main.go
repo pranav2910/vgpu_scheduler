@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -62,6 +63,10 @@ func main() {
 
 	// Layer 2 Phase 2.3: wire preemption.
 	sched.SetPreemptor(scheduler.NewPreemptor(mgr.GetClient()))
+
+	// gang-wiring fix applied: wire the GangBindingGate so Schedule()
+	// actually consults gang state before binding.
+	sched.GangGate = scheduler.NewGangBindingGate(mgr.GetClient())
 
 	// Bug D fix: seed the cache as a Runnable so it fires AFTER the informer
 	// cache has synced. Calling mgr.GetClient() before mgr.Start() blocks.
@@ -174,6 +179,29 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 		return reconcile.Result{}, nil
 	}
 
+	// Bug 6 fix: if this slice belongs to a gang whose reservation has Failed,
+	// transition the slice to Failed phase immediately. Without this the slice
+	// stays in Pending forever; the priority queue keeps re-enqueueing it; the
+	// gang gate keeps rejecting it; capacity is held by ghost slices.
+	if slice.Annotations != nil {
+		if rsvName, ok := slice.Annotations[vgpuv1alpha1.AnnotationReservationRef]; ok && rsvName != "" {
+			var rsv vgpuv1alpha1.VGPUGangReservation
+			if err := r.client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: rsvName}, &rsv); err == nil {
+				if rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseFailed ||
+					rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseReleased {
+					log.Printf("[scheduler] Slice %s/%s belongs to dead gang reservation %s — marking Failed",
+						slice.Namespace, slice.Name, rsvName)
+					slice.Status.Phase = vgpuv1alpha1.VGPUSlicePhase("Failed")
+					slice.Status.LastError = "gang reservation failed; this slot was orphaned"
+					if err := r.client.Status().Update(ctx, &slice); err != nil {
+						return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+					}
+					return reconcile.Result{}, nil
+				}
+			}
+		}
+	}
+
 	bestEffort := false
 	// Resolve ServiceTier from the parent claim if present. Bug #19.
 	if slice.Spec.ClaimRef != "" {
@@ -204,7 +232,14 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 
 	_, err := r.sched.Schedule(ctx, req.NamespacedName, string(slice.UID), slice.Spec.RequestedVRAMBytes, bestEffort)
 	if err != nil {
-		// Bug F fix: requeue instead of silently dropping the slice.
+		// gang-wiring fix applied: a gang member that hit "deferred" is
+		// waiting for siblings to reach Reserved. Retry quickly (500ms)
+		// so up to ~120 retries fit within the 60s reservation deadline.
+		// Other errors keep the existing 30s backoff.
+		var gd *scheduler.GangDeferredError
+		if errors.As(err, &gd) {
+			return reconcile.Result{RequeueAfter: 500 * time.Millisecond}, nil
+		}
 		log.Printf("Scheduling failed for Slice %s/%s: %v — will retry in 30s",
 			slice.Namespace, slice.Name, err)
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
@@ -271,7 +306,6 @@ func seedCacheFromNodes(ctx context.Context, k8sClient client.Client, cache *sch
 	}
 	return nil
 }
-
 
 // ─── Priority queue plumbing ────────────────────────────────────────────────
 
@@ -384,8 +418,8 @@ type queueAdapter struct {
 	q *pq.Queue
 }
 
-func (a *queueAdapter) Add(item reconcile.Request)                              { a.q.Add(item) }
-func (a *queueAdapter) Len() int                                                { return a.q.Len() }
+func (a *queueAdapter) Add(item reconcile.Request) { a.q.Add(item) }
+func (a *queueAdapter) Len() int                   { return a.q.Len() }
 func (a *queueAdapter) Get() (item reconcile.Request, shutdown bool) {
 	got, shut := a.q.Get()
 	if shut || got == nil {
@@ -393,14 +427,16 @@ func (a *queueAdapter) Get() (item reconcile.Request, shutdown bool) {
 	}
 	return got.(reconcile.Request), false
 }
-func (a *queueAdapter) Done(item reconcile.Request)                             { a.q.Done(item) }
-func (a *queueAdapter) ShutDown()                                               { a.q.ShutDown() }
-func (a *queueAdapter) ShutDownWithDrain()                                      { a.q.ShutDownWithDrain() }
-func (a *queueAdapter) ShuttingDown() bool                                      { return a.q.ShuttingDown() }
-func (a *queueAdapter) AddAfter(item reconcile.Request, after time.Duration)    { a.q.AddAfter(item, after) }
-func (a *queueAdapter) AddRateLimited(item reconcile.Request)                   { a.q.AddRateLimited(item) }
-func (a *queueAdapter) Forget(item reconcile.Request)                           { a.q.Forget(item) }
-func (a *queueAdapter) NumRequeues(item reconcile.Request) int                  { return a.q.NumRequeues(item) }
+func (a *queueAdapter) Done(item reconcile.Request) { a.q.Done(item) }
+func (a *queueAdapter) ShutDown()                   { a.q.ShutDown() }
+func (a *queueAdapter) ShutDownWithDrain()          { a.q.ShutDownWithDrain() }
+func (a *queueAdapter) ShuttingDown() bool          { return a.q.ShuttingDown() }
+func (a *queueAdapter) AddAfter(item reconcile.Request, after time.Duration) {
+	a.q.AddAfter(item, after)
+}
+func (a *queueAdapter) AddRateLimited(item reconcile.Request)  { a.q.AddRateLimited(item) }
+func (a *queueAdapter) Forget(item reconcile.Request)          { a.q.Forget(item) }
+func (a *queueAdapter) NumRequeues(item reconcile.Request) int { return a.q.NumRequeues(item) }
 
 // suppress unused-import warnings if the helpers are added but unused.
 var _ = fmt.Sprintf

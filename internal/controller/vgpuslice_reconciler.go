@@ -117,6 +117,38 @@ func (r *VGPUSliceReconciler) handleDelete(ctx context.Context, slice *vgpuv1alp
 
 	currentPhase := string(slice.Status.Phase)
 
+	// releasing-orphan fix applied: extended "neverBound" to also catch
+	// slices stuck in Releasing/Scheduled phases with no AllocationID.
+	// These slices were bound (assigned a nodeName) but the NodeAgent
+	// never allocated hardware for them — either because the gang failed
+	// at deadline and tearDown deleted the slice before NodeAgent
+	// processed it, or because something else interrupted the bind →
+	// allocate transition. The NodeAgent doesn't know about these slices,
+	// so it never advances Releasing → Released. Without this fix, every
+	// failed-gang test run leaks slices that hold finalizers forever.
+	//
+	// Safe to remove the finalizer directly: no hardware was allocated
+	// (AllocationID == ""), so there is nothing for the NodeAgent to free.
+	neverBound := slice.Status.AllocationID == "" &&
+		(currentPhase == state.SlicePhasePending ||
+			currentPhase == "" ||
+			currentPhase == state.SlicePhaseReleasing ||
+			currentPhase == state.SlicePhaseScheduled)
+	if neverBound {
+		log.Printf("Slice %s never bound; removing finalizer directly", slice.Name)
+		key := types.NamespacedName{Namespace: slice.Namespace, Name: slice.Name}
+		return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var fresh vgpuv1alpha1.VGPUSlice
+			if err := r.Client.Get(ctx, key, &fresh); err != nil {
+				return err
+			}
+			if !RemoveFinalizer(&fresh, SliceFinalizerName) {
+				return nil
+			}
+			return r.Client.Update(ctx, &fresh)
+		})
+	}
+
 	if currentPhase != state.SlicePhaseReleasing && currentPhase != state.SlicePhaseReleased {
 		return PatchSliceStatus(ctx, r.Client, slice, func() {
 			// Round-3 fix: swallowing DAG violations silently hid bugs. If the

@@ -15,11 +15,23 @@ spec:
       labels:
         control-plane: vgpu-controller
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: vgpu-controller-sa
       containers:
         - name: manager
           image: vgpu-controller:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: webhook
               containerPort: 9443
