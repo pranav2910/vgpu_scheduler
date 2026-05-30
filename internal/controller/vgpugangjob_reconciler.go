@@ -71,6 +71,37 @@ func (r *VGPUGangJobReconciler) Reconcile(ctx context.Context, req reconcile.Req
 		return reconcile.Result{}, nil
 	}
 
+	// gang-job-recreation fix applied: if the reservation is in a terminal
+	// phase (Failed or Released), don't re-create children that the
+	// reservation reconciler's tearDownChildren is actively cleaning up.
+	// Without this guard, deletion of a child VGPUJob fires a gang reconcile
+	// (via Owns watch), ensureChildren sees the missing child, re-creates
+	// it, tearDownChildren deletes it again — infinite loop.
+	{
+		rsvName := reservationNameForGang(gang.Name)
+		var rsv vgpuv1alpha1.VGPUGangReservation
+		if err := r.Client.Get(ctx, types.NamespacedName{
+			Namespace: gang.Namespace, Name: rsvName,
+		}, &rsv); err == nil {
+			if rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseFailed ||
+				rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseReleased {
+				log.Printf("VGPUGangJob %s/%s: reservation in terminal phase %s — skipping child materialization",
+					gang.Namespace, gang.Name, rsv.Status.Phase)
+				// Still mirror status so the gang itself transitions to
+				// Failed/Completed. Use updatePhase's existing logic.
+				desired := vgpuv1alpha1.GangPhaseFailed
+				if rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseReleased {
+					desired = vgpuv1alpha1.GangPhaseFailed
+				}
+				return r.updatePhase(ctx, &gang, desired,
+					"reservation terminated; no further child materialization",
+					gang.Spec.GangSize, 0)
+			}
+		}
+		// If err is NotFound or other, fall through — normal materialization
+		// path will handle creating the reservation as needed.
+	}
+
 	// 1. Make sure all N child VGPUJobs exist.
 	createdNow, totalExisting, err := r.ensureChildren(ctx, &gang)
 	if err != nil {

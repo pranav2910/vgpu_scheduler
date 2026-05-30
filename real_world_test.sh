@@ -517,14 +517,23 @@ test_2_2_failed_gang_teardown() {
     rsv_phase=$(kubectl get vgpugangreservation -n "$ns" fail-test-rsv -o jsonpath='{.status.phase}' 2>/dev/null)
     rsv_reason=$(kubectl get vgpugangreservation -n "$ns" fail-test-rsv -o jsonpath='{.status.failureReason}' 2>/dev/null)
 
-    # Wait for the reconciler's teardown to complete
-    sleep 10
-
-    local final_committed; final_committed=$(committed_bytes)
-    local remaining_slices remaining_claims remaining_jobs
-    remaining_slices=$(kubectl get vgpuslice -n "$ns" --no-headers 2>/dev/null | wc -l)
-    remaining_claims=$(kubectl get vgpuclaim -n "$ns" --no-headers 2>/dev/null | wc -l)
-    remaining_jobs=$(kubectl get vgpujob -n "$ns" --no-headers 2>/dev/null | wc -l)
+    # test-2-2-timing fix applied: poll for teardown completion instead of
+    # fixed sleep. The reservation reconciler drives cascade-delete via
+    # foreground propagation, which can take 10-20s. It transitions
+    # Failed -> Released once all children are confirmed gone.
+    local final_committed remaining_slices remaining_claims remaining_jobs
+    local waited=0
+    while [[ $waited -lt 60 ]]; do
+        remaining_slices=$(kubectl get vgpuslice -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        remaining_claims=$(kubectl get vgpuclaim -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        remaining_jobs=$(kubectl get vgpujob -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$remaining_slices" == "0" && "$remaining_claims" == "0" && "$remaining_jobs" == "0" ]]; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    final_committed=$(committed_bytes)
 
     log_to_report ""
     log_to_report "**Observed:**"
