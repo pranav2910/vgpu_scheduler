@@ -652,9 +652,13 @@ if [[ $SKIP_CLEANUP -eq 0 ]]; then
     banner "Preflight: resetting scheduler cache to a clean baseline"
     kubectl rollout restart deployment/vgpu-scheduler -n vgpu-system >/dev/null 2>&1 || true
     kubectl rollout status deployment/vgpu-scheduler -n vgpu-system --timeout=120s >/dev/null 2>&1 || true
+    # With 2 replicas (HA), only the leader seeds — scrape ALL scheduler pods by
+    # label so we catch the leader's seed log regardless of which pod is leader.
+    # `logs deployment/...` picks a single (possibly standby) pod and would miss it.
     seeded=0
     for _ in $(seq 1 30); do
-        if kubectl logs -n vgpu-system deployment/vgpu-scheduler 2>/dev/null | grep -q "Seeded cache: re-accounted"; then
+        if kubectl logs -n vgpu-system -l control-plane=vgpu-scheduler --tail=400 --prefix 2>/dev/null \
+            | grep -q "Seeded cache: re-accounted"; then
             seeded=1; break
         fi
         sleep 2
@@ -765,9 +769,11 @@ EOF
     dim "killing scheduler pod..."
     kubectl delete pod -n vgpu-system -l control-plane=vgpu-scheduler --wait=false >/dev/null 2>&1 || true
 
-    # 5. Wait for rollout.
-    if ! kubectl rollout status deployment/vgpu-scheduler -n vgpu-system --timeout=60s >/dev/null 2>&1; then
-        fail "scheduler did not recover within 60s of crash"
+    # 5. Wait for rollout. With HA (2 replicas) the kill above takes out BOTH
+    #    pods, so recovery is a full cold restart + leader election + warm-up;
+    #    allow more headroom than the single-replica era's 60s.
+    if ! kubectl rollout status deployment/vgpu-scheduler -n vgpu-system --timeout=150s >/dev/null 2>&1; then
+        fail "scheduler did not recover within 150s of crash"
         ns_cleanup "$ns"; return 1
     fi
     dim "scheduler back up; observing recovery..."
@@ -871,9 +877,11 @@ EOF
     done
     log_to_report "- Controller crashed 3× during materialization window"
 
-    # 4. Wait for the controller to stabilize after the burst.
-    if ! kubectl rollout status deployment/vgpu-controller -n vgpu-system --timeout=120s >/dev/null 2>&1; then
-        fail "controller did not recover within 120s of the crash burst"
+    # 4. Wait for the controller to stabilize after the burst. HA (2 replicas)
+    #    means each kill is a full cold restart of both pods + leader election;
+    #    allow generous headroom.
+    if ! kubectl rollout status deployment/vgpu-controller -n vgpu-system --timeout=150s >/dev/null 2>&1; then
+        fail "controller did not recover within 150s of the crash burst"
         ns_cleanup "$ns"; return 1
     fi
     dim "controller stabilized; observing convergence..."
