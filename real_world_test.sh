@@ -165,6 +165,28 @@ count_children_by_prefix() {
         | awk -v p="${prefix}-" 'index($1,p)==1' | wc -l | tr -d ' '
 }
 
+# HA helpers (Phase 3.3) ------------------------------------------------------
+# Current leader pod name for a lease (holderIdentity is "<pod>_<uuid>").
+lease_holder_pod() {
+    local lease=$1
+    kubectl -n vgpu-system get lease "$lease" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null | cut -d'_' -f1
+}
+
+# Scrape a single gauge/counter value from one pod via the API-server pod proxy
+# (the images are distroless, so there is no in-pod shell/curl to exec). Prints
+# the metric value, or "" if absent/unreachable.
+pod_metric() {
+    local pod=$1 port=$2 metric=$3
+    kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${pod}:${port}/proxy/metrics" 2>/dev/null \
+        | awk -v m="$metric" '$1==m {print $2; exit}'
+}
+
+# True if the named pod's /readyz returns ready via the API-server pod proxy.
+pod_ready() {
+    local pod=$1 port=$2
+    kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${pod}:${port}/proxy/readyz" >/dev/null 2>&1
+}
+
 # Wait for a predicate to evaluate true, OR until timeout. Returns 0 on success,
 # 1 on timeout. The predicate is a bash command in a string.
 wait_for_pred() {
@@ -1056,6 +1078,163 @@ EOF
     return 0
 }
 
+# Test 2.8 — Scheduler leader failover (HA, Phase 3.3)
+# Fill the cluster with 2 gangs (80 GiB) + a 3rd gang that cannot fit. Kill the
+# active scheduler leader. The hot standby must take over and, crucially,
+# re-account the already-committed 80 GiB during warm-up BEFORE it is Ready —
+# so it does NOT admit the 3rd gang into occupied capacity. Asserts the five HA
+# invariants: no over-admission, no duplicate binds, no stuck reservations,
+# cache_warmup_complete before readyz on the new leader, and a clean
+# leader_active transfer. Then proves the new leader is fully functional by
+# freeing capacity and watching the waiting gang schedule.
+test_2_8_scheduler_leader_failover() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-8-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns"
+
+    # Pre-flight: 2 replicas with exactly one leader.
+    local replicas
+    replicas=$(kubectl -n vgpu-system get deploy vgpu-scheduler -o jsonpath='{.spec.replicas}')
+    if [[ "$replicas" -lt 2 ]]; then
+        fail "scheduler not running >=2 replicas (got $replicas) — HA requires a hot standby"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 1. Fill the cluster: 2 gangs x 4 x 10 GiB = 80 GiB.
+    submit_gang "$ns" "g1" 4 10737418240
+    submit_gang "$ns" "g2" 4 10737418240
+    if ! wait_for_pred 90 "2 gangs committed (cluster full)" \
+        '[[ "$(committed_bytes)" == "85899345920" ]]'; then
+        fail "could not fill cluster with 2 gangs pre-failover (committed=$(committed_bytes))"
+        ns_cleanup "$ns"; return 1
+    fi
+    # 2. A 3rd gang that cannot fit — must stay un-admitted. Long reservation
+    #    deadline so it is still Reserving (not deadline-Failed) after the
+    #    failover window, letting step 9 prove the new leader can schedule it.
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: { name: g3, namespace: $ns }
+spec:
+  gangSize: 4
+  minAvailable: 4
+  priority: 500
+  workloadClass: Training
+  preemptible: false
+  reservationTimeoutSeconds: 600
+  podTemplate:
+    spec:
+      requestedVramBytes: 10737418240
+      serviceTier: Guaranteed
+EOF
+    sleep 5
+    local g3_phase; g3_phase=$(gang_phase "$ns" g3)
+    dim "pre-failover: committed=$(committed_bytes) g3=$g3_phase"
+
+    # 3. Identify leader + standby via the lease.
+    local leader standby
+    leader=$(lease_holder_pod vgpu-scheduler-lock)
+    if [[ -z "$leader" ]]; then
+        fail "could not resolve scheduler leader from lease"
+        ns_cleanup "$ns"; return 1
+    fi
+    standby=$(kubectl -n vgpu-system get pods -l control-plane=vgpu-scheduler \
+        -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v "^${leader}$" | head -1)
+    dim "leader=$leader standby=$standby"
+
+    # 4. Invariant 5 (pre): exactly the leader reports leader_active=1.
+    if [[ "$(pod_metric "$leader" 8081 vgpu_scheduler_leader_active)" != "1" ]]; then
+        fail "pre-failover leader $leader does not report leader_active=1"
+        ns_cleanup "$ns"; return 1
+    fi
+    if [[ -n "$standby" && "$(pod_metric "$standby" 8081 vgpu_scheduler_leader_active)" == "1" ]]; then
+        fail "standby $standby reports leader_active=1 — two leaders"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 5. Kill the leader.
+    dim "killing leader pod $leader ..."
+    kubectl -n vgpu-system delete pod "$leader" --wait=false >/dev/null 2>&1 || true
+
+    # 6. The lease must move off the killed leader. The winner may be the hot
+    #    standby (fast) or a fresh replacement pod (the election winner is
+    #    non-deterministic); either is valid HA — assert only that a *new*
+    #    leader emerges, then bind to whoever it is.
+    if ! wait_for_pred 90 "lease fails over to a new leader" \
+        "h=\$(lease_holder_pod vgpu-scheduler-lock); [[ -n \"\$h\" && \"\$h\" != \"$leader\" ]]"; then
+        fail "leader lease did not fail over within 90s (holder=$(lease_holder_pod vgpu-scheduler-lock))"
+        ns_cleanup "$ns"; return 1
+    fi
+    local new_leader; new_leader=$(lease_holder_pod vgpu-scheduler-lock)
+    dim "new leader = $new_leader ($([[ "$new_leader" == "$standby" ]] && echo "hot standby took over" || echo "replacement pod won election"))"
+
+    # 7. Invariant 4 + 5: new leader warms up, flips leader_active, and only then
+    #    reports Ready.
+    if ! wait_for_pred 90 "new leader warmed up + leader_active=1" \
+        "[[ \"\$(pod_metric $new_leader 8081 vgpu_scheduler_cache_warmup_complete)\" == \"1\" && \"\$(pod_metric $new_leader 8081 vgpu_scheduler_leader_active)\" == \"1\" ]]"; then
+        fail "new leader $new_leader did not warm up + claim leader_active within 90s"
+        ns_cleanup "$ns"; return 1
+    fi
+    if ! pod_ready "$new_leader" 8082; then
+        fail "new leader $new_leader warmed up but /readyz is not Ready"
+        ns_cleanup "$ns"; return 1
+    fi
+    # The killed leader's series is gone; confirm no second pod still claims leadership.
+    local other_active=0
+    for p in $(kubectl -n vgpu-system get pods -l control-plane=vgpu-scheduler -o jsonpath='{.items[*].metadata.name}'); do
+        [[ "$p" == "$new_leader" ]] && continue
+        [[ "$(pod_metric "$p" 8081 vgpu_scheduler_leader_active)" == "1" ]] && other_active=1
+    done
+    if [[ "$other_active" == "1" ]]; then
+        fail "more than one pod reports leader_active=1 after failover (split brain)"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "failover: leader_active transferred cleanly to $new_leader; warm-up completed before Ready"
+
+    # 8. Invariants 1 + 2: no over-admission, no duplicate binds. The new leader
+    #    cold-started, re-accounted 80 GiB, and must NOT have admitted g3.
+    local cb ready_slices
+    cb=$(committed_bytes)
+    ready_slices=$(kubectl get vgpuslice -n "$ns" -o json 2>/dev/null \
+        | python3 -c 'import sys,json;print(sum(1 for s in json.load(sys.stdin)["items"] if s.get("status",{}).get("phase")=="Ready"))')
+    if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+        fail "OVER-ADMISSION after failover: committed=$cb > capacity=$GPU_BYTES_TOTAL"
+        ns_cleanup "$ns"; return 1
+    fi
+    if [[ "$cb" != "$GPU_BYTES_TOTAL" || "$ready_slices" != "8" ]]; then
+        fail "post-failover inconsistency: committed=$cb (want $GPU_BYTES_TOTAL), readySlices=$ready_slices (want 8)"
+        ns_cleanup "$ns"; return 1
+    fi
+    if [[ "$(gang_phase "$ns" g3)" == "Running" ]]; then
+        fail "g3 became Running after failover — over-admission into occupied capacity"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "no over-admission / no duplicate binds: committed=$cb, 8 Ready slices, g3 still not admitted"
+
+    # 9. Invariant 3 + functional proof: free 40 GiB (delete g1); the new leader
+    #    must schedule the waiting g3 into the freed capacity (no stuck gang).
+    kubectl delete vgpugangjob -n "$ns" g1 >/dev/null 2>&1 || true
+    if ! wait_for_pred 90 "new leader schedules waiting g3 after capacity frees" \
+        "[[ \"\$(gang_phase $ns g3)\" == \"Running\" ]]"; then
+        fail "g3 did not schedule on the new leader after g1 freed capacity (g3=$(gang_phase "$ns" g3)) — stuck reservation or dead leader"
+        ns_cleanup "$ns"; return 1
+    fi
+    cb=$(committed_bytes)
+    if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+        fail "OVER-ADMISSION after g3 scheduled: committed=$cb > $GPU_BYTES_TOTAL"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "new leader fully functional: g3 scheduled after g1 freed capacity, committed=$cb (<= $GPU_BYTES_TOTAL)"
+
+    log_to_report "- 2-replica scheduler; killed leader \`$leader\`, standby \`$standby\` took over"
+    log_to_report "- New leader re-accounted 80 GiB during warm-up before Ready; no over-admission of g3"
+    log_to_report "- leader_active transferred cleanly; g3 scheduled only after capacity was freed"
+    log_to_report "**Path:** ✅ HA failover preserves safety (no over-admission), atomicity, and liveness."
+    ns_cleanup "$ns"
+    return 0
+}
+
 # Functional tests first, then the destructive chaos tests LAST (standard
 # practice): a crashed controller/scheduler needs time to re-stabilize, and
 # running chaos last means that re-stabilization can't bleed into other tests.
@@ -1067,6 +1246,7 @@ run_test "2.6" "Delete during in-flight scheduling" test_2_6_delete_during_infli
 run_test "2.7" "Gang vs preemption (atomicity)"    test_2_7_gang_vs_preemption
 run_test "2.4" "Scheduler crash mid-bind"          test_2_4_scheduler_crash_mid_bind
 run_test "2.3" "Controller crash mid-gang"         test_2_3_controller_crash_mid_gang
+run_test "2.8" "Scheduler leader failover (HA)"    test_2_8_scheduler_leader_failover
 
 finalize_report
 

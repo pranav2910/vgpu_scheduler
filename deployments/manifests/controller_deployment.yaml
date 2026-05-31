@@ -6,7 +6,9 @@ metadata:
   labels:
     control-plane: vgpu-controller
 spec:
-  replicas: 1
+  # Phase 3.3 HA: active leader + hot standby. Both replicas serve the webhook
+  # (the webhook Service load-balances across them); only the leader reconciles.
+  replicas: 2
   selector:
     matchLabels:
       control-plane: vgpu-controller
@@ -23,6 +25,16 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: vgpu-controller-sa
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  control-plane: vgpu-controller
       containers:
         - name: manager
           image: vgpu-controller:latest
@@ -60,3 +72,14 @@ spec:
           secret:
             secretName: vgpu-controller-webhook-cert
             defaultMode: 0440
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vgpu-controller-pdb
+  namespace: vgpu-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: vgpu-controller

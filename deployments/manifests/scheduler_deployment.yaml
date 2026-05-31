@@ -6,7 +6,9 @@ metadata:
   labels:
     control-plane: vgpu-scheduler
 spec:
-  replicas: 1
+  # Phase 3.3 HA: one active leader + one hot standby. Failover does not wait
+  # for a new pod to be scheduled and pulled.
+  replicas: 2
   selector:
     matchLabels:
       control-plane: vgpu-scheduler
@@ -16,10 +18,49 @@ spec:
         control-plane: vgpu-scheduler
     spec:
       serviceAccountName: vgpu-scheduler-sa
+      # Give graceful shutdown time to drain in-flight reconciles and release
+      # the leader lease (LeaderElectionReleaseOnCancel) before SIGKILL.
+      terminationGracePeriodSeconds: 30
+      # Prefer to spread the two replicas across nodes so a single node failure
+      # cannot take out both. Preferred (not required) so a single-node cluster
+      # can still run both for testing.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  control-plane: vgpu-scheduler
       containers:
       - name: manager
         image: vgpu-scheduler:latest
         imagePullPolicy: IfNotPresent
+        ports:
+        - name: metrics
+          containerPort: 8081
+        - name: health
+          containerPort: 8082
+        # /healthz = process alive (restart if it deadlocks).
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        # /readyz = safe to hold scheduling responsibility. The leader is not
+        # Ready until its cache warm-up completes; a standby is Ready to take over.
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
         resources:
           limits:
             cpu: 500m
@@ -27,3 +68,14 @@ spec:
           requests:
             cpu: 100m
             memory: 128Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vgpu-scheduler-pdb
+  namespace: vgpu-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: vgpu-scheduler

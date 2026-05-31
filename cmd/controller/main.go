@@ -43,6 +43,9 @@ func main() {
 		HealthProbeBindAddress: ":8082",
 		LeaderElection:         true,
 		LeaderElectionID:       "vgpu-controller-lock",
+		// Release the lease on graceful shutdown so the standby takes over in
+		// seconds rather than waiting out the lease duration. Phase 3.3.
+		LeaderElectionReleaseOnCancel: true,
 		WebhookServer: webhookserver.NewServer(webhookserver.Options{
 			Port:    9443,
 			CertDir: "/tmp/k8s-webhook-server/serving-certs",

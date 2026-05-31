@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -52,6 +53,9 @@ func main() {
 		HealthProbeBindAddress: ":8082",
 		LeaderElection:         true,
 		LeaderElectionID:       "vgpu-scheduler-lock",
+		// Release the lease on graceful shutdown so a hot standby takes over in
+		// seconds instead of waiting out the full lease duration. Phase 3.3.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		log.Fatalf("creating manager: %v", err)
@@ -114,10 +118,32 @@ func main() {
 		log.Fatalf("setting up node capacity reconciler: %v", err)
 	}
 
+	// /healthz means "process alive". /readyz means "safe to hold scheduling
+	// responsibility". Phase 3.3: the meaningful gate is that a leader must not
+	// report Ready until its cache warm-up has completed — otherwise a freshly
+	// promoted leader could be considered Ready while its cache still cold-starts
+	// at free=capacity, the exact window the warm-up gate exists to close.
+	//
+	// A non-leader (hot standby) reports Ready: it is healthy and ready to take
+	// over. Gating standby readiness on leadership would leave it permanently
+	// NotReady, which breaks Deployment availability (rollout never completes).
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Fatalf("adding healthz check: %v", err)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	elected := mgr.Elected()
+	if err := mgr.AddReadyzCheck("readyz", func(_ *http.Request) error {
+		select {
+		case <-elected:
+			// This replica is (or was) the leader: Ready only once warmed up.
+			if !cache.IsSeeded() {
+				return fmt.Errorf("leader cache warm-up in progress")
+			}
+			return nil
+		default:
+			// Not the leader: a healthy standby, ready to take over.
+			return nil
+		}
+	}); err != nil {
 		log.Fatalf("adding readyz check: %v", err)
 	}
 
