@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -396,7 +398,8 @@ func (r *VGPUGangReservationReconciler) applyPhase(
 	t *sliceTally,
 ) error {
 	key := types.NamespacedName{Namespace: rsv.Namespace, Name: rsv.Name}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	transitioned := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh vgpuv1alpha1.VGPUGangReservation
 		if err := r.Client.Get(ctx, key, &fresh); err != nil {
 			// teardown-loop fix applied: if the reservation was deleted
@@ -419,6 +422,7 @@ func (r *VGPUGangReservationReconciler) applyPhase(
 			now := metav1.Now()
 			fresh.Status.FirstReservingTime = &now
 		}
+		transitioned = fresh.Status.Phase != nextPhase
 		fresh.Status.Phase = nextPhase
 		fresh.Status.ReservedSlots = t.reservedSlots
 		fresh.Status.CommittedSlots = t.committedSlots
@@ -430,6 +434,32 @@ func (r *VGPUGangReservationReconciler) applyPhase(
 		}
 		return r.Client.Status().Update(ctx, &fresh)
 	})
+
+	// Count terminal-outcome transitions exactly once (only when the phase
+	// actually changed and the status write succeeded).
+	if err == nil && transitioned {
+		switch nextPhase {
+		case vgpuv1alpha1.ReservationPhaseCommitted:
+			telemetry.GangAttempts.WithLabelValues("committed").Inc()
+		case vgpuv1alpha1.ReservationPhaseFailed:
+			telemetry.GangAttempts.WithLabelValues("failed").Inc()
+			telemetry.GangRollbacks.WithLabelValues(rollbackReasonLabel(reason)).Inc()
+		}
+	}
+	return err
+}
+
+// rollbackReasonLabel collapses the freeform applyPhase reason into a small,
+// bounded set of label values so vgpu_gang_rollbacks_total stays low-cardinality.
+func rollbackReasonLabel(reason string) string {
+	switch {
+	case strings.Contains(reason, "deadline"):
+		return "deadline"
+	case strings.Contains(reason, "capacity"), strings.Contains(reason, "insufficient"):
+		return "insufficient_capacity"
+	default:
+		return "other"
+	}
 }
 
 // tearDownChildren is the rollback path. We delete each child VGPUJob with

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -120,10 +121,12 @@ func (p *Preemptor) TryPreempt(
 		// the plan or the slice changed under us. Don't proceed.
 		log.Printf("[preemptor] %s/%s: could not claim plan ownership: %v — skip",
 			requester.Namespace, requester.Name, err)
+		telemetry.PreemptionBlocked.WithLabelValues("ownership_lost").Inc()
 		return nil, nil
 	}
 	if !owned {
 		// Annotation already present and recent — another plan in flight.
+		telemetry.PreemptionBlocked.WithLabelValues("ownership_lost").Inc()
 		return nil, nil
 	}
 
@@ -135,6 +138,7 @@ func (p *Preemptor) TryPreempt(
 			p.mu.Unlock()
 			log.Printf("[preemptor] %s/%s in cooldown until %v",
 				requester.Namespace, requester.Name, until.Format(time.RFC3339))
+			telemetry.PreemptionBlocked.WithLabelValues("cooldown").Inc()
 			return nil, nil
 		}
 		p.mu.Unlock()
@@ -210,6 +214,7 @@ func (p *Preemptor) TryPreempt(
 	if len(candidates) == 0 {
 		log.Printf("[preemptor] no eligible victims in %s for %s (priority=%d)",
 			requester.Namespace, requester.Name, requesterPriority)
+		telemetry.PreemptionBlocked.WithLabelValues("no_victims").Inc()
 		return nil, nil
 	}
 
@@ -275,6 +280,7 @@ func (p *Preemptor) TryPreempt(
 	if plan.FreedBytes < neededBytes {
 		log.Printf("[preemptor] insufficient eligible capacity in %s: needed=%d freeable=%d",
 			requester.Namespace, neededBytes, plan.FreedBytes)
+		telemetry.PreemptionBlocked.WithLabelValues("insufficient_capacity").Inc()
 		return nil, nil
 	}
 
@@ -290,6 +296,12 @@ func (p *Preemptor) TryPreempt(
 		p.cooldown[v.Slice.Namespace+"/"+v.Job.Name+"-claim"] = until
 	}
 	p.mu.Unlock()
+
+	graces := make([]int32, 0, len(plan.Victims))
+	for _, v := range plan.Victims {
+		graces = append(graces, v.GraceSeconds)
+	}
+	telemetry.RecordPreemptionPlan(len(plan.Victims), plan.FreedBytes, graces)
 
 	log.Printf("[preemptor] PLAN: requester=%s/%s priority=%d victims=%d freed=%d/%d bytes",
 		requester.Namespace, requester.Name, requesterPriority,

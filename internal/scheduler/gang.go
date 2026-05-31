@@ -9,6 +9,7 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -182,6 +183,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 		vgpuv1alpha1.ReservationPhaseReleased:
 		// Terminal. Forget any cohort state for this gang and reject.
 		g.forgetCohort(slice.Namespace + "/" + rsvName)
+		telemetry.GangAdmissionDecisions.WithLabelValues("rejected").Inc()
 		return GangBindRejected,
 			fmt.Sprintf("reservation %s in terminal phase %s", rsvName, rsv.Status.Phase),
 			nil
@@ -208,6 +210,15 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// Reflect whether the admission slot is held once this decision settles
+	// (runs before the Unlock defer, so g.admitting is read under the lock).
+	defer func() {
+		if g.admitting != "" {
+			telemetry.GangAdmissionSlotHeld.Set(1)
+		} else {
+			telemetry.GangAdmissionSlotHeld.Set(0)
+		}
+	}()
 
 	// Reap stale cohorts proactively (cheap; runs on every gate call).
 	g.reapStaleCohortsLocked(time.Now())
@@ -231,6 +242,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	// whether it's been seen before. Tip from previous reconciles already
 	// committed the cohort.
 	if cohort.released {
+		telemetry.GangAdmissionDecisions.WithLabelValues("admitted").Inc()
 		return GangBindAllowed,
 			fmt.Sprintf("gang %s cohort released (siblings ready)", rsvName),
 			nil
@@ -243,6 +255,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	if g.admitting != "" && now.Sub(g.admittingSince) > gangAdmissionTimeout {
 		log.Printf("[gang] admitting gang %s stalled (%v without quorum) — backing off, freeing slot",
 			g.admitting, now.Sub(g.admittingSince).Round(time.Second))
+		telemetry.GangAdmissionBackoffs.Inc()
 		g.backoff[g.admitting] = now.Add(gangAdmissionBackoff)
 		g.releaseHoldsLocked(g.admitting)
 		g.admitting = ""
@@ -260,6 +273,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 		// slice's reservation so non-admitted gangs never fragment capacity.
 		// Drop any prior membership we may have recorded while admitted.
 		delete(cohort.members, string(slice.UID))
+		telemetry.GangAdmissionDecisions.WithLabelValues("wait").Inc()
 		reason := "no gang eligible for admission"
 		if g.admitting != "" {
 			reason = fmt.Sprintf("gang %s admitting first", g.admitting)
@@ -282,6 +296,8 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 		cohort.released = true
 		g.admitting = ""
 		delete(g.backoff, cohortKey)
+		telemetry.GangAdmissionDecisions.WithLabelValues("admitted").Inc()
+		telemetry.GangQuorumWait.Observe(now.Sub(cohort.createdAt).Seconds())
 		log.Printf("[gang] cohort %s reached quorum (%d/%d) — releasing for bind, freeing admission slot",
 			cohortKey, len(cohort.members), gangSize)
 		return GangBindAllowed,
@@ -290,6 +306,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	}
 
 	// Not yet quorum. Slice's reservation should be HELD by the caller.
+	telemetry.GangAdmissionDecisions.WithLabelValues("deferred").Inc()
 	return GangBindDeferred,
 		fmt.Sprintf("gang %s holding %d/%d members", rsvName, len(cohort.members), gangSize),
 		nil
@@ -353,6 +370,7 @@ func (g *GangBindingGate) forgetCohort(key string) {
 	delete(g.backoff, key)
 	if g.admitting == key {
 		g.admitting = "" // free the slot so the next gang can be admitted
+		telemetry.GangAdmissionSlotHeld.Set(0)
 	}
 }
 

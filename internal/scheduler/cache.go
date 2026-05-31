@@ -124,15 +124,16 @@ func (c *VRAMCache) recalculateFreeVRAM(node *NodeState) {
 	if node.FreeVRAMBytes < 0 {
 		node.FreeVRAMBytes = 0
 	}
-	// Bug #18: emit Prometheus gauge updates.
-	telemetry.RecordNodeCapacity(node.NodeName, node.TotalVRAMBytes, node.FreeVRAMBytes)
+	// Bug #18: emit Prometheus gauge updates — full capacity breakdown per node.
+	telemetry.RecordNodeVRAM(node.NodeName, node.TotalVRAMBytes,
+		node.ReservedVRAMBytes, node.AllocatedVRAMBytes, node.FreeVRAMBytes)
 	c.emitReservationGauge()
 }
 
 // emitReservationGauge publishes len(assumed) for observability. Caller
 // must hold the write lock (or the read lock for pure reads).
 func (c *VRAMCache) emitReservationGauge() {
-	telemetry.ActiveReservations.Set(float64(len(c.assumedBySlice)))
+	telemetry.ReservationsActive.Set(float64(len(c.assumedBySlice)))
 }
 
 func (c *VRAMCache) ListNodes() []string {

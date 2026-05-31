@@ -12,7 +12,7 @@ import (
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/scheduler"
 	pq "github.com/pranav2910/vgpu-scheduler/internal/scheduler/priorityqueue"
-	_ "github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -91,6 +91,12 @@ func main() {
 		untypedLimiter(limiter),
 	)
 
+	// Inventory-gauge collector: refreshes slice-phase / namespace / quota /
+	// queue-depth gauges every 15s.
+	if err := mgr.Add(&metricsCollectorRunnable{client: mgr.GetClient(), queue: priorityQueue, interval: 15 * time.Second}); err != nil {
+		log.Fatalf("adding metrics collector runnable: %v", err)
+	}
+
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&vgpuv1alpha1.VGPUSlice{}).
 		WithOptions(controller.Options{
@@ -129,10 +135,17 @@ type seedRunnable struct {
 }
 
 func (s *seedRunnable) Start(ctx context.Context) error {
+	// Runnables start only after this instance wins leader election, so this is
+	// a fair proxy for "actively scheduling".
+	telemetry.LeaderActive.Set(1)
+	start := time.Now()
 	if err := seedCacheFromNodes(ctx, s.client, s.cache); err != nil {
 		log.Printf("WARNING: seed from nodes failed: %v (cache will populate on reconcile)", err)
 	}
+	telemetry.CacheWarmupDuration.Set(time.Since(start).Seconds())
+	telemetry.CacheWarmupComplete.Set(1)
 	<-ctx.Done()
+	telemetry.LeaderActive.Set(0)
 	return nil
 }
 
@@ -145,6 +158,71 @@ func (r *ttlReaperRunnable) Start(ctx context.Context) error {
 	r.cache.StartTTLReaper(ctx, r.interval)
 	<-ctx.Done()
 	return nil
+}
+
+// metricsCollectorRunnable periodically refreshes the inventory-style gauges
+// that can't be maintained incrementally: slice counts by phase, per-namespace
+// allocated bytes, configured quota bytes, and the work-queue depth. A List
+// every interval is cheap and keeps these series fresh without coupling them
+// to the hot scheduling path.
+type metricsCollectorRunnable struct {
+	client   client.Client
+	queue    interface{ Len() int }
+	interval time.Duration
+}
+
+func (m *metricsCollectorRunnable) Start(ctx context.Context) error {
+	t := time.NewTicker(m.interval)
+	defer t.Stop()
+	for {
+		m.collect(ctx)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+	}
+}
+
+func (m *metricsCollectorRunnable) collect(ctx context.Context) {
+	if m.queue != nil {
+		telemetry.QueueDepth.Set(float64(m.queue.Len()))
+	}
+
+	var slices vgpuv1alpha1.VGPUSliceList
+	if err := m.client.List(ctx, &slices); err == nil {
+		byPhase := map[string]int{}
+		nsAllocated := map[string]int64{}
+		for i := range slices.Items {
+			sl := &slices.Items[i]
+			phase := string(sl.Status.Phase)
+			if phase == "" {
+				phase = "Pending"
+			}
+			byPhase[phase]++
+			if sl.Status.AllocatedBytes > 0 {
+				nsAllocated[sl.Namespace] += sl.Status.AllocatedBytes
+			}
+		}
+		// Reset first so phases/namespaces that dropped to zero don't linger.
+		telemetry.SlicesByPhase.Reset()
+		for phase, n := range byPhase {
+			telemetry.SlicesByPhase.WithLabelValues(phase).Set(float64(n))
+		}
+		telemetry.NamespaceAllocatedBytes.Reset()
+		for ns, bytes := range nsAllocated {
+			telemetry.NamespaceAllocatedBytes.WithLabelValues(ns).Set(float64(bytes))
+		}
+	}
+
+	var quotas vgpuv1alpha1.VGPUQuotaList
+	if err := m.client.List(ctx, &quotas); err == nil {
+		telemetry.NamespaceQuotaBytes.Reset()
+		for i := range quotas.Items {
+			q := &quotas.Items[i]
+			telemetry.NamespaceQuotaBytes.WithLabelValues(q.Spec.TargetNamespace).Set(float64(q.Spec.MaxVramBytes))
+		}
+	}
 }
 
 // ─── Slice scheduling reconciler ─────────────────────────────────────────────
@@ -165,19 +243,31 @@ type sliceSchedulingReconciler struct {
 }
 
 type trackedSlice struct {
-	uid  string
-	node string
+	uid   string
+	node  string
+	phase string
 }
 
-// recordSlice remembers a live slice's UID and bound node so a later delete can
-// release whatever cache footprint it held.
-func (r *sliceSchedulingReconciler) recordSlice(nn types.NamespacedName, uid, node string) {
+// recordSlice remembers a live slice's UID, bound node, and last-seen phase so
+// (a) a later delete can release whatever cache footprint it held, and (b) we
+// can emit Ready/Failed transition counters exactly once per transition. We
+// only count a transition when we have a prior phase for the slice, so a
+// scheduler restart re-observing already-Ready slices doesn't inflate counts.
+func (r *sliceSchedulingReconciler) recordSlice(nn types.NamespacedName, uid, node, phase string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.tracked == nil {
 		r.tracked = make(map[types.NamespacedName]trackedSlice)
 	}
-	r.tracked[nn] = trackedSlice{uid: uid, node: node}
+	if prev, ok := r.tracked[nn]; ok && prev.phase != phase {
+		switch phase {
+		case "Ready":
+			telemetry.SliceReady.Inc()
+		case "Failed":
+			telemetry.SliceFailed.WithLabelValues("scheduling").Inc()
+		}
+	}
+	r.tracked[nn] = trackedSlice{uid: uid, node: node, phase: phase}
 }
 
 // releaseOnDelete reclaims a deleted slice's cache footprint immediately.
@@ -202,9 +292,9 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 		}
 		return reconcile.Result{}, err
 	}
-	// Remember this slice's UID + bound node so a future delete can release
-	// whatever it held.
-	r.recordSlice(req.NamespacedName, string(slice.UID), slice.Spec.NodeName)
+	// Remember this slice's UID + bound node + phase so a future delete can
+	// release whatever it held and so Ready/Failed transitions get counted.
+	r.recordSlice(req.NamespacedName, string(slice.UID), slice.Spec.NodeName, string(slice.Status.Phase))
 
 	phase := string(slice.Status.Phase)
 
@@ -292,6 +382,7 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 		if errors.As(err, &cnr) {
 			return reconcile.Result{RequeueAfter: time.Second}, nil
 		}
+		telemetry.ReconcileErrors.Inc()
 		log.Printf("Scheduling failed for Slice %s/%s: %v — will retry in 30s",
 			slice.Namespace, slice.Name, err)
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil

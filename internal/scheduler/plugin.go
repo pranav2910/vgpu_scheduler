@@ -70,6 +70,10 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 		return "", &CacheNotReadyError{}
 	}
 
+	// Measure the wall-clock cost of a real scheduling cycle (post warm-up).
+	start := time.Now()
+	defer func() { telemetry.SliceScheduleLatency.Observe(time.Since(start).Seconds()) }()
+
 	log.Printf("Scheduling cycle started for Slice %s (req: %d bytes)", nn, reqBytes)
 
 	// Layer 2 Phase 2.2a: enforce VGPUQuota before searching for nodes.
@@ -113,7 +117,7 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 	}
 
 	if len(validNodes) == 0 {
-		telemetry.RecordScheduleAttempt(false)
+		telemetry.RecordScheduleResult("error", "insufficient_capacity")
 		// wave1 fix applied: gang-member slices skip preemption.
 		// Gang membership is governed by the gang's atomic reserve-or-fail
 		// semantic, not single-slice preemption.
@@ -152,7 +156,7 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 
 	tx, err := s.Reserver.Reserve(sliceUID, winningNode, reqBytes)
 	if err != nil {
-		telemetry.RecordScheduleAttempt(false)
+		telemetry.RecordScheduleResult("error", "reserve_failed")
 		return "", fmt.Errorf("speculative reserve failed: %w", err)
 	}
 	defer tx.RollbackIfNotConfirmed()
@@ -187,7 +191,7 @@ func (s *SliceScheduler) gateAndBind(
 			}
 			switch res {
 			case GangBindDeferred:
-				telemetry.RecordScheduleAttempt(false)
+				telemetry.RecordScheduleResult("deferred", "gang_quorum")
 				// Hold the speculative cache reservation across function
 				// return. Subsequent reconcile cycles will fast-forward
 				// past Reserve and re-enter the gate; eventually the
@@ -197,7 +201,7 @@ func (s *SliceScheduler) gateAndBind(
 				log.Printf("[gang] %s deferred: %s (HOLDING reservation)", nn, reason)
 				return "", &GangDeferredError{Reason: reason}
 			case GangBindWait:
-				telemetry.RecordScheduleAttempt(false)
+				telemetry.RecordScheduleResult("wait", "gang_admission")
 				// Another gang owns the admission slot. Do NOT MarkHeld — the
 				// deferred RollbackIfNotConfirmed releases this slice's
 				// speculative reservation so non-admitted gangs hold zero
@@ -207,7 +211,7 @@ func (s *SliceScheduler) gateAndBind(
 				log.Printf("[gang] %s waiting: %s (RELEASING reservation)", nn, reason)
 				return "", &GangDeferredError{Reason: reason}
 			case GangBindRejected:
-				telemetry.RecordScheduleAttempt(false)
+				telemetry.RecordScheduleResult("rejected", "gang_terminal")
 				log.Printf("[gang] %s rejected: %s", nn, reason)
 				return "", fmt.Errorf("gang reservation rejected bind: %s", reason)
 			case GangBindAllowed:
@@ -219,12 +223,12 @@ func (s *SliceScheduler) gateAndBind(
 	}
 
 	if err := s.bindToKubernetesAPI(ctx, nn, winningNode); err != nil {
-		telemetry.RecordScheduleAttempt(false)
+		telemetry.RecordScheduleResult("error", "bind_failed")
 		return "", fmt.Errorf("bind to Kubernetes API failed: %w", err)
 	}
 
 	tx.Confirm()
-	telemetry.RecordScheduleAttempt(true)
+	telemetry.RecordScheduleResult("success", "")
 	log.Printf("Slice %s bound to node %s", nn, winningNode)
 	return winningNode, nil
 }
@@ -266,6 +270,7 @@ func (s *SliceScheduler) bindToKubernetesAPI(ctx context.Context, nn types.Names
 			cond.Message = fmt.Sprintf("preferred zone %q unavailable; scheduled in zone %q", pref, placedZone)
 			log.Printf("[topology] %s: %s", nn, cond.Message)
 		}
+		telemetry.RecordTopologyPlacement(placedZone, placedZone == pref)
 		target.Status.Conditions = upsertCondition(target.Status.Conditions, cond)
 	}
 
