@@ -170,6 +170,10 @@ func (r *VGPUGangJobReconciler) ensureChildren(ctx context.Context, gang *vgpuv1
 		childAnnotations := map[string]string{
 			vgpuv1alpha1.AnnotationGangRef:        gang.Name,
 			vgpuv1alpha1.AnnotationReservationRef: reservationNameForGang(gang.Name),
+			// Denormalize the gang's priority onto the child chain so the
+			// scheduler's serialized admission gate can order gangs without a
+			// CRD lookup. Rides Job→Claim→Slice via FilterGangAnnotations.
+			vgpuv1alpha1.AnnotationGangPriority: strconv.Itoa(int(gang.Spec.Priority)),
 		}
 		for k, v := range FilterGangAnnotations(gang.Annotations) {
 			if _, exists := childAnnotations[k]; !exists {

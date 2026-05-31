@@ -196,6 +196,16 @@ func (s *SliceScheduler) gateAndBind(
 				tx.MarkHeld()
 				log.Printf("[gang] %s deferred: %s (HOLDING reservation)", nn, reason)
 				return "", &GangDeferredError{Reason: reason}
+			case GangBindWait:
+				telemetry.RecordScheduleAttempt(false)
+				// Another gang owns the admission slot. Do NOT MarkHeld — the
+				// deferred RollbackIfNotConfirmed releases this slice's
+				// speculative reservation so non-admitted gangs hold zero
+				// capacity and cannot fragment it. Requeue quickly; once the
+				// admitting gang commits (or stalls and backs off) this slice's
+				// gang gets its turn at the slot.
+				log.Printf("[gang] %s waiting: %s (RELEASING reservation)", nn, reason)
+				return "", &GangDeferredError{Reason: reason}
 			case GangBindRejected:
 				telemetry.RecordScheduleAttempt(false)
 				log.Printf("[gang] %s rejected: %s", nn, reason)

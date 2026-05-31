@@ -228,6 +228,13 @@ const AnnotationReservationRef = "gang.vgpu.pranav2910.com/reservation"
 // reconciler when iterating over children.
 const AnnotationGangRef = "gang.vgpu.pranav2910.com/gang"
 
+// AnnotationGangPriority is stamped on each child VGPUClaim/VGPUSlice with the
+// parent gang's scheduling priority (as a decimal string). The scheduler's
+// gang admission gate reads it to order which gang may hold capacity when the
+// serialized admission slot is free (priority desc → age asc → name asc), so
+// priority can influence gang admission without a CRD lookup on the hot path.
+const AnnotationGangPriority = "gang.vgpu.pranav2910.com/priority"
+
 // IsTerminalReservationPhase returns true if no further state transitions
 // are valid from the given phase.
 func IsTerminalReservationPhase(p VGPUGangReservationPhase) bool {
