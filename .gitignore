@@ -87,3 +87,8 @@ real_world_report.md
 
 # Obsolete scratch installers (Wave 2 tests now live in real_world_test.sh)
 add_test_2_4*.sh
+
+# Stray binaries from `go build ./cmd/...` into the repo root
+/nodeagent
+/scheduler
+/controller

@@ -187,6 +187,45 @@ var (
 		Help: "Number of speculative cache reservations currently held in memory.",
 	})
 
+	// ── GPU hardware truth (Phase 3.1, node agent observation) ────────────
+	// Observed per-device GPU state from the node agent's GPUProvider. Keyed by
+	// node + device UUID. Observation-only: these never drive scheduler capacity.
+
+	GPUDeviceTotalBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_total_memory_bytes",
+		Help: "Observed total VRAM of a physical GPU, in bytes (healthy devices only).",
+	}, []string{"node", "device"})
+
+	GPUDeviceUsedBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_used_memory_bytes",
+		Help: "Observed used VRAM of a physical GPU, in bytes (healthy devices only).",
+	}, []string{"node", "device"})
+
+	GPUDeviceFreeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_free_memory_bytes",
+		Help: "Observed free VRAM of a physical GPU, in bytes (healthy devices only).",
+	}, []string{"node", "device"})
+
+	GPUDeviceHealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_healthy",
+		Help: "1 if a physical GPU is healthy/observable, 0 otherwise.",
+	}, []string{"node", "device"})
+
+	GPUProviderInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_provider_info",
+		Help: "Active GPU provider on a node (1). provider: fake|nvml|degraded.",
+	}, []string{"node", "provider"})
+
+	GPUObservationErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_gpu_observation_errors_total",
+		Help: "Failed GPU observation cycles (provider unavailable, driver/permission errors).",
+	}, []string{"node"})
+
+	GPUCapacityDriftBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_capacity_drift_bytes",
+		Help: "Observed healthy GPU total minus scheduler-assumed capacity, in bytes (negative => hardware shows less than assumed).",
+	}, []string{"node"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -217,6 +256,9 @@ func init() {
 		// scheduler health
 		CacheWarmupComplete, CacheWarmupDuration, QueueDepth, ReconcileErrors,
 		LeaderActive, ReservationsActive,
+		// gpu hardware truth
+		GPUDeviceTotalBytes, GPUDeviceUsedBytes, GPUDeviceFreeBytes, GPUDeviceHealthy,
+		GPUProviderInfo, GPUObservationErrors, GPUCapacityDriftBytes,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

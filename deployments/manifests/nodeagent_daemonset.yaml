@@ -24,6 +24,17 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName # Dynamically injects the physical server's name
+        # Phase 3.1: the default (kind) image uses the fake GPU provider. Model
+        # the node's advertised 80 GiB so observed truth matches scheduler-
+        # assumed capacity (drift = 0). On real hardware, build -tags nvml and
+        # drop these — the NVML provider reports actual VRAM.
+        - name: VGPU_FAKE_GPU_MEM_BYTES
+          value: "85899345920"   # 80 GiB
+        - name: VGPU_EXPECTED_VRAM_BYTES
+          value: "85899345920"   # scheduler-assumed capacity, for the drift gauge
+        ports:
+        - name: metrics
+          containerPort: 8083
         securityContext:
           privileged: true # Required to talk directly to NVML and write to host directories
         volumeMounts:

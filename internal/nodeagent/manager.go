@@ -24,9 +24,13 @@ type Manager struct {
 	Detector  *drift.Detector
 }
 
-func NewManager(nodeName string, k8sClient client.Client) *Manager {
+// NewManager builds the node-agent manager. mock selects the allocator's
+// hardware mode; callers derive it from the build tag (gpu.RealBuild) so the
+// allocation path and the observation path agree on whether real hardware is
+// present.
+func NewManager(nodeName string, k8sClient client.Client, mock bool) *Manager {
 	store := checkpoint.NewStore()
-	allocator := nvml.NewAllocator(true)
+	allocator := nvml.NewAllocator(mock)
 	return &Manager{
 		NodeName:  nodeName,
 		Store:     store,

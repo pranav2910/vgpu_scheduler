@@ -4,10 +4,12 @@ import (
 	"context"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/gpu"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,16 +48,42 @@ func main() {
 	// Single cached client lives inside ctrlMgr — no separate direct client.
 	ctrlMgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:         scheme,
-		Metrics:        metricsserver.Options{BindAddress: "0"}, // disabled
+		Metrics:        metricsserver.Options{BindAddress: ":8083"}, // Phase 3.1: expose GPU + data-plane metrics
 		LeaderElection: false,
 	})
 	if err != nil {
 		log.Fatalf("creating controller manager: %v", err)
 	}
 
+	// Build tag is the single source of truth for "is real hardware present":
+	// default build → mock allocator + fake GPU provider; -tags nvml → real both.
+	mock := !gpu.RealBuild
+
 	// Manager wires allocation, CDI, checkpoint, reporter, drift. Uses the
 	// SAME client the reconciler uses — fixes the stale-read race.
-	mgr := nodeagent.NewManager(nodeName, ctrlMgr.GetClient())
+	mgr := nodeagent.NewManager(nodeName, ctrlMgr.GetClient(), mock)
+
+	// Phase 3.1: GPU hardware-truth observation. Read-only — discovers GPUs,
+	// reports VRAM/health via metrics, and surfaces drift. Never writes node
+	// capacity or enforces limits. A provider init failure (driver/lib/perms)
+	// degrades to a provider that reports the error each cycle; the agent stays
+	// up either way.
+	gpuProvider, gerr := gpu.NewProvider()
+	if gerr != nil {
+		log.Printf("[gpu] provider init failed (%v) — running in degraded observation mode", gerr)
+		gpuProvider = gpu.NewDegradedProvider(gerr)
+	}
+	// Optional: scheduler-assumed capacity for drift (no Node read / RBAC needed).
+	expectedVRAM := int64(0)
+	if v := os.Getenv("VGPU_EXPECTED_VRAM_BYTES"); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			expectedVRAM = n
+		}
+	}
+	gpuCollector := gpu.NewCollector(gpuProvider, nodeName, 30*time.Second, expectedVRAM)
+	if err := ctrlMgr.Add(gpuCollector); err != nil {
+		log.Fatalf("adding GPU observation collector: %v", err)
+	}
 
 	// Drift detection runs before any new slice work starts, using a one-shot
 	// Runnable so the informer cache is synced first.
@@ -137,15 +165,3 @@ func (r *nodeAgentSliceReconciler) Reconcile(ctx context.Context, req reconcile.
 	return reconcile.Result{}, nil
 }
 
-func explicitMockMode() bool {
-	value := os.Getenv("VGPU_MOCK")
-	switch value {
-	case "true", "1", "yes":
-		return true
-	case "false", "0", "no":
-		return false
-	default:
-		log.Fatalf("VGPU_MOCK must be explicitly set to true for local development or false for production")
-		return false
-	}
-}
