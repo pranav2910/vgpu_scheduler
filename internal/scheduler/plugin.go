@@ -76,9 +76,12 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 
 	log.Printf("Scheduling cycle started for Slice %s (req: %d bytes)", nn, reqBytes)
 
-	// Layer 2 Phase 2.2a: enforce VGPUQuota before searching for nodes.
+	// Layer 2 Phase 2.2a: enforce VGPUQuota before searching for nodes. For a
+	// gang member, the whole gang's demand is weighed against the quota so a gang
+	// is admitted all-or-none (never partially past quota).
 	if s.QuotaChecker != nil {
-		if ok, reason, msg := s.QuotaChecker.Check(ctx, nn.Namespace, reqBytes); !ok {
+		gangRef, gangTotal := s.gangQuotaContext(ctx, nn, reqBytes)
+		if ok, reason, msg := s.QuotaChecker.Check(ctx, nn.Namespace, reqBytes, gangRef, gangTotal); !ok {
 			log.Printf("Scheduling rejected for Slice %s by quota: %s — %s",
 				nn, reason, msg)
 			return "", &SchedulingError{Reason: reason, Message: msg}
@@ -306,6 +309,31 @@ func (s *SliceScheduler) SyncCacheFromSlice(sliceUID, nodeName, phase string, al
 	case "Released":
 		s.Cache.ReleaseSliceOnce(sliceUID, nodeName)
 	}
+}
+
+// gangQuotaContext returns (gangRef, gangTotalBytes) for a gang member so quota
+// can be enforced gang-atomically, or ("", 0) for a solo slice (or on any
+// lookup failure — a safe fall-back to per-slice quota). gangTotal = gangSize ×
+// this slice's request; gang members are built from one pod template and share
+// an identical request.
+func (s *SliceScheduler) gangQuotaContext(ctx context.Context, nn types.NamespacedName, reqBytes int64) (string, int64) {
+	var slice vgpuv1alpha1.VGPUSlice
+	if err := s.K8sClient.Get(ctx, nn, &slice); err != nil || slice.Annotations == nil {
+		return "", 0
+	}
+	gangRef := slice.Annotations[vgpuv1alpha1.AnnotationGangRef]
+	rsvName := slice.Annotations[vgpuv1alpha1.AnnotationReservationRef]
+	if gangRef == "" || rsvName == "" {
+		return "", 0
+	}
+	var rsv vgpuv1alpha1.VGPUGangReservation
+	if err := s.K8sClient.Get(ctx, types.NamespacedName{Namespace: nn.Namespace, Name: rsvName}, &rsv); err != nil {
+		return "", 0
+	}
+	if rsv.Spec.GangSize <= 0 {
+		return "", 0
+	}
+	return gangRef, int64(rsv.Spec.GangSize) * reqBytes
 }
 
 // SetQuotaChecker wires a quota checker into the scheduler. nil disables

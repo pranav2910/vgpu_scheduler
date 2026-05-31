@@ -2,8 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"sync"
-	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -11,38 +9,39 @@ import (
 
 // QuotaChecker enforces VGPUQuota at scheduling time.
 //
-// It maintains a small in-memory cache of namespace VRAM usage so the hot
-// scheduling path stays O(1). The cache is refreshed lazily on each Filter
-// call (cheap) or invalidated externally when slice phases change.
+// Quota is enforced GANG-ATOMICALLY. When a gang member is checked, the whole
+// gang's demand is weighed against the namespace quota minus the usage of all
+// OTHER workloads — so either the entire gang fits or none of it is admitted. A
+// gang can never be partially admitted past quota.
+//
+// Usage is computed fresh from authoritative API state on every check (the
+// scheduling path is reconcile-driven, not a hot request path), and counts
+// every slice that currently HOLDS capacity — not just Ready ones. Counting
+// in-flight (Scheduled/Allocating) admissions closes the window where a slice
+// could slip past a stale, Ready-only usage figure. (The earlier 5s usage cache
+// caused exactly that and is removed.)
 type QuotaChecker struct {
 	client client.Client
-
-	mu      sync.RWMutex
-	usage   map[string]int64 // namespace → used bytes
-	lastRefresh time.Time
 }
 
 // NewQuotaChecker returns a new checker bound to the given client.
 func NewQuotaChecker(c client.Client) *QuotaChecker {
-	return &QuotaChecker{
-		client: c,
-		usage:  make(map[string]int64),
-	}
+	return &QuotaChecker{client: c}
 }
 
-// Check reports whether a request to allocate `requested` bytes in `namespace`
-// is allowed under any VGPUQuota that targets the namespace.
+// Check reports whether admitting `requested` bytes in `namespace` is allowed
+// under any VGPUQuota that targets the namespace.
 //
-// Returns:
-//   allowed (bool) — true if no quota or quota would not be exceeded
-//   reason (string) — short machine-readable code (empty when allowed)
-//   message (string) — human-readable explanation
-func (q *QuotaChecker) Check(ctx context.Context, namespace string, requested int64) (bool, string, string) {
-	// Find any quota for this namespace. Cluster-scoped, so we List all.
+// For a gang member, pass gangRef (the gang's name) and gangTotal (the gang's
+// full VRAM demand); the check weighs the WHOLE gang against the quota and
+// excludes the gang's own slices from current usage, so every member reaches
+// the same all-or-none verdict. For a solo slice, pass gangRef="" gangTotal=0.
+//
+// Returns: allowed, a short reason code (empty when allowed), and a message.
+func (q *QuotaChecker) Check(ctx context.Context, namespace string, requested int64, gangRef string, gangTotal int64) (bool, string, string) {
 	var quotas vgpuv1alpha1.VGPUQuotaList
 	if err := q.client.List(ctx, &quotas); err != nil {
-		// Fail open — if quota lookup fails, don't block scheduling.
-		// Logged in caller. This matches "no quota = unlimited" semantics.
+		// Fail open — "no quota = unlimited" semantics; logged by the caller.
 		return true, "", ""
 	}
 
@@ -54,61 +53,65 @@ func (q *QuotaChecker) Check(ctx context.Context, namespace string, requested in
 		}
 	}
 	if match == nil {
-		return true, "", "" // No quota = unlimited
+		return true, "", "" // no quota = unlimited
 	}
 
-	// Compute current namespace usage.
-	used, err := q.namespaceUsage(ctx, namespace)
+	// Gang members are weighed as a whole, excluding their own slices from the
+	// "other usage" tally so the gang is counted exactly once (via gangTotal).
+	demand := requested
+	excludeGang := ""
+	if gangRef != "" && gangTotal > 0 {
+		demand = gangTotal
+		excludeGang = gangRef
+	}
+
+	used, err := q.namespaceUsage(ctx, namespace, excludeGang)
 	if err != nil {
 		return true, "", "" // fail open
 	}
 
-	if used+requested > match.Spec.MaxVramBytes {
+	if used+demand > match.Spec.MaxVramBytes {
 		return false, "QuotaExceeded",
-			fmtQuotaExceeded(namespace, used, requested, match.Spec.MaxVramBytes)
+			fmtQuotaExceeded(namespace, used, demand, match.Spec.MaxVramBytes)
 	}
-
 	return true, "", ""
 }
 
-// namespaceUsage returns the sum of allocatedBytes for Ready slices in the
-// given namespace. Uses a 5-second cache to avoid hammering the API.
-func (q *QuotaChecker) namespaceUsage(ctx context.Context, namespace string) (int64, error) {
-	q.mu.RLock()
-	cached, hit := q.usage[namespace]
-	staleness := time.Since(q.lastRefresh)
-	q.mu.RUnlock()
-
-	if hit && staleness < 5*time.Second {
-		return cached, nil
-	}
-
-	// Refresh.
+// namespaceUsage sums the VRAM currently held by slices in the namespace,
+// excluding any whose gang annotation == excludeGang. A slice holds capacity
+// once the scheduler has bound it (spec.nodeName set) and until it is Released
+// or Failed — so in-flight (Scheduled/Allocating) admissions are counted.
+func (q *QuotaChecker) namespaceUsage(ctx context.Context, namespace, excludeGang string) (int64, error) {
 	var slices vgpuv1alpha1.VGPUSliceList
 	if err := q.client.List(ctx, &slices, client.InNamespace(namespace)); err != nil {
 		return 0, err
 	}
 	var total int64
-	for _, s := range slices.Items {
-		if s.Status.Phase == "Ready" {
-			total += s.Status.AllocatedBytes
+	for i := range slices.Items {
+		s := &slices.Items[i]
+		if s.Spec.NodeName == "" {
+			continue // not yet admitted — holds no capacity
 		}
+		switch string(s.Status.Phase) {
+		case "Released", "Failed":
+			continue // no longer holding capacity
+		}
+		if excludeGang != "" && s.Annotations != nil &&
+			s.Annotations[vgpuv1alpha1.AnnotationGangRef] == excludeGang {
+			continue // this gang is accounted for via gangTotal
+		}
+		total += sliceHeldBytes(s)
 	}
-
-	q.mu.Lock()
-	q.usage[namespace] = total
-	q.lastRefresh = time.Now()
-	q.mu.Unlock()
-
 	return total, nil
 }
 
-// Invalidate clears the cached usage for a namespace, forcing a refresh on
-// the next Check call. Useful when a slice transitions to/from Ready.
-func (q *QuotaChecker) Invalidate(namespace string) {
-	q.mu.Lock()
-	delete(q.usage, namespace)
-	q.mu.Unlock()
+// sliceHeldBytes is the VRAM a bound slice is accounted for: its real allocation
+// once Ready, otherwise its request (admitted but not yet allocated).
+func sliceHeldBytes(s *vgpuv1alpha1.VGPUSlice) int64 {
+	if s.Status.AllocatedBytes > 0 {
+		return s.Status.AllocatedBytes
+	}
+	return s.Spec.RequestedVRAMBytes
 }
 
 func fmtQuotaExceeded(ns string, used, req, max int64) string {
@@ -117,7 +120,5 @@ func fmtQuotaExceeded(ns string, used, req, max int64) string {
 }
 
 func i64s(v int64) string {
-	// Avoid importing strconv just for this; sprintf-style would also pull fmt.
-	// strconv is already in go.sum so use it.
 	return _i64s(v)
 }
