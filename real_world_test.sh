@@ -148,6 +148,23 @@ count_gangs_by_phase() {
     fi
 }
 
+# Count VGPUGangReservations in a namespace whose status.phase matches $1.
+# Robust JSON parse (the embedded-newline jsonpath form errors out under set -e).
+count_rsv_by_phase() {
+    local phase=$1 ns=$2
+    kubectl get vgpugangreservation -n "$ns" -o json 2>/dev/null \
+        | python3 -c "import sys,json;print(sum(1 for g in json.load(sys.stdin).get('items',[]) if g.get('status',{}).get('phase')=='$phase'))" 2>/dev/null \
+        || echo 0
+}
+
+# Count child objects of a gang by name prefix (children are named "<gang>-N...").
+# Children carry gang *annotations*, not labels, so a label selector matches nothing.
+count_children_by_prefix() {
+    local kind=$1 ns=$2 prefix=$3
+    kubectl get "$kind" -n "$ns" --no-headers 2>/dev/null \
+        | awk -v p="${prefix}-" 'index($1,p)==1' | wc -l | tr -d ' '
+}
+
 # Wait for a predicate to evaluate true, OR until timeout. Returns 0 on success,
 # 1 on timeout. The predicate is a bash command in a string.
 wait_for_pred() {
@@ -225,8 +242,23 @@ ns_cleanup() {
 # Verify the cluster is in a clean baseline state. Aborts the run if not.
 # Called at the top of every test so we never start on dirty state.
 require_clean_baseline() {
-    local committed
-    committed=$(committed_bytes)
+    # After a chaos test (controller/scheduler crash) the next test must not
+    # start until the control plane has re-stabilized — re-acquired leadership,
+    # re-established watches, re-seeded the scheduler cache. Wait for both
+    # deployments Available, then a short settle so a freshly-elected leader is
+    # actually reconciling before we submit work.
+    kubectl rollout status deployment/vgpu-controller -n vgpu-system --timeout=120s >/dev/null 2>&1 || true
+    kubectl rollout status deployment/vgpu-scheduler  -n vgpu-system --timeout=120s >/dev/null 2>&1 || true
+    sleep 5
+
+    # Bounded wait for committed capacity to return to 0 (graceful teardown from
+    # the previous test may still be draining).
+    local committed elapsed=0
+    while [[ $elapsed -lt 30 ]]; do
+        committed=$(committed_bytes)
+        [[ "$committed" == "0" ]] && break
+        sleep 2; elapsed=$((elapsed + 2))
+    done
     if [[ "$committed" != "0" ]]; then
         fail "cluster is NOT clean: $committed bytes still committed before test"
         kubectl get vgpuslice -A
@@ -587,10 +619,454 @@ if [[ "$init_committed" != "0" ]]; then
 fi
 ok "baseline: 0 bytes committed (cluster clean)"
 
+# Reset the scheduler's in-memory cache to a known-clean state before testing.
+# committed_bytes==0 proves the *API* is clean, but the scheduler cache can
+# briefly retain draining holds/allocations from a prior heavy run (self-heals
+# in ~50s via the TTL reaper — benign, never over-admission). Restarting forces
+# a re-seed from authoritative API state; the warm-up gate guarantees the
+# re-seed is correct, so every battery starts deterministic regardless of what
+# ran before. (Skipped under --skip-cleanup, where we're inspecting live state.)
+if [[ $SKIP_CLEANUP -eq 0 ]]; then
+    banner "Preflight: resetting scheduler cache to a clean baseline"
+    kubectl rollout restart deployment/vgpu-scheduler -n vgpu-system >/dev/null 2>&1 || true
+    kubectl rollout status deployment/vgpu-scheduler -n vgpu-system --timeout=120s >/dev/null 2>&1 || true
+    seeded=0
+    for _ in $(seq 1 30); do
+        if kubectl logs -n vgpu-system deployment/vgpu-scheduler 2>/dev/null | grep -q "Seeded cache: re-accounted"; then
+            seeded=1; break
+        fi
+        sleep 2
+    done
+    [[ "$seeded" -eq 1 ]] && ok "scheduler cache re-seeded (clean baseline)" || warn "could not confirm re-seed; proceeding anyway"
+fi
+
+# Test 2.4 — Scheduler crash mid-bind
+#
+# test-2-4 v4: custom-deadline submission
+#
+# Submits 3 gangs with reservationTimeoutSeconds=240 (overriding submit_gang's
+# 60s default) so the contention window is wide enough to detect, crash, and
+# observe recovery. 2 gangs win; 1 is held by the gang gate. Kill the
+# scheduler mid-flight. Verify:
+#   - committed gangs remain Committed (cache rebuilds correctly)
+#   - deferred gang reaches a clean terminal state (Failed or Committed)
+#   - capacity accounting is correct
+# Post-crash "settled" check for test 2.4. Returns 0 when no reservation is still
+# in a non-terminal phase AND the deferred gang is either cleanly torn down
+# (Failed/Released with zero child slices/claims/jobs) or recovered to Committed.
+# Defined as a real function so the predicate carries no eval'd `return`/`false`
+# control flow (which would otherwise return from wait_for_pred itself).
+_gang24_settled() {
+    local ns=$1 dg=$2
+    local p r rd
+    p=$(count_rsv_by_phase Pending "$ns")
+    r=$(count_rsv_by_phase Reserving "$ns")
+    rd=$(count_rsv_by_phase Reserved "$ns")
+    [[ $((p + r + rd)) -gt 0 ]] && return 1
+    local defphase
+    defphase=$(kubectl get vgpugangreservation -n "$ns" "${dg}-rsv" -o jsonpath='{.status.phase}' 2>/dev/null || echo Released)
+    if [[ "$defphase" == "Failed" || "$defphase" == "Released" ]]; then
+        local s c j
+        s=$(count_children_by_prefix vgpuslice "$ns" "$dg")
+        c=$(count_children_by_prefix vgpuclaim "$ns" "$dg")
+        j=$(count_children_by_prefix vgpujob  "$ns" "$dg")
+        [[ "$s" == "0" && "$c" == "0" && "$j" == "0" ]]
+        return
+    fi
+    [[ "$defphase" == "Committed" ]]
+}
+
+test_2_4_scheduler_crash_mid_bind() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-4-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+
+    log_to_report "**Setup:** Submit 3 gangs × 4 × 10 GiB with 120s timeout (120 GiB demand into 80 GiB cluster). 2 win, 1 held. Kill scheduler mid-flight."
+    log_to_report ""
+
+    # 1. Submit 3 contended gangs inline (240s deadline overrides the 60s
+    #    default in submit_gang to give us a stable contention window).
+    local g
+    for g in g1 g2 g3; do
+        cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: { name: $g, namespace: $ns }
+spec:
+  gangSize: 4
+  minAvailable: 4
+  priority: 500
+  workloadClass: Training
+  preemptible: false
+  reservationTimeoutSeconds: 120
+  podTemplate:
+    spec:
+      requestedVramBytes: 10737418240
+      serviceTier: Guaranteed
+EOF
+    done
+
+    sleep 2
+
+    # 2. Wait for contention state.
+    if ! wait_for_pred 60 "contention established (2 Committed + 1 Reserving)" '
+        c=$(count_rsv_by_phase Committed '"$ns"');
+        r=$(count_rsv_by_phase Reserving '"$ns"');
+        [[ "$c" -eq 2 ]] && [[ "$r" -eq 1 ]]
+    '; then
+        fail "did not reach 2-committed-1-deferred state within 60s"
+        kubectl get vgpugangreservation -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 3. Identify the deferred gang.
+    local deferred_gang=""
+    for g in g1 g2 g3; do
+        local ph
+        ph=$(kubectl get vgpugangreservation -n "$ns" "${g}-rsv" -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [[ "$ph" == "Reserving" ]]; then
+            deferred_gang="$g"
+            break
+        fi
+    done
+    if [[ -z "$deferred_gang" ]]; then
+        fail "could not identify deferred gang"
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "deferred gang: $deferred_gang (the cohort under test)"
+    log_to_report "- Deferred gang: \`$deferred_gang\`"
+
+    local pre_committed; pre_committed=$(committed_bytes)
+    dim "pre-crash committed=$pre_committed bytes"
+
+    # 4. Kill scheduler.
+    dim "killing scheduler pod..."
+    kubectl delete pod -n vgpu-system -l control-plane=vgpu-scheduler --wait=false >/dev/null 2>&1 || true
+
+    # 5. Wait for rollout.
+    if ! kubectl rollout status deployment/vgpu-scheduler -n vgpu-system --timeout=60s >/dev/null 2>&1; then
+        fail "scheduler did not recover within 60s of crash"
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "scheduler back up; observing recovery..."
+
+    # 6. Wait up to 240s (deadline window) for stable terminal state.
+    #    Acceptable: g1, g2 stay Committed; deferred gang either Committed
+    #    (recovery), Failed (deadline), or Released (failed + cleaned).
+    if ! wait_for_pred 240 "stable terminal state after crash" \
+        '_gang24_settled '"$ns"' '"$deferred_gang"; then
+        fail "system did not reach stable terminal state within 240s after crash"
+        kubectl get vgpugangjob,vgpugangreservation,vgpuslice -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 7. Verify post-recovery state.
+    local final_committed; final_committed=$(committed_bytes)
+    local g1_phase g2_phase def_phase
+    g1_phase=$(kubectl get vgpugangreservation -n "$ns" g1-rsv -o jsonpath='{.status.phase}' 2>/dev/null || echo "<gone>")
+    g2_phase=$(kubectl get vgpugangreservation -n "$ns" g2-rsv -o jsonpath='{.status.phase}' 2>/dev/null || echo "<gone>")
+    def_phase=$(kubectl get vgpugangreservation -n "$ns" "${deferred_gang}-rsv" -o jsonpath='{.status.phase}' 2>/dev/null || echo "<gone>")
+
+    log_to_report ""
+    log_to_report "**Observed (post-recovery):**"
+    log_to_report "- g1 reservation:        \`$g1_phase\`"
+    log_to_report "- g2 reservation:        \`$g2_phase\`"
+    log_to_report "- $deferred_gang reservation: \`$def_phase\`"
+    log_to_report "- Committed bytes:       $final_committed"
+
+    if [[ "$g1_phase" != "Committed" ]] || [[ "$g2_phase" != "Committed" ]]; then
+        fail "committed gangs lost their state across crash: g1=$g1_phase g2=$g2_phase"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    if [[ "$def_phase" == "Committed" ]]; then
+        fail "deferred gang reached Committed but cluster only has 80 GiB — over-admission"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    local expected_committed=85899345920  # 2 × 40 GiB
+    if [[ "$final_committed" != "$expected_committed" ]]; then
+        fail "capacity accounting wrong: committed=$final_committed expected=$expected_committed"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    ok "post-crash state stable: g1=$g1_phase, g2=$g2_phase, $deferred_gang=$def_phase, capacity=$final_committed bytes"
+    log_to_report "- **Path:** ✅ Graceful failure of deferred gang; committed gangs preserved"
+    ns_cleanup "$ns"
+    return 0
+}
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 2.3 — Controller crash mid-gang
+# The controller hosts the gang-job, claim, slice, and reservation reconcilers —
+# all state lives in CRDs, none in memory. Submit a gang that fits, kill the
+# controller while it's materializing, and verify the gang still converges to
+# Committed after the controller recovers, with correct capacity and clean teardown.
+# ─────────────────────────────────────────────────────────────────────────────
+test_2_3_controller_crash_mid_gang() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-3-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+
+    log_to_report "**Setup:** Submit a 4 × 10 GiB gang (fits in 80 GiB). Kill the controller mid-materialization. Verify the gang converges to Committed after recovery, then deletes cleanly."
+    log_to_report ""
+
+    # 1. Submit a gang that fits, with a generous 180s deadline so a crash burst
+    #    cannot push it past the reservation deadline — a stateless controller
+    #    should recover and commit well within that budget. (submit_gang's default
+    #    60s is too tight to absorb a 3-crash storm + rollout, which correctly
+    #    fails closed rather than recovering — see test 2.4 for the deadline path.)
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: { name: ctlcrash, namespace: $ns }
+spec:
+  gangSize: 4
+  minAvailable: 4
+  priority: 500
+  workloadClass: Training
+  preemptible: false
+  reservationTimeoutSeconds: 180
+  podTemplate:
+    spec:
+      requestedVramBytes: 10737418240
+      serviceTier: Guaranteed
+EOF
+
+    # 2-3. Chaos burst: the full pipeline commits in <4s, so a single well-timed
+    #      kill is racy. Instead, crash the controller 3× across the first ~6s so
+    #      at least one crash deterministically lands mid-materialization.
+    dim "crashing controller 3× during materialization..."
+    local i pre_phase
+    for i in 1 2 3; do
+        pre_phase=$(kubectl get vgpugangreservation -n "$ns" ctlcrash-rsv -o jsonpath='{.status.phase}' 2>/dev/null || echo "<none>")
+        dim "  crash $i — reservation phase: ${pre_phase:-<none>}"
+        kubectl delete pod -n vgpu-system -l control-plane=vgpu-controller --wait=false >/dev/null 2>&1 || true
+        sleep 2
+    done
+    log_to_report "- Controller crashed 3× during materialization window"
+
+    # 4. Wait for the controller to stabilize after the burst.
+    if ! kubectl rollout status deployment/vgpu-controller -n vgpu-system --timeout=120s >/dev/null 2>&1; then
+        fail "controller did not recover within 120s of the crash burst"
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "controller stabilized; observing convergence..."
+
+    # 5. Gang must converge to Committed (it fits) after the controller recovers.
+    if ! wait_for_pred 120 "gang converges to Committed after controller crash" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' ctlcrash-rsv -o jsonpath="{.status.phase}" 2>/dev/null);
+        [[ "$ph" == "Committed" ]]
+    '; then
+        fail "gang did not converge to Committed after controller crash"
+        kubectl get vgpugangjob,vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 6. Verify exactly 4 Ready slices and correct capacity.
+    local ready; ready=$(kubectl get vgpuslice -n "$ns" -o json 2>/dev/null \
+        | python3 -c 'import sys,json;print(sum(1 for s in json.load(sys.stdin).get("items",[]) if s.get("status",{}).get("phase")=="Ready"))' 2>/dev/null || echo 0)
+    if [[ "$ready" != "4" ]]; then
+        fail "expected 4 Ready slices after recovery, got $ready"
+        kubectl get vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    local committed; committed=$(committed_bytes)
+    local expected=42949672960  # 4 × 10 GiB
+    if [[ "$committed" != "$expected" ]]; then
+        fail "capacity wrong after controller crash: committed=$committed expected=$expected"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "gang converged to Committed after controller crash: 4 Ready slices, capacity=$committed bytes"
+    log_to_report "- Post-recovery: gang Committed, 4 Ready slices, committed=$committed bytes"
+
+    # 7. Delete and verify clean teardown post-recovery.
+    kubectl delete vgpugangjob ctlcrash -n "$ns" --wait=false >/dev/null 2>&1 || true
+    if ! wait_for_pred 90 "clean teardown after recovery" '
+        objs=$(kubectl get vgpugangjob,vgpugangreservation,vgpujob,vgpuclaim,vgpuslice -n '"$ns"' --no-headers 2>/dev/null | wc -l | tr -d " ");
+        [[ "$objs" -eq 0 ]]
+    '; then
+        fail "objects not cleaned up after gang deletion post-recovery"
+        kubectl get vgpugangjob,vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "post-recovery deletion cleaned up fully; capacity returned to baseline"
+    log_to_report "**Path:** ✅ Controller crash is invisible to the gang — CRD-driven state converges after restart."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 2.6 — Object deletion during in-flight scheduling
+# Submit an oversized gang (4 × 30 GiB = 120 GiB into 80 GiB) so it sits in
+# Reserving (never reaches quorum) with children materialized and up to 2 held
+# cache reservations. Delete the VGPUGangJob mid-flight. Assert the whole tree
+# cascade-deletes with no orphans and capacity returns to baseline.
+# ─────────────────────────────────────────────────────────────────────────────
+test_2_6_delete_during_inflight() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-6-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+
+    log_to_report "**Setup:** Submit oversized gang (4 × 30 GiB into 80 GiB → stays Reserving). Delete the VGPUGangJob while in-flight. Verify full cascade cleanup."
+    log_to_report ""
+
+    # 1. Submit oversized gang — it will materialize children and sit in Reserving.
+    submit_gang "$ns" "race" 4 32212254720   # 30 GiB each
+
+    # 2. Wait until it's genuinely in-flight: Reserving AND children materialized.
+    if ! wait_for_pred 30 "gang in-flight (Reserving + ≥1 child slice)" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' race-rsv -o jsonpath="{.status.phase}" 2>/dev/null);
+        sl=$(kubectl get vgpuslice -n '"$ns"' --no-headers 2>/dev/null | wc -l | tr -d " ");
+        [[ "$ph" == "Reserving" ]] && [[ "$sl" -ge 1 ]]
+    '; then
+        fail "gang never reached in-flight (Reserving) state within 30s"
+        kubectl get vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    local inflight_slices; inflight_slices=$(kubectl get vgpuslice -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    dim "in-flight: reservation=Reserving, $inflight_slices child slice(s) materialized"
+    log_to_report "- In-flight snapshot: reservation Reserving, $inflight_slices child slices"
+
+    # 3. Delete the gang mid-flight.
+    dim "deleting VGPUGangJob mid-reservation..."
+    kubectl delete vgpugangjob race -n "$ns" --wait=false >/dev/null 2>&1 || true
+
+    # 4. Full cascade cleanup: every object kind drops to zero.
+    if ! wait_for_pred 120 "full cascade cleanup after in-flight delete" '
+        objs=$(kubectl get vgpugangjob,vgpugangreservation,vgpujob,vgpuclaim,vgpuslice -n '"$ns"' --no-headers 2>/dev/null | wc -l | tr -d " ");
+        [[ "$objs" -eq 0 ]]
+    '; then
+        fail "objects not fully cleaned up after in-flight gang deletion"
+        kubectl get vgpugangjob,vgpugangreservation,vgpujob,vgpuclaim,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 5. Capacity (and any held cache reservations) returned to baseline.
+    local final_committed; final_committed=$(committed_bytes)
+    if [[ "$final_committed" != "0" ]]; then
+        fail "capacity did not return to 0 after in-flight delete: committed=$final_committed"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    ok "in-flight gang deletion fully cleaned up; no orphans, capacity=0"
+    log_to_report ""
+    log_to_report "**Observed:** all child jobs/claims/slices + reservation cascade-deleted; committed bytes = 0."
+    log_to_report "**Path:** ✅ Mid-flight deletion races cleanly to a clean cluster."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 2.7 — Gang + preemption interaction
+# Gang members are non-preemptible by design: evicting one member would break
+# gang atomicity, so the system must NOT preempt a gang member even for a strictly
+# higher-priority request. Fill the cluster with a non-preemptible gang, submit a
+# higher-priority standalone VGPUJob, and assert the gang stays fully intact and
+# the high-priority request simply fails to schedule (no member enters Preempting).
+# ─────────────────────────────────────────────────────────────────────────────
+test_2_7_gang_vs_preemption() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-7-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+
+    log_to_report "**Setup:** Non-preemptible gang (4 × 20 GiB) fills the cluster. Submit a higher-priority (900) standalone job needing 20 GiB. Assert no gang member is preempted; gang stays Running; high-prio request fails to schedule."
+    log_to_report ""
+
+    # 1. Fill the cluster with a non-preemptible gang (submit_gang sets priority 500,
+    #    preemptible false). 4 × 20 GiB = 80 GiB = whole cluster.
+    submit_gang "$ns" "filler" 4 21474836480
+    if ! wait_for_pred 60 "filler gang Committed (cluster full)" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' filler-rsv -o jsonpath="{.status.phase}" 2>/dev/null);
+        [[ "$ph" == "Committed" ]]
+    '; then
+        fail "filler gang did not commit within 60s"
+        kubectl get vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "filler gang Committed; cluster is full (80 GiB)"
+
+    # 2. Submit a higher-priority (900) standalone VGPUJob needing 20 GiB.
+    #    Priority delta is 400 (≥100), but the only occupants are non-preemptible
+    #    gang members — so it must NOT trigger preemption.
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata: { name: highprio, namespace: $ns }
+spec:
+  priority: 900
+  preemptible: false
+  workloadClass: Inference
+  preemptionGraceSeconds: 30
+  claimTemplate:
+    spec:
+      requestedVramBytes: 21474836480
+      serviceTier: Guaranteed
+EOF
+    dim "submitted higher-priority (900) standalone job; observing for 25s..."
+
+    # 3. Observe for 25s: no gang member may enter Preempting, gang stays intact,
+    #    high-prio slice must not become Ready.
+    local breached=0 t=0
+    while [[ $t -lt 25 ]]; do
+        local preempting
+        preempting=$(kubectl get vgpuslice -n "$ns" -o json 2>/dev/null \
+            | python3 -c 'import sys,json;print(sum(1 for s in json.load(sys.stdin).get("items",[]) if s.get("status",{}).get("phase")=="Preempting"))' 2>/dev/null || echo 0)
+        if [[ "$preempting" != "0" ]]; then breached=1; break; fi
+        sleep 5; t=$((t + 5))
+    done
+    if [[ "$breached" -eq 1 ]]; then
+        fail "a gang member entered Preempting — gang atomicity violated by preemption"
+        kubectl get vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 4. Verify the gang is still fully intact and capacity unchanged.
+    local rsv_phase ready committed
+    rsv_phase=$(kubectl get vgpugangreservation -n "$ns" filler-rsv -o jsonpath='{.status.phase}' 2>/dev/null || echo "<gone>")
+    ready=$(kubectl get vgpuslice -n "$ns" -o json 2>/dev/null \
+        | python3 -c 'import sys,json;print(sum(1 for s in json.load(sys.stdin).get("items",[]) if s.get("status",{}).get("phase")=="Ready" and s["metadata"]["name"].startswith("filler-")))' 2>/dev/null || echo 0)
+    committed=$(committed_bytes)
+    if [[ "$rsv_phase" != "Committed" || "$ready" != "4" ]]; then
+        fail "filler gang not intact after high-prio submission: phase=$rsv_phase ready=$ready"
+        kubectl get vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 5. The high-priority request must NOT have scheduled (no capacity, no eviction).
+    local hp_phase
+    hp_phase=$(kubectl get vgpuslice -n "$ns" highprio-claim-slice -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
+    if [[ "$hp_phase" == "Ready" ]]; then
+        fail "high-priority job scheduled despite a full, non-preemptible cluster (over-admission)"
+        ns_cleanup "$ns"; return 1
+    fi
+    if [[ "$committed" != "85899345920" ]]; then
+        fail "capacity changed unexpectedly: committed=$committed (expected 80 GiB held by gang)"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    ok "gang intact (4 Ready), no member preempted; high-prio request correctly unscheduled (phase=$hp_phase)"
+    log_to_report "- Filler gang: Committed, 4 Ready slices (intact)"
+    log_to_report "- High-priority job slice: \`$hp_phase\` (not scheduled — correct)"
+    log_to_report "**Path:** ✅ Gang atomicity beats single-slice priority; non-preemptible members are never evicted."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# Functional tests first, then the destructive chaos tests LAST (standard
+# practice): a crashed controller/scheduler needs time to re-stabilize, and
+# running chaos last means that re-stabilization can't bleed into other tests.
 run_test "1.1" "Concurrent gangs (atomicity)"      test_1_1_concurrent_gangs
 run_test "1.2" "Race on full-cluster slots"        test_1_2_race_full_cluster
 run_test "2.1" "Capacity returns after Running"    test_2_1_capacity_returns_after_running
 run_test "2.2" "Failed gang teardown"              test_2_2_failed_gang_teardown
+run_test "2.6" "Delete during in-flight scheduling" test_2_6_delete_during_inflight
+run_test "2.7" "Gang vs preemption (atomicity)"    test_2_7_gang_vs_preemption
+run_test "2.4" "Scheduler crash mid-bind"          test_2_4_scheduler_crash_mid_bind
+run_test "2.3" "Controller crash mid-gang"         test_2_3_controller_crash_mid_gang
 
 finalize_report
 

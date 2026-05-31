@@ -28,6 +28,27 @@ type VRAMCache struct {
 	// allocatedBytesBySlice remembers per-slice allocations so ReleaseAllocated
 	// can decrement the exact amount even if the caller's bytes arg is stale.
 	allocatedBytesBySlice map[string]int64
+
+	// seeded is set once the cache has been warmed at startup with node capacity
+	// AND the consumption of all already-bound slices. The scheduler refuses to
+	// place slices until this is true, so a freshly (re)started scheduler cannot
+	// over-admit into capacity that is actually occupied by slices it has not
+	// yet re-observed. Closes the scheduler-restart over-admission window.
+	seeded bool
+}
+
+// MarkSeeded records that the cache has been warmed and scheduling may begin.
+func (c *VRAMCache) MarkSeeded() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seeded = true
+}
+
+// IsSeeded reports whether the startup warm-up has completed.
+func (c *VRAMCache) IsSeeded() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.seeded
 }
 
 type NodeState struct {
@@ -37,6 +58,10 @@ type NodeState struct {
 	ReservedVRAMBytes  int64
 	FreeVRAMBytes      int64
 	Healthy            bool
+	// TopologyZone is the node's topology zone, from the
+	// topology.vgpu.pranav2910.com/zone label. Empty if the node is
+	// unlabeled. Phase 2.5a: node-level topology awareness.
+	TopologyZone string
 }
 
 type AssumedAllocation struct {
@@ -264,6 +289,21 @@ func (c *VRAMCache) RollbackAssumedSlice(sliceUID string) {
 	}
 }
 
+// ForgetSlice releases a slice's entire cache footprint regardless of which
+// state it's in (assumed / confirmed / allocated). Call this when a slice is
+// deleted so its capacity is reclaimed immediately, rather than depending on
+// the scheduler observing a Released phase (which a fast namespace delete can
+// skip) or the TTL reaper (assumed only). Each sub-release is an idempotent
+// no-op for states the slice isn't in, and a slice is only ever in one of the
+// three states, so there is no risk of double-release.
+func (c *VRAMCache) ForgetSlice(sliceUID, nodeName string) {
+	c.RollbackAssumedSlice(sliceUID) // speculative hold, if any
+	c.ReleaseConfirmedSlice(sliceUID) // confirmed-but-not-allocated, if any
+	if nodeName != "" {
+		c.ReleaseSliceOnce(sliceUID, nodeName) // allocated, if any
+	}
+}
+
 func (c *VRAMCache) ReleaseConfirmedSlice(sliceUID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -346,6 +386,7 @@ type NodeSnapshot struct {
 	ReservedVRAMBytes  int64
 	FreeVRAMBytes      int64
 	Healthy            bool
+	TopologyZone       string
 }
 
 func (c *VRAMCache) SnapshotNode(nodeName string) *NodeSnapshot {
@@ -379,7 +420,33 @@ func snapshotOf(node *NodeState) NodeSnapshot {
 		ReservedVRAMBytes:  node.ReservedVRAMBytes,
 		FreeVRAMBytes:      node.FreeVRAMBytes,
 		Healthy:            node.Healthy,
+		TopologyZone:       node.TopologyZone,
 	}
+}
+
+// SetNodeZone records a node's topology zone (from its
+// topology.vgpu.pranav2910.com/zone label). Creates the node entry if the
+// node-watch reconciler hasn't seen it yet, so zone and capacity can arrive
+// in either order. Phase 2.5a.
+func (c *VRAMCache) SetNodeZone(nodeName, zone string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	node, exists := c.nodes[nodeName]
+	if !exists {
+		node = &NodeState{NodeName: nodeName, Healthy: true}
+		c.nodes[nodeName] = node
+	}
+	node.TopologyZone = zone
+}
+
+// NodeZone returns a node's topology zone, or "" if unknown/unlabeled.
+func (c *VRAMCache) NodeZone(nodeName string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if node, ok := c.nodes[nodeName]; ok {
+		return node.TopologyZone
+	}
+	return ""
 }
 
 // IsAssumed reports whether sliceUID has a held speculative reservation.

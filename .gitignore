@@ -81,3 +81,9 @@ bin/
 # Session artifacts
 *.bak.*
 real_world_report.md
+
+# Test run logs (real_world_test.sh tees timestamped .out files)
+*.out
+
+# Obsolete scratch installers (Wave 2 tests now live in real_world_test.sh)
+add_test_2_4*.sh

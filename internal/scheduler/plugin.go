@@ -7,10 +7,20 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+)
+
+const (
+	// TopologyZoneLabel is the node label declaring its topology zone.
+	// Phase 2.5a (node-level topology awareness).
+	TopologyZoneLabel = "topology.vgpu.pranav2910.com/zone"
+	// TopologyPreferredZoneAnnotation is the workload's soft topology-zone
+	// preference. Propagated Job→Claim→Slice via FilterGangAnnotations.
+	TopologyPreferredZoneAnnotation = "topology.vgpu.pranav2910.com/preferred-zone"
 )
 
 // SliceScheduler is the stateful scheduling engine.
@@ -51,6 +61,15 @@ const gangHoldTTL = 50 * time.Second
 // the Nth arrival the gate releases the cohort, and on subsequent reconciles
 // the previously-deferred members find their hold still alive and proceed.
 func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, sliceUID string, reqBytes int64, bestEffort bool) (string, error) {
+	// Warm-up gate: refuse to place anything until the cache has been seeded with
+	// node capacity AND the consumption of all already-bound slices. Without this,
+	// a freshly restarted scheduler (cold cache, free=full) can place a pending
+	// slice into capacity that is actually occupied by slices it has not yet
+	// re-observed → over-admission. The reconciler retries quickly on this error.
+	if !s.Cache.IsSeeded() {
+		return "", &CacheNotReadyError{}
+	}
+
 	log.Printf("Scheduling cycle started for Slice %s (req: %d bytes)", nn, reqBytes)
 
 	// Layer 2 Phase 2.2a: enforce VGPUQuota before searching for nodes.
@@ -121,7 +140,10 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 		return "", fmt.Errorf("no node has sufficient VRAM for %d bytes", reqBytes)
 	}
 
-	scores := ScoreWithTier(s.Cache, validNodes, reqBytes, bestEffort)
+	// Phase 2.5a: honor a soft topology-zone preference (strong weight — in-zone
+	// nodes outrank out-of-zone, bin-packing orders within the zone).
+	preferredZone := s.slicePreferredZone(ctx, nn)
+	scores := ScoreWithTopology(s.Cache, validNodes, reqBytes, bestEffort, preferredZone)
 	if len(scores) == 0 {
 		return "", fmt.Errorf("scoring returned 0 candidates despite passing filter — cache inconsistency")
 	}
@@ -213,11 +235,48 @@ func (s *SliceScheduler) bindToKubernetesAPI(ctx context.Context, nn types.Names
 
 	statusBase := client.MergeFrom(target.DeepCopy())
 	target.Status.Phase = vgpuv1alpha1.VGPUSlicePhase("Scheduled")
+
+	// Phase 2.5a: explainable topology placement. If the workload expressed a
+	// soft zone preference, record — observably, on the slice — whether we
+	// honored it or fell back to another zone. This is the wedge: not just
+	// topology-aware, but topology-aware with an auditable reason.
+	if pref := target.Annotations[TopologyPreferredZoneAnnotation]; pref != "" {
+		placedZone := s.Cache.NodeZone(nodeName)
+		cond := metav1.Condition{
+			Type:               "TopologyPreferenceSatisfied",
+			LastTransitionTime: metav1.Now(),
+		}
+		if placedZone == pref {
+			cond.Status = metav1.ConditionTrue
+			cond.Reason = "PreferredZoneHonored"
+			cond.Message = fmt.Sprintf("scheduled in preferred zone %q", pref)
+		} else {
+			cond.Status = metav1.ConditionFalse
+			cond.Reason = "TopologyPreferenceMiss"
+			cond.Message = fmt.Sprintf("preferred zone %q unavailable; scheduled in zone %q", pref, placedZone)
+			log.Printf("[topology] %s: %s", nn, cond.Message)
+		}
+		target.Status.Conditions = upsertCondition(target.Status.Conditions, cond)
+	}
+
 	if err := s.K8sClient.Status().Patch(ctx, &target, statusBase); err != nil {
 		return fmt.Errorf("patching status.phase to Scheduled: %w", err)
 	}
 
 	return nil
+}
+
+// slicePreferredZone reads the soft topology-zone preference annotation off the
+// slice, returning "" if absent or unreadable. Phase 2.5a.
+func (s *SliceScheduler) slicePreferredZone(ctx context.Context, nn types.NamespacedName) string {
+	var slice vgpuv1alpha1.VGPUSlice
+	if err := s.K8sClient.Get(ctx, nn, &slice); err != nil {
+		return ""
+	}
+	if slice.Annotations == nil {
+		return ""
+	}
+	return slice.Annotations[TopologyPreferredZoneAnnotation]
 }
 
 // SyncCacheFromSlice reconciles the scheduler cache with the NodeAgent's
@@ -287,4 +346,15 @@ type GangDeferredError struct {
 
 func (e *GangDeferredError) Error() string {
 	return "gang bind deferred: " + e.Reason
+}
+
+// CacheNotReadyError is returned by Schedule before the cache warm-up has
+// completed (just after a scheduler (re)start). The reconciler retries quickly
+// rather than backing off. This gate is what prevents over-admission on
+// restart: no slice is placed until the cache reflects all existing bound
+// consumption.
+type CacheNotReadyError struct{}
+
+func (e *CacheNotReadyError) Error() string {
+	return "scheduler cache not yet seeded; deferring placement"
 }

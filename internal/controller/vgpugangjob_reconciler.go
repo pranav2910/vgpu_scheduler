@@ -164,7 +164,19 @@ func (r *VGPUGangJobReconciler) ensureChildren(ctx context.Context, gang *vgpuv1
 			return created, existing, err
 		}
 
-		// Build child VGPUJob.
+		// Build child VGPUJob. Start with the gang/reservation refs, then merge
+		// any propagated annotations from the gang itself (Phase 2.5a: topology
+		// hints) so they ride the Job→Claim→Slice chain to the scheduler.
+		childAnnotations := map[string]string{
+			vgpuv1alpha1.AnnotationGangRef:        gang.Name,
+			vgpuv1alpha1.AnnotationReservationRef: reservationNameForGang(gang.Name),
+		}
+		for k, v := range FilterGangAnnotations(gang.Annotations) {
+			if _, exists := childAnnotations[k]; !exists {
+				childAnnotations[k] = v
+			}
+		}
+
 		child := &vgpuv1alpha1.VGPUJob{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
@@ -173,10 +185,7 @@ func (r *VGPUGangJobReconciler) ensureChildren(ctx context.Context, gang *vgpuv1
 					vgpuv1alpha1.LabelGangParent: gang.Name,
 					vgpuv1alpha1.LabelGangIndex:  strconv.Itoa(int(i)),
 				},
-				Annotations: map[string]string{
-					vgpuv1alpha1.AnnotationGangRef:        gang.Name,
-					vgpuv1alpha1.AnnotationReservationRef: reservationNameForGang(gang.Name),
-				},
+				Annotations: childAnnotations,
 			},
 			Spec: vgpuv1alpha1.VGPUJobSpec{
 				Priority:               gang.Spec.Priority,

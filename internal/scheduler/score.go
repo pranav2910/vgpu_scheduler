@@ -12,11 +12,21 @@ const (
 	// fragmentPenaltyBytes is the magnitude of the penalty; the sign is applied
 	// at the use site. Bug #12 fix.
 	fragmentPenaltyBytes = int64(5_000_000_000)
+
+	// topologyZoneMatchBonus is added to a node's score when it matches the
+	// workload's preferred topology zone. Phase 2.5a: "strong" weight — it is
+	// an order of magnitude above the bin-pack range (~80e9), so any in-zone
+	// node outranks every out-of-zone node, and bin-packing only orders nodes
+	// *within* the preferred zone. Soft preference: a workload still schedules
+	// out-of-zone if its zone is full (the bonus is purely additive, never a
+	// filter). Decision locked with user: soft-only, strong weight.
+	topologyZoneMatchBonus = int64(1_000_000_000_000)
 )
 
 type ScoreBreakdown struct {
 	BinPackScore       int64
 	FragmentationScore int64
+	ZoneScore          int64
 	Total              int64
 }
 
@@ -32,7 +42,20 @@ const BestEffortPenalty = int64(1_000_000_000)
 // Score ranks eligible nodes by bin-packing efficiency and fragmentation penalty.
 // Uses SnapshotAllNodes so the loop is lock-free. Bug #9 fix.
 // ScoreWithTier is the tier-aware scoring entrypoint. Bug #19.
+//
+// Back-compat shim: delegates to ScoreWithTopology with no zone preference.
 func ScoreWithTier(cache *VRAMCache, validNodes []string, requestedBytes int64, bestEffort bool) []NodeScore {
+	return ScoreWithTopology(cache, validNodes, requestedBytes, bestEffort, "")
+}
+
+// ScoreWithTopology ranks eligible nodes by bin-packing efficiency, fragmentation
+// penalty, tier, and — Phase 2.5a — topology-zone affinity. When preferredZone is
+// non-empty, nodes whose TopologyZone matches it receive topologyZoneMatchBonus,
+// which dominates the bin-pack range so in-zone nodes always outrank out-of-zone
+// nodes (with bin-packing ordering within each zone). The preference is soft: if
+// no in-zone node has capacity, the workload still schedules out-of-zone — the
+// caller is expected to surface a TopologyPreferenceMiss condition in that case.
+func ScoreWithTopology(cache *VRAMCache, validNodes []string, requestedBytes int64, bestEffort bool, preferredZone string) []NodeScore {
 	snaps := cache.SnapshotAllNodes()
 	byName := make(map[string]NodeSnapshot, len(snaps))
 	for _, s := range snaps {
@@ -58,7 +81,14 @@ func ScoreWithTier(cache *VRAMCache, validNodes []string, requestedBytes int64, 
 			frag = -fragmentPenaltyBytes
 		}
 
-		total := binPack + frag
+		// Topology-zone affinity (Phase 2.5a): strong additive bonus for an
+		// in-zone node. Only applies when the workload expressed a preference.
+		zone := int64(0)
+		if preferredZone != "" && node.TopologyZone == preferredZone {
+			zone = topologyZoneMatchBonus
+		}
+
+		total := binPack + frag + zone
 		if bestEffort {
 			total -= BestEffortPenalty
 		}
@@ -68,6 +98,7 @@ func ScoreWithTier(cache *VRAMCache, validNodes []string, requestedBytes int64, 
 			Score: ScoreBreakdown{
 				BinPackScore:       binPack,
 				FragmentationScore: frag,
+				ZoneScore:          zone,
 				Total:              total,
 			},
 		})
@@ -76,9 +107,6 @@ func ScoreWithTier(cache *VRAMCache, validNodes []string, requestedBytes int64, 
 	sort.Slice(scores, func(i, j int) bool {
 		return scores[i].Score.Total > scores[j].Score.Total
 	})
-
-	// Scoring winner log removed from hot path (round-3 fix). If you need it,
-	// enable it via a debug build tag or structured logging at V(1).
 
 	return scores
 }

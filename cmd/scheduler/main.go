@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
@@ -97,7 +98,7 @@ func main() {
 				return &queueAdapter{q: priorityQueue}
 			},
 		}).
-		Complete(&sliceSchedulingReconciler{sched: sched, client: mgr.GetClient()}); err != nil {
+		Complete(&sliceSchedulingReconciler{sched: sched, client: mgr.GetClient(), tracked: make(map[types.NamespacedName]trackedSlice)}); err != nil {
 		log.Fatalf("setting up slice scheduling reconciler: %v", err)
 	}
 
@@ -151,13 +152,59 @@ func (r *ttlReaperRunnable) Start(ctx context.Context) error {
 type sliceSchedulingReconciler struct {
 	sched  *scheduler.SliceScheduler
 	client client.Client
+
+	// tracked maps a slice's NamespacedName → its UID and bound node for slices
+	// we've observed. On a delete event (Get → NotFound) the object is gone, so
+	// this lets us release the slice's ENTIRE cache footprint (assumed,
+	// confirmed, or allocated) immediately — rather than depending on observing
+	// a Released phase (which a fast namespace delete can skip) or the TTL
+	// reaper (assumed only). Without it, a deleted committed gang leaves ghost
+	// allocated capacity that blocks a subsequent full-cluster request.
+	mu      sync.Mutex
+	tracked map[types.NamespacedName]trackedSlice
+}
+
+type trackedSlice struct {
+	uid  string
+	node string
+}
+
+// recordSlice remembers a live slice's UID and bound node so a later delete can
+// release whatever cache footprint it held.
+func (r *sliceSchedulingReconciler) recordSlice(nn types.NamespacedName, uid, node string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tracked == nil {
+		r.tracked = make(map[types.NamespacedName]trackedSlice)
+	}
+	r.tracked[nn] = trackedSlice{uid: uid, node: node}
+}
+
+// releaseOnDelete reclaims a deleted slice's cache footprint immediately.
+func (r *sliceSchedulingReconciler) releaseOnDelete(nn types.NamespacedName) {
+	r.mu.Lock()
+	t, ok := r.tracked[nn]
+	delete(r.tracked, nn)
+	r.mu.Unlock()
+	if ok && t.uid != "" {
+		r.sched.Cache.ForgetSlice(t.uid, t.node)
+	}
 }
 
 func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	var slice vgpuv1alpha1.VGPUSlice
 	if err := r.client.Get(ctx, req.NamespacedName, &slice); err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+		if client.IgnoreNotFound(err) == nil {
+			// Slice deleted — release its entire cache footprint now, instead of
+			// leaving it for a Released-phase observation or the TTL reaper.
+			r.releaseOnDelete(req.NamespacedName)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
 	}
+	// Remember this slice's UID + bound node so a future delete can release
+	// whatever it held.
+	r.recordSlice(req.NamespacedName, string(slice.UID), slice.Spec.NodeName)
 
 	phase := string(slice.Status.Phase)
 
@@ -240,6 +287,11 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 		if errors.As(err, &gd) {
 			return reconcile.Result{RequeueAfter: 500 * time.Millisecond}, nil
 		}
+		// Cache still warming up after a (re)start — retry quickly, don't back off.
+		var cnr *scheduler.CacheNotReadyError
+		if errors.As(err, &cnr) {
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
 		log.Printf("Scheduling failed for Slice %s/%s: %v — will retry in 30s",
 			slice.Namespace, slice.Name, err)
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
@@ -267,8 +319,12 @@ func (r *nodeCapacityReconciler) Reconcile(ctx context.Context, req reconcile.Re
 
 	consumed := consumedVRAMOnNode(&node)
 	r.cache.UpdateNode(node.Name, totalVRAM.Value(), consumed)
-	log.Printf("Cache updated: node %s total=%d consumed=%d",
-		node.Name, totalVRAM.Value(), consumed)
+	// Phase 2.5a: record the node's topology zone from its label, if any.
+	if zone := node.Labels[scheduler.TopologyZoneLabel]; zone != "" {
+		r.cache.SetNodeZone(node.Name, zone)
+	}
+	log.Printf("Cache updated: node %s total=%d consumed=%d zone=%q",
+		node.Name, totalVRAM.Value(), consumed, node.Labels[scheduler.TopologyZoneLabel])
 	return reconcile.Result{}, nil
 }
 
@@ -286,8 +342,15 @@ func consumedVRAMOnNode(node *corev1.Node) int64 {
 	return consumed
 }
 
-// seedCacheFromNodes pre-populates the VRAM cache at startup.
+// seedCacheFromNodes pre-populates the VRAM cache at startup: first node
+// capacity, then the consumption of every already-bound slice. It marks the
+// cache seeded at the end (always — even if the slice list degrades — so a
+// transient API hiccup can't permanently wedge scheduling; the lazy reconcile
+// path + TTL reaper still converge). Until seeded, Schedule() defers placement,
+// which is what prevents over-admission on a scheduler restart.
 func seedCacheFromNodes(ctx context.Context, k8sClient client.Client, cache *scheduler.VRAMCache) error {
+	defer cache.MarkSeeded()
+
 	var nodeList corev1.NodeList
 	if err := k8sClient.List(ctx, &nodeList); err != nil {
 		return fmt.Errorf("listing nodes: %w", err)
@@ -301,9 +364,40 @@ func seedCacheFromNodes(ctx context.Context, k8sClient client.Client, cache *sch
 		}
 		consumed := consumedVRAMOnNode(node)
 		cache.UpdateNode(node.Name, totalVRAM.Value(), consumed)
-		log.Printf("Seeded cache: node %s total=%d consumed=%d",
-			node.Name, totalVRAM.Value(), consumed)
+		if zone := node.Labels[scheduler.TopologyZoneLabel]; zone != "" {
+			cache.SetNodeZone(node.Name, zone)
+		}
+		log.Printf("Seeded cache: node %s total=%d consumed=%d zone=%q",
+			node.Name, totalVRAM.Value(), consumed, node.Labels[scheduler.TopologyZoneLabel])
 	}
+
+	// Re-account already-bound slices so a restarted scheduler knows true
+	// consumption before it places anything. Without this, the cache cold-starts
+	// at free=capacity and can over-admit until the reconciler lazily catches up.
+	var sliceList vgpuv1alpha1.VGPUSliceList
+	if err := k8sClient.List(ctx, &sliceList); err != nil {
+		log.Printf("WARNING: seeding slices failed: %v (cache may briefly under-count until reconcile)", err)
+		return nil
+	}
+	reaccounted := 0
+	for i := range sliceList.Items {
+		sl := &sliceList.Items[i]
+		if sl.Spec.NodeName == "" {
+			continue
+		}
+		switch string(sl.Status.Phase) {
+		case "Scheduled", "Allocating", "Ready":
+			bytes := sl.Status.AllocatedBytes
+			if bytes <= 0 {
+				bytes = sl.Spec.RequestedVRAMBytes // not yet allocated; reserve its ask
+			}
+			// Idempotent; the restart-fallback path applies the allocation
+			// directly and returns a benign "not confirmed" error we ignore.
+			_ = cache.PromoteSliceToAllocatedOnce(string(sl.UID), sl.Spec.NodeName, bytes)
+			reaccounted++
+		}
+	}
+	log.Printf("Seeded cache: re-accounted %d bound slice(s) into consumption", reaccounted)
 	return nil
 }
 
