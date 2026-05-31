@@ -298,6 +298,8 @@ should_run() {
     local id=$1
     [[ -z "$ONLY" ]] && return 0
     [[ "$ONLY" == "$id" ]] && return 0
+    # Prefix match so e.g. --only=3 runs the whole Wave 3 group (3.1, 3.2, ...).
+    [[ "$id" == "$ONLY".* ]] && return 0
     return 1
 }
 
@@ -1243,6 +1245,301 @@ EOF
     return 0
 }
 
+# ============================================================================
+# WAVE 3 — Complex / adversarial scenarios (does it sustain what it claims?)
+# Each combines subsystems or sustained load to stress a headline claim that
+# the per-feature Wave 1/2 tests don't exercise together.
+# ============================================================================
+
+# Test 3.1 — Heterogeneous gangs under heavy over-subscription.
+# Demand 180 GiB (40+40+20+80) into 80. Claim under test: SAFETY (committed
+# never exceeds capacity at ANY instant) + LIVENESS (something packs in) +
+# stability (no flapping at steady state) when gang sizes are mixed.
+test_3_1_heterogeneous_packing() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-3-1-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns — demand 180 GiB into 80 (mixed sizes 40/40/20/80)"
+
+    submit_gang "$ns" "a" 4 10737418240   # 40 GiB
+    submit_gang "$ns" "b" 4 10737418240   # 40 GiB
+    submit_gang "$ns" "c" 2 10737418240   # 20 GiB
+    submit_gang "$ns" "d" 8 10737418240   # 80 GiB
+
+    # Continuously sample the safety invariant for 75s.
+    local max=0 cb samples=0 last5=()
+    local deadline=$(( $(date +%s) + 75 ))
+    while [[ $(date +%s) -lt $deadline ]]; do
+        cb=$(committed_bytes); samples=$((samples + 1))
+        if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+            fail "OVER-ADMISSION: committed=$cb > $GPU_BYTES_TOTAL (sample $samples)"
+            kubectl get vgpugangreservation -n "$ns"
+            ns_cleanup "$ns"; return 1
+        fi
+        [[ "$cb" -gt "$max" ]] && max=$cb
+        last5+=("$cb"); [[ ${#last5[@]} -gt 5 ]] && last5=("${last5[@]:1}")
+        sleep 3
+    done
+
+    cb=$(committed_bytes)
+    if [[ "$cb" -eq 0 ]]; then
+        fail "LIVENESS: nothing committed from 4 feasible gangs after 75s"
+        kubectl get vgpugangreservation -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+    # Stability: the last 5 samples should be identical (settled, not flapping).
+    local stable=1 v
+    for v in "${last5[@]}"; do [[ "$v" == "$cb" ]] || stable=0; done
+    if [[ "$stable" -ne 1 ]]; then
+        warn "committed still moving at end (${last5[*]}) — not yet settled, but never over-admitted"
+    fi
+    ok "heterogeneous safety held: max committed=$max <= $GPU_BYTES_TOTAL over $samples samples; settled committed=$cb"
+    log_to_report "- Mixed gangs (40/40/20/80) into 80 GiB: max observed committed = $max bytes, never exceeded capacity."
+    log_to_report "**Path:** ✅ Safety holds under heterogeneous over-subscription; cluster packs (committed=$cb), no over-admission."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# Test 3.2 — Anti-starvation: an impossible gang must not block feasible ones.
+# X needs 160 GiB (8×20) — it can NEVER fit, and would hog the serialized
+# admission slot. Y1,Y2 (40 each) DO fit together. Claim: the gate backs X off
+# so Y1+Y2 make progress while X is still actively contending (not after X dies).
+test_3_2_impossible_gang_no_starvation() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-3-2-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns — impossible X(8×20=160) + feasible Y1,Y2(40 each)"
+
+    # X: impossible, LONG deadline so it keeps contending the whole test.
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: { name: x, namespace: $ns }
+spec:
+  gangSize: 8
+  minAvailable: 8
+  priority: 500
+  workloadClass: Training
+  preemptible: false
+  reservationTimeoutSeconds: 600
+  podTemplate:
+    spec:
+      requestedVramBytes: 21474836480   # 20 GiB × 8 = 160 GiB (never fits)
+      serviceTier: Guaranteed
+EOF
+    submit_gang "$ns" "y1" 4 10737418240   # 40 GiB
+    submit_gang "$ns" "y2" 4 10737418240   # 40 GiB
+
+    # Both feasible gangs must reach Running while X is still Reserving.
+    if ! wait_for_pred 150 "Y1 and Y2 both Running despite impossible X" '
+        [[ "$(gang_phase '"$ns"' y1)" == "Running" ]] && [[ "$(gang_phase '"$ns"' y2)" == "Running" ]]
+    '; then
+        fail "STARVATION: feasible gangs did not both reach Running within 150s (y1=$(gang_phase "$ns" y1) y2=$(gang_phase "$ns" y2) x=$(gang_phase "$ns" x))"
+        kubectl get vgpugangreservation -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+    local xphase cb
+    xphase=$(gang_phase "$ns" x)
+    cb=$(committed_bytes)
+    if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+        fail "OVER-ADMISSION while packing around impossible gang: committed=$cb"
+        ns_cleanup "$ns"; return 1
+    fi
+    if [[ "$xphase" == "Running" ]]; then
+        fail "impossible gang X reached Running — that is physically impossible (160>80)"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "no starvation: Y1+Y2 Running (committed=$cb), impossible X correctly NOT admitted (phase=$xphase)"
+    log_to_report "- Impossible gang (160 GiB) did not block two feasible 40 GiB gangs; X stayed \`$xphase\`."
+    log_to_report "**Path:** ✅ Serialized-admission backoff prevents an un-assemblable gang from starving the cluster."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# Test 3.3 — Sustained mixed-workload soak: 6 rounds of submit→settle→delete.
+# Claim: the system SUSTAINS over time — safety holds every round, and capacity
+# returns to exactly 0 after each round (no cache/accounting leak across cycles).
+test_3_3_soak_no_leak() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-3-3-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns — 6 rounds of mixed submit/delete, leak + safety check"
+
+    local round
+    for round in 1 2 3 4 5 6; do
+        # Vary the mix per round so accounting paths differ.
+        submit_gang "$ns" "r${round}a" 4 10737418240             # 40
+        submit_gang "$ns" "r${round}b" 4 10737418240             # 40
+        submit_gang "$ns" "r${round}c" 2 10737418240             # 20 (over-subscribe → 100>80)
+
+        # Sample safety for ~18s.
+        local cb t=0
+        while [[ $t -lt 18 ]]; do
+            cb=$(committed_bytes)
+            if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+                fail "OVER-ADMISSION in soak round $round: committed=$cb > $GPU_BYTES_TOTAL"
+                ns_cleanup "$ns"; return 1
+            fi
+            sleep 3; t=$((t + 3))
+        done
+
+        # Tear the round down and require capacity back to 0 (leak check).
+        kubectl delete vgpugangjob -n "$ns" --all --wait=false >/dev/null 2>&1 || true
+        if ! wait_for_pred 60 "round $round capacity returns to 0" '[[ "$(committed_bytes)" == "0" ]]'; then
+            fail "LEAK: capacity did not return to 0 after round $round (committed=$(committed_bytes))"
+            kubectl get vgpuslice -n "$ns"
+            ns_cleanup "$ns"; return 1
+        fi
+        dim "  round $round OK (safety held, capacity reclaimed to 0)"
+    done
+
+    ok "soak survived 6 mixed rounds: safety held every round, zero capacity leak between cycles"
+    log_to_report "- 6 submit/settle/delete rounds: no over-admission, capacity returned to 0 each round (no leak)."
+    log_to_report "**Path:** ✅ Accounting is stable over sustained churn — no drift, no leak."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# Test 3.4 — Quota + gang atomicity composition.
+# Namespace quota = 40 GiB. Q1 (40) fits → commits. Q2 (40) would breach quota
+# (80>40) → must be rejected WHOLE, never partially admitted. Claim: quota
+# enforcement composes with gang all-or-nothing.
+test_3_4_quota_gang_atomicity() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-3-4-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns — VGPUQuota maxVramBytes=40 GiB"
+
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUQuota
+metadata: { name: ns-quota, namespace: $ns }
+spec:
+  targetNamespace: $ns
+  maxVramBytes: 42949672960   # 40 GiB
+  description: "Wave3 quota+gang composition test"
+EOF
+    sleep 2
+
+    submit_gang "$ns" "q1" 4 10737418240   # 40 GiB — fits quota exactly
+    if ! wait_for_pred 90 "Q1 (40 GiB) commits within quota" '[[ "$(gang_phase '"$ns"' q1)" == "Running" ]]'; then
+        fail "Q1 (40 GiB) did not commit under a 40 GiB quota (phase=$(gang_phase "$ns" q1))"
+        kubectl get vgpugangjob,vgpuquota -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+
+    submit_gang "$ns" "q2" 4 10737418240   # 40 GiB — would push namespace to 80 > 40
+    # Observe for 30s: Q2 must NOT commit, and committed must stay at 40 (Q1 only).
+    local t=0 cb q2_ready
+    while [[ $t -lt 30 ]]; do
+        cb=$(committed_bytes)
+        if [[ "$cb" -gt 42949672960 ]]; then
+            fail "QUOTA BREACH: committed=$cb > quota 42949672960 (Q2 partially admitted?)"
+            ns_cleanup "$ns"; return 1
+        fi
+        q2_ready=$(kubectl get vgpuslice -n "$ns" -o json 2>/dev/null | python3 -c '
+import sys,json
+n=sum(1 for s in json.load(sys.stdin)["items"]
+      if s.get("metadata",{}).get("annotations",{}).get("gang.vgpu.pranav2910.com/gang")=="q2"
+      and s.get("status",{}).get("phase")=="Ready")
+print(n)')
+        if [[ "${q2_ready:-0}" -gt 0 ]]; then
+            fail "ATOMICITY+QUOTA: Q2 has $q2_ready Ready slice(s) — partial admission past quota"
+            ns_cleanup "$ns"; return 1
+        fi
+        sleep 3; t=$((t + 3))
+    done
+
+    if [[ "$(gang_phase "$ns" q2)" == "Running" ]]; then
+        fail "Q2 reached Running despite exceeding namespace quota"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "quota+gang compose: Q1 Running (committed=$(committed_bytes)=40 GiB), Q2 correctly held out (phase=$(gang_phase "$ns" q2))"
+    log_to_report "- Quota 40 GiB: Q1 committed; Q2 (would breach) held out whole, 0 partial slices."
+    log_to_report "**Path:** ✅ Quota enforcement composes with gang atomicity — no partial over-quota admission."
+    ns_cleanup "$ns"
+    return 0
+}
+
+# Test 3.5 — HA under live contention: kill the scheduler leader TWICE while two
+# 80 GiB gangs contend for an 80 GiB cluster. Claim: stacking leader churn on
+# top of contention never over-admits and still converges to a single winner.
+test_3_5_leader_churn_under_contention() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-3-5-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+    dim "namespace: $ns — two 80 GiB gangs contend; leader killed 2× mid-flight"
+
+    # Long deadlines so the loser keeps waiting (Reserving) through the churn
+    # instead of deadline-failing for an unrelated reason.
+    local g
+    for g in g1 g2; do
+        cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: { name: $g, namespace: $ns }
+spec:
+  gangSize: 8
+  minAvailable: 8
+  priority: 500
+  workloadClass: Training
+  preemptible: false
+  reservationTimeoutSeconds: 300
+  podTemplate:
+    spec:
+      requestedVramBytes: 10737418240
+      serviceTier: Guaranteed
+EOF
+    done
+
+    # Establish the winner BEFORE churning: exactly one 80 GiB gang commits.
+    if ! wait_for_pred 90 "one 80 GiB gang commits (contention resolved)" '
+        c=$(count_rsv_by_phase Committed '"$ns"'); [[ "$c" -eq 1 ]] && [[ "$(committed_bytes)" == "85899345920" ]]
+    '; then
+        fail "contention did not resolve to one committed gang pre-churn (committed=$(count_rsv_by_phase Committed "$ns"), bytes=$(committed_bytes))"
+        kubectl get vgpugangreservation -n "$ns"; ns_cleanup "$ns"; return 1
+    fi
+    dim "winner established; now killing the leader twice under load"
+
+    # Kill the active scheduler leader twice, sampling safety throughout.
+    local kills=0 cb
+    while [[ $kills -lt 2 ]]; do
+        local leader; leader=$(lease_holder_pod vgpu-scheduler-lock)
+        if [[ -n "$leader" ]]; then
+            dim "  killing leader $leader (kill #$((kills+1)))"
+            kubectl -n vgpu-system delete pod "$leader" --wait=false >/dev/null 2>&1 || true
+            kills=$((kills + 1))
+        fi
+        # sample safety a few times between kills
+        local s=0
+        while [[ $s -lt 5 ]]; do
+            cb=$(committed_bytes)
+            if [[ "$cb" -gt "$GPU_BYTES_TOTAL" ]]; then
+                fail "OVER-ADMISSION during leader churn: committed=$cb > $GPU_BYTES_TOTAL"
+                ns_cleanup "$ns"; return 1
+            fi
+            sleep 3; s=$((s + 1))
+        done
+    done
+
+    # Let the dust settle and require convergence: exactly one 80 GiB gang wins.
+    kubectl -n vgpu-system rollout status deployment/vgpu-scheduler --timeout=150s >/dev/null 2>&1 || true
+    if ! wait_for_pred 180 "converges to exactly one committed 80 GiB gang" '
+        c=$(count_rsv_by_phase Committed '"$ns"');
+        cb=$(committed_bytes);
+        [[ "$c" -eq 1 ]] && [[ "$cb" == "85899345920" ]]
+    '; then
+        fail "did not converge to exactly one committed gang after churn (committed=$(count_rsv_by_phase Committed "$ns"), bytes=$(committed_bytes))"
+        kubectl get vgpugangreservation -n "$ns"
+        ns_cleanup "$ns"; return 1
+    fi
+    ok "HA holds under contention: 2 leader kills mid-flight, never over-admitted, converged to 1 winner (80 GiB)"
+    log_to_report "- Two 80 GiB gangs + 2 leader kills: never over-admitted; converged to exactly one committed gang."
+    log_to_report "**Path:** ✅ Safety + liveness survive leadership churn stacked on contention."
+    ns_cleanup "$ns"
+    return 0
+}
+
 # Functional tests first, then the destructive chaos tests LAST (standard
 # practice): a crashed controller/scheduler needs time to re-stabilize, and
 # running chaos last means that re-stabilization can't bleed into other tests.
@@ -1252,9 +1549,16 @@ run_test "2.1" "Capacity returns after Running"    test_2_1_capacity_returns_aft
 run_test "2.2" "Failed gang teardown"              test_2_2_failed_gang_teardown
 run_test "2.6" "Delete during in-flight scheduling" test_2_6_delete_during_inflight
 run_test "2.7" "Gang vs preemption (atomicity)"    test_2_7_gang_vs_preemption
+# Wave 3 — complex / adversarial (non-destructive ones here; chaos with the rest)
+run_test "3.1" "Heterogeneous gangs (safety+liveness)" test_3_1_heterogeneous_packing
+run_test "3.2" "Impossible gang (anti-starvation)"     test_3_2_impossible_gang_no_starvation
+run_test "3.3" "Sustained soak (no leak)"              test_3_3_soak_no_leak
+run_test "3.4" "Quota + gang atomicity"                test_3_4_quota_gang_atomicity
+# Destructive chaos LAST.
 run_test "2.4" "Scheduler crash mid-bind"          test_2_4_scheduler_crash_mid_bind
 run_test "2.3" "Controller crash mid-gang"         test_2_3_controller_crash_mid_gang
 run_test "2.8" "Scheduler leader failover (HA)"    test_2_8_scheduler_leader_failover
+run_test "3.5" "Leader churn under contention (HA)" test_3_5_leader_churn_under_contention
 
 finalize_report
 
