@@ -30,10 +30,15 @@ build: fmt vet ## Build all three binaries
 	go build -o bin/nodeagent  ./cmd/nodeagent/main.go
 
 .PHONY: docker-build
-docker-build: ## Build all three container images
+docker-build: ## Build all three container images (node agent: fake GPU provider)
 	docker build -t $(IMG_SCHEDULER)  -f Dockerfile.scheduler .
 	docker build -t $(IMG_CONTROLLER) -f Dockerfile.controller .
 	docker build -t $(IMG_NODEAGENT)  -f Dockerfile.nodeagent .
+
+IMG_NODEAGENT_NVML ?= vgpu-nodeagent:nvml
+.PHONY: docker-build-nodeagent-nvml
+docker-build-nodeagent-nvml: ## Build the node agent with the real NVML provider (for real GPU nodes / g5)
+	docker build --build-arg GOTAGS=nvml -t $(IMG_NODEAGENT_NVML) -f Dockerfile.nodeagent .
 
 .PHONY: install-crds
 install-crds: ## Install CRDs into the current cluster

@@ -99,36 +99,49 @@ Configured by env so the kind agent models the cluster's advertised capacity:
 The kind daemonset sets `VGPU_FAKE_GPU_MEM_BYTES` and `VGPU_EXPECTED_VRAM_BYTES`
 to 80 GiB, so observed truth matches scheduler-assumed capacity (drift = 0).
 
-## Real-GPU validation runbook (g5)
+## Real-GPU validation runbook (g5) — Phase 3.1b
 
-Run this on real hardware; CI/kind stays on the fake provider.
+Run this on real hardware; CI/kind stays on the fake provider. The build,
+deploy, and validation are now turnkey:
 
-1. **Provision** a GPU node (e.g. AWS `g5.xlarge`, NVIDIA A10G, 24 GiB).
-   Install the NVIDIA driver + container toolkit; confirm `nvidia-smi` works.
-2. **Build** the real image:
+1. **Provision** a GPU node (e.g. AWS `g5.xlarge`, NVIDIA A10G, ~23 GiB).
+   Install the NVIDIA driver + **container toolkit**; confirm `nvidia-smi` works
+   and that containers can see the GPU
+   (`docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`).
+2. **Build the real image** (Linux + CGO + go-nvml, `-tags nvml`):
    ```sh
-   go build -tags nvml ./cmd/nodeagent
-   # or: docker build with the nvml tag, base image carrying libnvidia-ml.so.1
+   make docker-build-nodeagent-nvml          # -> vgpu-nodeagent:nvml
+   # then load/push vgpu-nodeagent:nvml so the node can pull it
    ```
-3. **Deploy** to the GPU node. Logs should show:
-   `[gpu] observation collector started: provider=nvml ...`
-4. **Verify truth** against `nvidia-smi`:
+3. **Deploy the NVML node agent** (real provider + driver/device injection):
    ```sh
-   kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/<agent-pod>:8083/proxy/metrics" \
-     | grep '^vgpu_gpu_'
-   # vgpu_gpu_total_memory_bytes ≈ nvidia-smi --query-gpu=memory.total --format=csv,nounits,nounits (×1024²)
+   kubectl apply -f deployments/manifests/nodeagent_daemonset_nvml.yaml
+   # if the nvidia runtime isn't the node default, uncomment runtimeClassName: nvidia
    ```
-   Start a CUDA process and confirm `used`/`free` track it.
-5. **Failure drills** (each must keep the agent up, capacity untouched):
-   - Revoke device access / stop the driver → `vgpu_gpu_healthy 0`,
-     `provider_info{provider="degraded"}`, `observation_errors_total` climbing.
+   Logs should show: `[gpu] observation collector started: provider=nvml ...`
+4. **Validate** — one command runs checks 1-7 and compares against `nvidia-smi`:
+   ```sh
+   scripts/validate-gpu-nvml.sh
+   ```
+   It verifies: provider=nvml, UUID mapping matches nvidia-smi, total VRAM matches
+   (within tolerance), used+free reconcile, health=1, drift metric emitted, and
+   that the agent does NOT mutate the node's advertised `vgpu-bytes` (observe-only).
+5. **Workload check (manual, #8)**: run a CUDA job and re-run the script;
+   `vgpu_gpu_used_memory_bytes` should rise and `free` fall.
+6. **Failure drills** (each must keep the agent up, capacity untouched):
+   - Stop the driver / revoke device access → `provider_info{provider="degraded"}`,
+     `vgpu_gpu_observation_errors_total` climbing, scheduler capacity unchanged.
    - On a multi-GPU node, take one GPU offline → only that device's
      `vgpu_gpu_healthy` drops to 0; others keep reporting.
-6. **Drift**: set `VGPU_EXPECTED_VRAM_BYTES` to the node's advertised
-   `vgpu-bytes`; confirm `vgpu_gpu_capacity_drift_bytes` ≈ 0 when they match,
-   and goes negative if you under-provision the advertised capacity.
-7. **Regression**: confirm the default build still runs on kind with
-   `provider=fake` and all chaos tests stay green.
+7. **Drift**: set `VGPU_EXPECTED_VRAM_BYTES` (in the nvml daemonset) to the node's
+   advertised `vgpu-bytes`; `vgpu_gpu_capacity_drift_bytes` ≈ 0 when they match,
+   negative if hardware shows less than advertised.
+8. **Regression**: the default build still runs on kind with `provider=fake` —
+   `go test ./internal/nodeagent/gpu/... && bash real_world_test.sh`.
+
+Artifacts: `Dockerfile.nodeagent` (`--build-arg GOTAGS=nvml`),
+`deployments/manifests/nodeagent_daemonset_nvml.yaml`,
+`scripts/validate-gpu-nvml.sh` + `scripts/gpu_nvml_compare.py`.
 
 ## Non-goals (reaffirmed)
 

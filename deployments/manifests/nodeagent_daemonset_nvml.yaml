@@ -1,0 +1,74 @@
+# Real-GPU node agent (Phase 3.1b validation on g5 / any NVIDIA node).
+#
+# Differs from nodeagent_daemonset.yaml (the default fake-provider DaemonSet):
+#   - uses the NVML-tagged image (build: make docker-build-nodeagent-nvml)
+#   - requests driver + device injection from the NVIDIA container toolkit
+#     (NVIDIA_VISIBLE_DEVICES + NVIDIA_DRIVER_CAPABILITIES=utility) so go-nvml can
+#     dlopen libnvidia-ml.so.1 and read the GPUs — WITHOUT exclusively allocating
+#     a GPU via the device plugin (this agent only OBSERVES).
+#   - drops the VGPU_FAKE_* knobs (the real provider reads actual hardware).
+#
+# Apply ON the GPU node's cluster, replacing the fake DaemonSet:
+#   make docker-build-nodeagent-nvml
+#   # load/push vgpu-nodeagent:nvml to the node's registry
+#   kubectl apply -f deployments/manifests/nodeagent_daemonset_nvml.yaml
+#
+# If your cluster's default container runtime is NOT the nvidia runtime, also set
+# spec.template.spec.runtimeClassName: nvidia (uncommented below).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vgpu-nodeagent
+  namespace: vgpu-system
+  labels:
+    app: vgpu-nodeagent
+spec:
+  selector:
+    matchLabels:
+      app: vgpu-nodeagent
+  template:
+    metadata:
+      labels:
+        app: vgpu-nodeagent
+    spec:
+      serviceAccountName: vgpu-nodeagent-sa
+      # Uncomment if the nvidia runtime is not the node default:
+      # runtimeClassName: nvidia
+      containers:
+      - name: nodeagent
+        image: vgpu-nodeagent:nvml
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Ask the NVIDIA container toolkit to inject the driver + all GPUs.
+        # "utility" exposes NVML + nvidia-smi (no compute/graphics needed here).
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "utility"
+        # Optional: scheduler-assumed capacity for the drift gauge. Set to the
+        # node's advertised vgpu-bytes if you want vgpu_gpu_capacity_drift_bytes.
+        # - name: VGPU_EXPECTED_VRAM_BYTES
+        #   value: "23609344000"   # e.g. one A10G (~22 GiB) — match your node
+        ports:
+        - name: metrics
+          containerPort: 8083
+        securityContext:
+          privileged: true # direct NVML + host device access
+        volumeMounts:
+        - name: cdi-dir
+          mountPath: /var/run/cdi
+        - name: dev-dir
+          mountPath: /dev
+      volumes:
+      - name: cdi-dir
+        hostPath:
+          path: /var/run/cdi
+          type: DirectoryOrCreate
+      - name: dev-dir
+        hostPath:
+          path: /dev
+          type: Directory
