@@ -92,3 +92,7 @@ add_test_2_4*.sh
 /nodeagent
 /scheduler
 /controller
+
+# Python bytecode
+__pycache__/
+*.pyc
