@@ -7,16 +7,18 @@ ever evicted on untrusted accounting:
 ```
 3.4a  detect node-level over-use            ✅ observe-only
 3.4b  attribute + mark the slice Violating  ✅ observe-and-mark only
-3.4c  soft enforcement (warn / annotate)    ✅ non-destructive      ← HERE
-3.4d  hard enforcement (evict / throttle)
+3.4c  soft enforcement (warn / annotate)    ✅ non-destructive
+3.4d  opt-in eviction (reclaim VRAM)        ✅ destructive, opt-in   ← HERE
 3.4e  MIG-backed hard partitioning
 ```
 
-Everything through 3.4c is **non-destructive**: it makes over-use visible and
-auditable (metrics, Kubernetes Events, CRD status) and — in 3.4c — surfaces an
-enforcement *decision* on the offending workload's own pod, but never evicts,
-throttles, or changes a running workload. Workload-disrupting enforcement (3.4d+)
-stays gated behind all of this being trusted.
+Everything through 3.4c is **non-destructive**, and that is still the **default**:
+the chain makes over-use visible and auditable (metrics, Events, CRD status) and
+surfaces an enforcement *decision* on the offending pod, but touches nothing
+running. 3.4d adds the *option* to act — evicting a pod that stays over-budget
+past a deadline — but only when an operator explicitly turns it on. The default
+(`softwarn`) never evicts. True per-process VRAM partitioning (so a workload
+*cannot* exceed its slice) needs MIG and is 3.4e.
 
 ## 3.4a — node-level over-use detection (current)
 
@@ -216,3 +218,77 @@ additionally asserts, against live NVML, that the over-using **pod** carries the
 violation label + enforcement annotations + deadline, the `MemoryEnforcement`
 condition is `True`, and — critically — the pod is **still `Running`** (soft =
 non-destructive).
+
+## 3.4d — opt-in eviction (current)
+
+The first stage that actually *acts* on a workload. One hardware reality drives
+the whole design: **a non-MIG GPU cannot cap VRAM per process** — there is no
+cgroup-style memory limit for GPU memory. So "hard enforcement" of a VRAM budget
+means exactly one thing — **evict the offending pod to reclaim its VRAM**.
+("Throttle" applies to *compute* (MPS) and reclaims no VRAM, so it is out of
+scope; true per-process VRAM caps are MIG, 3.4e.)
+
+3.4d is therefore **grace-gated, opt-in, PDB-respecting eviction**, layered on
+3.4c. It does *not* change the default — eviction only happens when an operator
+sets the mode explicitly.
+
+### Mode gate (opt-in)
+
+`VGPU_ENFORCEMENT_MODE`: `off | softwarn | evict`. The default stays **`softwarn`**
+(non-destructive). `evict` is the only value that enables eviction; `throttle` /
+`hard` are rejected (they are not valid VRAM actions) and fall back to `softwarn`.
+
+### When a pod is evicted
+
+The 3.4c `enforcement-deadline` becomes **binding**. Timeline (defaults):
+
+```
+onset ──(60s soft grace)──▶ SoftWarned ──(120s eviction grace)──▶ Evicted
+  3.4b flagged              pod labeled/warned                    pod evicted
+```
+
+So a pod is evicted only after **sustained, attributed, hysteresis-confirmed**
+over-use that persisted ~270s end-to-end *and* past the soft-warn window — never
+on a transient spike. If usage drops within grant before the deadline, recovery
+clears everything and **nothing is evicted**.
+
+### Safety rails (all enforced)
+
+| Rail | Behavior |
+|---|---|
+| **Opt-in** | default `softwarn`; eviction only when mode is explicitly `evict` |
+| **Eviction API** | uses `pods/eviction` (PDB-respecting, graceful) — **never** a raw delete or force-delete |
+| **PDB-blocked** | if a PodDisruptionBudget would be violated, the pod is **not** deleted; a `MemoryEvictionBlocked` event + `vgpu_memory_evictions_blocked_total{reason="pdb"}` fire, and the slice stays marked + warned (retried next cycle) |
+| **Exemption** | a pod (or its namespace) labeled `infrastructure.pranav2910.com/enforcement-exempt=true` is never evicted — still detected, marked, soft-warned |
+| **Rate limit** | ≤ `maxEvictionsPerWindow` (3) evictions per node per `evictionWindow` (5 min); excess is deferred with `reason="ratelimited"` |
+| **Audit** | on eviction: a `Warning`/`MemoryEnforcementEvicted` pod Event, the slice `MemoryEnforcement` condition `reason=Evicted`, a job mirror (`ChildSliceEvicted`), and `vgpu_memory_enforcement_actions_total{action="evict"}` |
+
+The slice **grant survives** the eviction — 3.4d corrects the offending *pod*, not
+the allocation. A controller-managed workload may reschedule; if the new pod
+over-uses again, it is re-evaluated and (after the grace) evicted again, visibly.
+
+### Tunables (`internal/nodeagent/enforcement.go`)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `evictionGracePeriod` | 120s | additional grace after soft-warn before eviction |
+| `maxEvictionsPerWindow` | 3 | per-node eviction budget |
+| `evictionWindow` | 5m | rate-limit window |
+| `enforcementExemptLabel` | `…/enforcement-exempt` | pod/namespace opt-out |
+
+### Explicitly NOT done in 3.4d
+
+No raw/force delete, no compute throttle, no MIG, no scheduler-level punishment
+(the offender's *future* claims are not blocked). VRAM is reclaimed by eviction
+alone.
+
+### Deployment & validation
+
+RBAC adds `pods/eviction: create` and `namespaces: get` (exemption) on top of
+3.4c. The policy — evict-after-grace, exemption, rate limit, PDB-block-retries —
+is unit-tested deterministically with an injected clock and a **stubbed evictor**
+(so the rails are exercised without a live cluster). The real Eviction API call
+and end-to-end reclaim are covered by the A10 evict E2E
+(`scripts/validate-runtime-3.4d-a10.sh`): a slice granted 2 GiB, a 4 GiB workload,
+mode `evict` → the offending pod is evicted past the deadline while an
+**exempt** pod over-using the same way is **not**.
