@@ -44,10 +44,10 @@ surfaces under combined load.
 
 ### Runtime VRAM accounting — hardware-validated (NVIDIA A10)
 
-The runtime over-use chain is validated end-to-end against **real NVML + Linux
-cgroups + the Kubernetes Eviction API** on an A10 (`scripts/a10-bootstrap.sh` +
-`scripts/validate-runtime-3.4-a10.sh` `13/13` and `scripts/validate-runtime-3.4d-a10.sh`
-`5/5`), not just mocks:
+The runtime chain is validated end-to-end against **real NVML + Linux cgroups +
+the Kubernetes Eviction API** on an A10 (`scripts/a10-bootstrap.sh` +
+`validate-runtime-3.4-a10.sh` `13/13`, `validate-runtime-3.4d-a10.sh` `5/5`,
+`validate-runtime-3.5-a10.sh` `8/8`), not just mocks:
 
 - **Hardware truth** — per-GPU VRAM read via NVML v2 accounting (process-used vs
   driver-reserved separated), matching `nvidia-smi`
@@ -64,9 +64,16 @@ cgroups + the Kubernetes Eviction API** on an A10 (`scripts/a10-bootstrap.sh` +
   (rate-limited per node; never a raw delete). Pods/namespaces labeled
   `…/enforcement-exempt=true` are spared — proven on hardware: victim evicted,
   exempt pod left Running.
+- **Feedback loop (3.5/3.6)** — the node agent's NVML observations accumulate into
+  a per-workload `VGPUWorkloadProfile` (peak/avg, incident counts), the controller
+  recommends a right-sized grant (`peak × 1.15`) with a confidence grade, and an
+  under-provisioned request gets a **non-blocking** `Underprovisioned` advisory.
+  Validated end-to-end on the A10 (`validate-runtime-3.5-a10.sh`): real peak →
+  `recommended > requested` at `High` confidence → advisory fires, pod still running.
 
-The A10 runs also surfaced a real cached-vs-direct client bug in pod stamping that
-unit tests structurally couldn't — caught and fixed on hardware.
+The A10 runs also surfaced two real bugs unit tests structurally couldn't — a
+cached-vs-direct client read in pod stamping, and a controller/slice ordering race
+— both caught and fixed on hardware.
 
 ## Quick start (kind)
 
@@ -108,7 +115,7 @@ over-use **detection → attribution → soft enforcement → opt-in eviction**
 **runtime feedback engine** — per-workload GPU behavior profiles that learn peak
 usage and recommend right-sized grants (3.5) · **soft feedback-aware scheduling**
 — a non-blocking advisory when a request is below its profile's recommendation
-(3.6). 3.5/3.6 are observe-and-recommend only, unit-validated.
+(3.6). 3.5/3.6 are observe-and-recommend only, hardware-validated on an A10.
 
 Next frontier: 3.7 **enforcing the recommendation** (block / auto-right-size
 under-provisioned requests). MIG-backed hard partitioning (3.4e), federation, and
