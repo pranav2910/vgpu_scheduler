@@ -99,10 +99,27 @@ Configured by env so the kind agent models the cluster's advertised capacity:
 The kind daemonset sets `VGPU_FAKE_GPU_MEM_BYTES` and `VGPU_EXPECTED_VRAM_BYTES`
 to 80 GiB, so observed truth matches scheduler-assumed capacity (drift = 0).
 
-## Real-GPU validation runbook (g5) — Phase 3.1b
+## Quick proof (no Kubernetes — ideal for a Lambda / cloud GPU box)
+
+The fastest real-hardware check runs the node agent's exact NVML provider in a
+container and shows it next to `nvidia-smi` — no cluster needed. On any Ubuntu
+box with the NVIDIA driver + Docker + nvidia-container-toolkit (all default on
+Lambda Cloud):
+
+```sh
+git clone <repo> && cd vgpu_scheduler
+scripts/validate-gpu-docker.sh
+```
+
+It builds `cmd/gpu-probe` with `-tags nvml`, runs it via `docker run --gpus all`,
+and prints our provider's reading beside `nvidia-smi` for comparison (provider=
+nvml, UUID, total/used/free, health). This proves checks 1-5 + 8. The Kubernetes
+drift + capacity-unchanged checks (6,7) come from the full runbook below.
+
+## Full validation runbook (any GPU node) — Phase 3.1b
 
 Run this on real hardware; CI/kind stays on the fake provider. The build,
-deploy, and validation are now turnkey:
+deploy, and validation are turnkey:
 
 1. **Provision** a GPU node (e.g. AWS `g5.xlarge`, NVIDIA A10G, ~23 GiB).
    Install the NVIDIA driver + **container toolkit**; confirm `nvidia-smi` works

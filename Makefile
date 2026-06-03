@@ -40,6 +40,11 @@ IMG_NODEAGENT_NVML ?= vgpu-nodeagent:nvml
 docker-build-nodeagent-nvml: ## Build the node agent with the real NVML provider (for real GPU nodes / g5)
 	docker build --build-arg GOTAGS=nvml -t $(IMG_NODEAGENT_NVML) -f Dockerfile.nodeagent .
 
+IMG_GPU_PROBE_NVML ?= vgpu-gpu-probe:nvml
+.PHONY: docker-build-gpu-probe-nvml
+docker-build-gpu-probe-nvml: ## Build the standalone NVML probe (no k8s; run with: docker run --rm --gpus all $(IMG_GPU_PROBE_NVML))
+	docker build --build-arg GOTAGS=nvml -t $(IMG_GPU_PROBE_NVML) -f Dockerfile.gpu-probe .
+
 .PHONY: install-crds
 install-crds: ## Install CRDs into the current cluster
 	kubectl apply -f $(MANIFESTS)/crds/
