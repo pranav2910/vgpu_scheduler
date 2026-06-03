@@ -163,6 +163,7 @@ func (d *SliceViolationDetector) enforce(ctx context.Context, u *sliceUsage, exc
 		d.enforced[key] = true
 		d.stampedPods[key] = append([]types.NamespacedName(nil), u.pods...)
 		telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "warn").Inc()
+		d.profileOnSoftWarn(key) // 3.5: count the soft-enforcement engagement
 		d.engageSoftWarn(ctx, u, excess, start, evictDeadline)
 	}
 	// 3.4d: once over-use persists past the eviction deadline, evict mode reclaims
@@ -399,6 +400,7 @@ func (d *SliceViolationDetector) maybeEvict(ctx context.Context, u *sliceUsage, 
 		delete(d.blockedNotified, podK)
 		d.recordEvictionTime()
 		telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "evict").Inc()
+		d.profileOnEviction(sliceKey(u.namespace, u.name)) // 3.5: count the eviction
 		d.recordEvictionAudit(ctx, u, nn, excess)
 	}
 }

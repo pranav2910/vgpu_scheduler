@@ -56,6 +56,10 @@ type SliceViolationDetector struct {
 	evictHandled    map[string]string                                        // podKey -> terminal outcome ("evicted"|"exempt")
 	blockedNotified map[string]string                                        // podKey -> last-notified block reason (dedupe)
 	evictionTimes   []time.Time                                              // per-node eviction timestamps (rate-limit window)
+
+	// Phase 3.5 runtime feedback — in-memory per-slice running stats flushed to
+	// VGPUSlice.status (the controller aggregates them into VGPUWorkloadProfiles).
+	profileStats map[string]*sliceStat // sliceKey -> running observation stats
 }
 
 // NewSliceViolationDetector builds the detector. interval <= 0 defaults to 30s.
@@ -81,6 +85,7 @@ func NewSliceViolationDetector(c client.Client, apiReader client.Reader, nodeNam
 		stampedPods:     map[string][]types.NamespacedName{},
 		evictHandled:    map[string]string{},
 		blockedNotified: map[string]string{},
+		profileStats:    map[string]*sliceStat{},
 	}
 	d.evictFn = d.evictViaAPI
 	return d
@@ -158,6 +163,7 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 		telemetry.SliceMemoryViolationExcessBytes.WithLabelValues(d.nodeName, u.namespace, u.name).Set(float64(excess))
 		if onset {
 			telemetry.SliceMemoryViolationsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, memoryViolationReason).Inc()
+			d.profileOnViolation(key) // 3.5: count the over-use onset
 			d.mark(ctx, u, excess, true)
 		} else if cleared {
 			d.mark(ctx, u, 0, false)
@@ -165,6 +171,8 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 		// Phase 3.4c/3.4d: drive the grace-gated enforcement state machine
 		// (soft-warn, then opt-in eviction past the eviction deadline).
 		d.enforce(ctx, u, excess, violating)
+		// Phase 3.5: record this sample + flush running stats to the slice status.
+		d.observeProfile(ctx, u)
 	}
 	// Prune state for slices no longer present (deleted/unbound).
 	for key := range d.active {
@@ -194,6 +202,13 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 	for podK := range d.blockedNotified {
 		if !seenPods[podK] {
 			delete(d.blockedNotified, podK)
+		}
+	}
+	// 3.5: drop in-memory profile stats for vanished slices (the persisted slice
+	// status stats remain until the slice itself is deleted).
+	for key := range d.profileStats {
+		if !seen[key] {
+			delete(d.profileStats, key)
 		}
 	}
 	return nil
