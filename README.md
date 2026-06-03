@@ -42,6 +42,27 @@ adversarial). The Wave 3 adversarial suite found and closed a real
 gang-vs-quota composition bug — the kind of cross-subsystem defect that only
 surfaces under combined load.
 
+### Runtime VRAM accounting — hardware-validated (NVIDIA A10)
+
+The runtime over-use chain is validated end-to-end against **real NVML + Linux
+cgroups** on an A10 (`scripts/a10-bootstrap.sh` + `scripts/validate-runtime-3.4-a10.sh`,
+`13/13 green`), not just mocks:
+
+- **Hardware truth** — per-GPU VRAM read via NVML v2 accounting (process-used vs
+  driver-reserved separated), matching `nvidia-smi`
+- **Over-use detection** — a node flags GPU memory use beyond the VRAM granted to
+  its bound slices (hysteresis; no flapping)
+- **Per-slice attribution** — the over-using workload is traced to the exact
+  `VGPUSlice` (GPU PID → `/proc` cgroup → claim-ref → slice) using host-PID NVML
+- **Soft enforcement (non-destructive)** — the offending **pod** is labeled +
+  annotated with the violation and an informational enforcement deadline, the
+  slice/job carry a `MemoryEnforcement` condition, events fire — and the pod
+  keeps **running**. Mode is gated (`off | softwarn`, default `softwarn`);
+  nothing is evicted, throttled, or phase-failed.
+
+The A10 run also surfaced a real cached-vs-direct client bug in pod stamping that
+unit tests structurally couldn't — caught and fixed on hardware.
+
 ## Quick start (kind)
 
 ```sh
@@ -69,13 +90,17 @@ See [docs/metrics.md](docs/metrics.md).
 - [docs/ha-failover.md](docs/ha-failover.md) — active/standby model, readiness semantics, failover invariants
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics reference + sample scrape config
 - [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md) — NVML observation scaffolding + g5 validation runbook
+- [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement (3.4a/b/c), tunables, A10 E2E
 
 ## Status & roadmap
 
 Done and validated: single-slice lifecycle · gang scheduling (atomic,
 live under contention) · preemption · quota (gang-atomic) · soft topology ·
-observability · HA failover · GPU hardware-truth **observation**.
+observability · HA failover · GPU hardware-truth **observation** · runtime
+over-use **detection → attribution → soft enforcement** (3.4a/b/c,
+hardware-validated on an A10, non-destructive).
 
-Next frontiers (not yet built): real-GPU NVML validation on hardware, then
-runtime VRAM **enforcement** (the bridge from "observe" to "enforce"). Federation
-and a managed SaaS layer are deferred.
+Next frontier (in progress): 3.4d **opt-in pod eviction** for sustained GPU
+memory over-use — policy-driven, PDB-respecting, rate-limited, exemptable;
+default stays `softwarn`. True per-process VRAM partitioning (MIG, 3.4e),
+federation, and a managed SaaS layer are deferred.
