@@ -17,9 +17,12 @@ rules:
   - apiGroups: ["infrastructure.pranav2910.com"]
     resources: ["vgpujobs/status"]
     verbs: ["get", "patch", "update"]
+  # Phase 3.4c: soft enforcement stamps over-using pods with a violation label +
+  # annotations (and removes them on recovery) — labels/annotations only, never
+  # the pod spec, never eviction. "patch" is the merge-patch verb used for both.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
