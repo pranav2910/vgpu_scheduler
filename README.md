@@ -95,7 +95,8 @@ See [docs/metrics.md](docs/metrics.md).
 - [docs/ha-failover.md](docs/ha-failover.md) — active/standby model, readiness semantics, failover invariants
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics reference + sample scrape config
 - [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md) — NVML observation scaffolding + g5 validation runbook
-- [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement (3.4a/b/c), tunables, A10 E2E
+- [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement → opt-in eviction (3.4a–d), tunables, A10 E2E
+- [docs/runtime-feedback.md](docs/runtime-feedback.md) — GPU behavior profiles: learn peak usage → recommend right-sized grants (3.5, observe-only)
 
 ## Status & roadmap
 
@@ -103,8 +104,10 @@ Done and validated: single-slice lifecycle · gang scheduling (atomic,
 live under contention) · preemption · quota (gang-atomic) · soft topology ·
 observability · HA failover · GPU hardware-truth **observation** · runtime
 over-use **detection → attribution → soft enforcement → opt-in eviction**
-(3.4a–d, hardware-validated on an A10; default stays non-destructive `softwarn`).
+(3.4a–d, hardware-validated on an A10; default non-destructive `softwarn`) ·
+**runtime feedback engine** — per-workload GPU behavior profiles that learn peak
+usage and recommend right-sized grants (3.5, observe-only, unit-validated).
 
-Next frontier: 3.4e **MIG-backed hard partitioning** — true per-process VRAM
-caps, where a workload *cannot* exceed its slice (eviction reclaims after the
-fact; MIG prevents). Federation and a managed SaaS layer are deferred.
+Next frontier: 3.6 **feedback-aware scheduling** — the scheduler acts on profile
+recommendations (right-size grants, flag risky requests). MIG-backed hard
+partitioning (3.4e), federation, and a managed SaaS layer are deferred.
