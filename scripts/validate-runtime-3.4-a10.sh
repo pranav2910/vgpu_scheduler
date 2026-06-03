@@ -12,23 +12,16 @@
 #         (the default in nodeagent_daemonset_nvml.yaml).
 #
 # It does NOT need the scheduler/controller/webhook — the node-agent detectors
-# read slices, pods, and NVML directly. So the minimal stack is just:
+# read slices, pods, and NVML directly. Stand up the minimal stack (k3s + NVIDIA
+# runtime + CRDs/RBAC + the NVML node agent) with the companion bootstrap, then
+# run this:
 #
-#   # 1. a single-node k8s with the NVIDIA toolkit (k3s shown):
-#   curl -sfL https://get.k3s.io | sh -            # + nvidia-container-toolkit
+#   bash scripts/a10-bootstrap.sh           # one-shot, idempotent
 #   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-#   # 2. CRDs + namespace + RBAC (the rbac/ dir holds the ServiceAccounts too):
-#   kubectl apply -f deployments/manifests/crds/
-#   kubectl apply -f deployments/manifests/namespace.yaml
-#   kubectl apply -f deployments/manifests/rbac/
-#   # 3. the NVML node agent (hostPID, real provider):
-#   make docker-build-nodeagent-nvml
-#   sudo k3s ctr images import <(docker save vgpu-nodeagent:nvml)   # load into k3s
-#   kubectl apply -f deployments/manifests/nodeagent_daemonset_nvml.yaml
-#   # 4. then run this:
 #   bash scripts/validate-runtime-3.4-a10.sh
 #
-# Requirements on the host: kubectl, a running vgpu-nodeagent pod (provider=nvml).
+# Requirements on the host: kubectl, a running vgpu-nodeagent pod (provider=nvml)
+# — all provided by a10-bootstrap.sh.
 set -uo pipefail
 
 NS="${NS:-default}"
@@ -91,12 +84,17 @@ metadata:
 spec:
   nodeName: $NODE
   restartPolicy: Never
+  # Use the nvidia RuntimeClass (created by a10-bootstrap.sh) for GPU access —
+  # no device plugin / nvidia.com/gpu request needed for this observe-only test.
+  runtimeClassName: ${RUNTIME_CLASS:-nvidia}
   containers:
   - name: hog
     image: $HOG_IMAGE
     command: ["python","-c"]
     args: ["import torch,time; n=$HOG_BYTES//2; x=torch.empty(n, dtype=torch.float16, device='cuda'); print('allocated', x.numel()*2, 'bytes'); time.sleep(3600)"]
-    resources: { limits: { nvidia.com/gpu: "1" } }
+    env:
+    - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
+    - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
 EOF
 # Mark the slice Ready so the detector counts its grant.
 kubectl patch vgpuslice "$SLICE" -n "$NS" --subresource=status --type=merge \
