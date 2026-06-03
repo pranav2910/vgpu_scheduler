@@ -35,9 +35,15 @@ func main() {
 		log.Fatalf("getting kubeconfig: %v", err)
 	}
 
+	// Webhooks require cert-manager-provisioned TLS at the mounted cert dir. They
+	// can be disabled (VGPU_DISABLE_WEBHOOKS=true) to run the controller in a
+	// minimal, reconcilers-only mode without cert-manager — used by the runtime-
+	// feedback hardware E2E. Production leaves them on (the default).
+	webhooksEnabled := os.Getenv("VGPU_DISABLE_WEBHOOKS") != "true"
+
 	// Bug #16: start the webhook server on :9443, reading TLS material from
 	// the cert-manager-provisioned secret mounted at /tmp/k8s-webhook-server/serving-certs.
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: ":8080"},
 		HealthProbeBindAddress: ":8082",
@@ -46,11 +52,14 @@ func main() {
 		// Release the lease on graceful shutdown so the standby takes over in
 		// seconds rather than waiting out the lease duration. Phase 3.3.
 		LeaderElectionReleaseOnCancel: true,
-		WebhookServer: webhookserver.NewServer(webhookserver.Options{
+	}
+	if webhooksEnabled {
+		mgrOpts.WebhookServer = webhookserver.NewServer(webhookserver.Options{
 			Port:    9443,
 			CertDir: "/tmp/k8s-webhook-server/serving-certs",
-		}),
-	})
+		})
+	}
+	mgr, err := ctrl.NewManager(cfg, mgrOpts)
 	if err != nil {
 		log.Fatalf("creating manager: %v", err)
 	}
@@ -102,15 +111,19 @@ func main() {
 		log.Fatalf("setting up VGPUWorkloadProfileReconciler: %v", err)
 	}
 
-	// Bug #16: register admission webhooks.
-	decoder := admission.NewDecoder(scheme)
-	mgr.GetWebhookServer().Register("/mutate-v1-pod",
-		&webhookserver.Admission{Handler: webhook.NewPodMutatorHandler(mgr.GetClient(), decoder)})
-	mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpuclaim",
-		&webhookserver.Admission{Handler: webhook.NewClaimValidatorHandler(decoder)})
-	mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpugangjob",
-		&webhookserver.Admission{Handler: webhook.NewGangJobValidatorHandler(decoder)})
-	log.Println("Webhook server registered on :9443")
+	// Bug #16: register admission webhooks (unless disabled for minimal mode).
+	if webhooksEnabled {
+		decoder := admission.NewDecoder(scheme)
+		mgr.GetWebhookServer().Register("/mutate-v1-pod",
+			&webhookserver.Admission{Handler: webhook.NewPodMutatorHandler(mgr.GetClient(), decoder)})
+		mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpuclaim",
+			&webhookserver.Admission{Handler: webhook.NewClaimValidatorHandler(decoder)})
+		mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpugangjob",
+			&webhookserver.Admission{Handler: webhook.NewGangJobValidatorHandler(decoder)})
+		log.Println("Webhook server registered on :9443")
+	} else {
+		log.Println("Webhooks DISABLED (VGPU_DISABLE_WEBHOOKS=true) — reconcilers-only mode, no cert-manager required")
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Fatalf("adding healthz: %v", err)

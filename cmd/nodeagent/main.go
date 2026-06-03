@@ -80,7 +80,15 @@ func main() {
 			expectedVRAM = n
 		}
 	}
-	gpuCollector := gpu.NewCollector(gpuProvider, nodeName, 30*time.Second, expectedVRAM)
+	// Observation/detection cadence. Default 30s; lower it (e.g. VGPU_OBSERVE_INTERVAL=2s)
+	// to accumulate runtime-feedback observations faster, e.g. for the 3.5 E2E.
+	observeInterval := 30 * time.Second
+	if v := os.Getenv("VGPU_OBSERVE_INTERVAL"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
+			observeInterval = d
+		}
+	}
+	gpuCollector := gpu.NewCollector(gpuProvider, nodeName, observeInterval, expectedVRAM)
 	if err := ctrlMgr.Add(gpuCollector); err != nil {
 		log.Fatalf("adding GPU observation collector: %v", err)
 	}
@@ -90,7 +98,7 @@ func main() {
 	// sustained over-use via metrics + a Node Event. No eviction or throttling.
 	detector := nodeagent.NewViolationDetector(
 		ctrlMgr.GetClient(), nodeName, gpuCollector.Inventory(),
-		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second)
+		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), observeInterval)
 	if err := ctrlMgr.Add(detector); err != nil {
 		log.Fatalf("adding over-use detector: %v", err)
 	}
@@ -106,7 +114,7 @@ func main() {
 	enforceMode := nodeagent.ParseEnforcementMode(os.Getenv("VGPU_ENFORCEMENT_MODE"))
 	sliceDetector := nodeagent.NewSliceViolationDetector(
 		ctrlMgr.GetClient(), ctrlMgr.GetAPIReader(), nodeName, gpuProvider,
-		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second, enforceMode)
+		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), observeInterval, enforceMode)
 	if err := ctrlMgr.Add(sliceDetector); err != nil {
 		log.Fatalf("adding per-slice over-use detector: %v", err)
 	}
