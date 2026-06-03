@@ -12,11 +12,10 @@
 #   # 1. a single-node k8s with the NVIDIA toolkit (k3s shown):
 #   curl -sfL https://get.k3s.io | sh -            # + nvidia-container-toolkit
 #   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-#   # 2. CRDs + namespace + node-agent RBAC/SA:
+#   # 2. CRDs + namespace + RBAC (the rbac/ dir holds the ServiceAccounts too):
 #   kubectl apply -f deployments/manifests/crds/
 #   kubectl apply -f deployments/manifests/namespace.yaml
-#   kubectl apply -f deployments/manifests/rbac/nodeagent_rbac.yaml
-#   kubectl apply -f deployments/manifests/sa/            # node-agent ServiceAccount
+#   kubectl apply -f deployments/manifests/rbac/
 #   # 3. the NVML node agent (hostPID, real provider):
 #   make docker-build-nodeagent-nvml
 #   sudo k3s ctr images import <(docker save vgpu-nodeagent:nvml)   # load into k3s
