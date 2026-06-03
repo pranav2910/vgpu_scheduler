@@ -45,41 +45,56 @@ type SliceViolationDetector struct {
 	active map[string]bool // sliceKey -> currently marked
 
 	// Phase 3.4c soft enforcement.
-	enforceMode    EnforcementMode                   // off | softwarn
+	enforceMode    EnforcementMode                   // off | softwarn | evict
 	now            func() time.Time                  // injectable clock for the grace timer (defaults to time.Now)
 	violationStart map[string]time.Time              // sliceKey -> when 3.4b flagged it (grace anchor)
 	enforced       map[string]bool                   // sliceKey -> soft enforcement currently engaged
 	stampedPods    map[string][]types.NamespacedName // sliceKey -> pods we labeled/annotated (for exact cleanup)
+
+	// Phase 3.4d opt-in eviction.
+	evictFn         func(ctx context.Context, nn types.NamespacedName) error // pod evictor (defaults to the Eviction API; overridable in tests)
+	evictHandled    map[string]string                                        // podKey -> terminal outcome ("evicted"|"exempt")
+	blockedNotified map[string]string                                        // podKey -> last-notified block reason (dedupe)
+	evictionTimes   []time.Time                                              // per-node eviction timestamps (rate-limit window)
 }
 
 // NewSliceViolationDetector builds the detector. interval <= 0 defaults to 30s.
-// mode selects the 3.4c enforcement ceiling (off | softwarn).
+// mode selects the enforcement ceiling (off | softwarn | evict).
 func NewSliceViolationDetector(c client.Client, apiReader client.Reader, nodeName string, provider gpu.GPUProvider, recorder record.EventRecorder, interval time.Duration, mode EnforcementMode) *SliceViolationDetector {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return &SliceViolationDetector{
-		client:         c,
-		apiReader:      apiReader,
-		nodeName:       nodeName,
-		provider:       provider,
-		recorder:       recorder,
-		interval:       interval,
-		procRoot:       "/proc",
-		enforceMode:    mode,
-		now:            time.Now,
-		streak:         map[string]int{},
-		active:         map[string]bool{},
-		violationStart: map[string]time.Time{},
-		enforced:       map[string]bool{},
-		stampedPods:    map[string][]types.NamespacedName{},
+	d := &SliceViolationDetector{
+		client:          c,
+		apiReader:       apiReader,
+		nodeName:        nodeName,
+		provider:        provider,
+		recorder:        recorder,
+		interval:        interval,
+		procRoot:        "/proc",
+		enforceMode:     mode,
+		now:             time.Now,
+		streak:          map[string]int{},
+		active:          map[string]bool{},
+		violationStart:  map[string]time.Time{},
+		enforced:        map[string]bool{},
+		stampedPods:     map[string][]types.NamespacedName{},
+		evictHandled:    map[string]string{},
+		blockedNotified: map[string]string{},
 	}
+	d.evictFn = d.evictViaAPI
+	return d
 }
 
 func (d *SliceViolationDetector) Start(ctx context.Context) error {
 	telemetry.MemoryEnforcementMode.WithLabelValues(d.nodeName).Set(float64(d.enforceMode))
-	log.Printf("[slice-violation] per-slice over-use detector started: node=%s interval=%s enforcement=%s (no eviction/throttle)",
-		d.nodeName, d.interval, d.enforceMode.String())
+	note := "non-destructive"
+	if d.enforceMode == EnforcementEvict {
+		note = fmt.Sprintf("EVICT MODE — pods over-using past the deadline may be evicted (PDB-respecting, <=%d/%s, exempt via %s=true)",
+			maxEvictionsPerWindow, evictionWindow, enforcementExemptLabel)
+	}
+	log.Printf("[slice-violation] per-slice over-use detector started: node=%s interval=%s enforcement=%s (%s)",
+		d.nodeName, d.interval, d.enforceMode.String(), note)
 	d.sweepOrphanStamps(ctx) // drop any soft-enforcement stamps left by a prior lifetime
 	t := time.NewTicker(d.interval)
 	defer t.Stop()
@@ -132,8 +147,12 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 	telemetry.MemoryEnforcementActive.Reset()
 
 	seen := make(map[string]bool, len(usage))
+	seenPods := map[string]bool{}
 	for key, u := range usage {
 		seen[key] = true
+		for _, nn := range u.pods {
+			seenPods[nn.Namespace+"/"+nn.Name] = true
+		}
 		onset, cleared, excess, violating := d.evaluate(key, u.used, u.grant)
 		telemetry.SliceMemoryViolationActive.WithLabelValues(d.nodeName, u.namespace, u.name).Set(boolToFloat01(violating))
 		telemetry.SliceMemoryViolationExcessBytes.WithLabelValues(d.nodeName, u.namespace, u.name).Set(float64(excess))
@@ -143,7 +162,8 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 		} else if cleared {
 			d.mark(ctx, u, 0, false)
 		}
-		// Phase 3.4c: drive the grace-gated soft-enforcement state machine.
+		// Phase 3.4c/3.4d: drive the grace-gated enforcement state machine
+		// (soft-warn, then opt-in eviction past the eviction deadline).
 		d.enforce(ctx, u, excess, violating)
 	}
 	// Prune state for slices no longer present (deleted/unbound).
@@ -162,6 +182,18 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 	for key := range d.violationStart {
 		if !seen[key] {
 			delete(d.violationStart, key)
+		}
+	}
+	// 3.4d: forget eviction bookkeeping for pods no longer attributed, so a
+	// genuinely new over-user (e.g. a rescheduled pod) is re-evaluated.
+	for podK := range d.evictHandled {
+		if !seenPods[podK] {
+			delete(d.evictHandled, podK)
+		}
+	}
+	for podK := range d.blockedNotified {
+		if !seenPods[podK] {
+			delete(d.blockedNotified, podK)
 		}
 	}
 	return nil

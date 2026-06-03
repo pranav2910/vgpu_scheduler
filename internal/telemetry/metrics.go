@@ -279,8 +279,16 @@ var (
 
 	MemoryEnforcementActionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "vgpu_memory_enforcement_actions_total",
-		Help: "Soft-enforcement actions taken, by mode and action (warn|clear). Non-destructive — no eviction or throttling.",
+		Help: "Enforcement actions taken, by mode and action (warn|clear in softwarn; evict in evict mode).",
 	}, []string{"node", "namespace", "slice", "mode", "action"})
+
+	// Phase 3.4d: blocked eviction attempts (the safety rails firing). reason:
+	// pdb (PodDisruptionBudget would be violated), exempt (workload opted out),
+	// ratelimited (per-node eviction budget exhausted).
+	MemoryEvictionsBlocked = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_memory_evictions_blocked_total",
+		Help: "Eviction attempts blocked by a safety rail, by reason (pdb|exempt|ratelimited).",
+	}, []string{"node", "namespace", "slice", "reason"})
 
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
@@ -318,8 +326,9 @@ func init() {
 		// runtime over-use detection (3.4a node-level, 3.4b per-slice)
 		NodeMemoryOveruseBytes, NodeMemoryViolationActive,
 		SliceMemoryViolationActive, SliceMemoryViolationExcessBytes, SliceMemoryViolationsTotal,
-		// runtime soft enforcement (3.4c)
+		// runtime soft enforcement (3.4c) + opt-in eviction (3.4d)
 		MemoryEnforcementMode, MemoryEnforcementActive, MemoryEnforcementActionsTotal,
+		MemoryEvictionsBlocked,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

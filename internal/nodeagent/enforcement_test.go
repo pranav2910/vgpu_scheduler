@@ -25,8 +25,10 @@ func TestParseEnforcementMode(t *testing.T) {
 		"off":      EnforcementOff,
 		"none":     EnforcementOff,
 		"observe":  EnforcementOff,
-		"evict":    EnforcementSoftWarn, // hard modes are rejected → softwarn
-		"throttle": EnforcementSoftWarn,
+		"evict":    EnforcementEvict, // opt-in destructive enforcement
+		"Evict":    EnforcementEvict,
+		"throttle": EnforcementSoftWarn, // not a valid VRAM action → softwarn
+		"hard":     EnforcementSoftWarn,
 		"garbage":  EnforcementSoftWarn,
 	}
 	for in, want := range cases {
@@ -148,6 +150,178 @@ func TestEnforce_OffModeDoesNotStampPod(t *testing.T) {
 	if !sliceConditionTrue(t, c, "slice-1") {
 		t.Fatalf("3.4b MemoryViolation should still mark with enforcement off")
 	}
+}
+
+// ── Phase 3.4d: opt-in eviction ──────────────────────────────────────────────
+
+// driveToEviction runs the cycles to reach a state where eviction would be
+// attempted: violating → past the soft grace (engage soft-warn) → past the
+// eviction deadline. The clock is advanced in place via the pointer.
+func driveToEviction(t *testing.T, ctx context.Context, d *SliceViolationDetector, clk *time.Time) {
+	t.Helper()
+	for i := 0; i < sliceOveruseStreakThreshold; i++ {
+		if err := d.detectOnce(ctx); err != nil {
+			t.Fatalf("detectOnce: %v", err)
+		}
+	}
+	*clk = clk.Add(enforcementGracePeriod + time.Second) // engage soft-warn
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	*clk = clk.Add(evictionGracePeriod + time.Second) // past the eviction deadline
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+}
+
+func TestEnforce_EvictsAfterEvictionGrace(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	var evicted []types.NamespacedName
+	d.evictFn = func(_ context.Context, nn types.NamespacedName) error {
+		evicted = append(evicted, nn)
+		return nil
+	}
+	ctx := context.Background()
+
+	// Engage soft-warn but stay before the eviction deadline → no eviction yet.
+	for i := 0; i < sliceOveruseStreakThreshold; i++ {
+		if err := d.detectOnce(ctx); err != nil {
+			t.Fatalf("detectOnce: %v", err)
+		}
+	}
+	clock = clock.Add(enforcementGracePeriod + time.Second)
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if len(evicted) != 0 {
+		t.Fatalf("evicted before the eviction deadline: %v", evicted)
+	}
+	if !podStamped(t, c, "wl") {
+		t.Fatalf("soft-warn must still engage in evict mode (warn before kill)")
+	}
+
+	// Past the eviction deadline → evict exactly once.
+	clock = clock.Add(evictionGracePeriod + time.Second)
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if len(evicted) != 1 || evicted[0].Name != "wl" {
+		t.Fatalf("want one eviction of pod wl, got %v", evicted)
+	}
+	if got := sliceEnforcementReason(t, c, "slice-1"); got != enforcementReasonEvicted {
+		t.Fatalf("slice MemoryEnforcement reason = %q, want %q", got, enforcementReasonEvicted)
+	}
+	if got := testutil.ToFloat64(telemetry.MemoryEnforcementActionsTotal.WithLabelValues("node-a", "default", "slice-1", "evict", "evict")); got != 1 {
+		t.Fatalf("evict action metric = %v, want 1", got)
+	}
+	// Idempotent: the pod is terminal (evicted) — a later cycle does not re-evict.
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if len(evicted) != 1 {
+		t.Fatalf("re-evicted the same pod: %v", evicted)
+	}
+}
+
+func TestEnforce_ExemptPodNotEvicted(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	// Opt the pod out of eviction (the violation is still marked + soft-warned).
+	pod := getPod(t, c, "wl")
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[enforcementExemptLabel] = "true"
+	if err := c.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	evictCalled := false
+	d.evictFn = func(context.Context, types.NamespacedName) error { evictCalled = true; return nil }
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if evictCalled {
+		t.Fatalf("exempt pod must not be evicted")
+	}
+	if got := testutil.ToFloat64(telemetry.MemoryEvictionsBlocked.WithLabelValues("node-a", "default", "slice-1", "exempt")); got != 1 {
+		t.Fatalf("exempt blocked metric = %v, want 1", got)
+	}
+}
+
+func TestEnforce_EvictionRateLimited(t *testing.T) {
+	d, _ := fixture(t, 12*giB)
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	// Exhaust the per-node eviction budget within the window.
+	for i := 0; i < maxEvictionsPerWindow; i++ {
+		d.evictionTimes = append(d.evictionTimes, clock)
+	}
+	evictCalled := false
+	d.evictFn = func(context.Context, types.NamespacedName) error { evictCalled = true; return nil }
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if evictCalled {
+		t.Fatalf("eviction must be blocked by the per-node rate limit")
+	}
+	if got := testutil.ToFloat64(telemetry.MemoryEvictionsBlocked.WithLabelValues("node-a", "default", "slice-1", "ratelimited")); got != 1 {
+		t.Fatalf("ratelimited blocked metric = %v, want 1", got)
+	}
+}
+
+func TestEnforce_PDBBlockedEvictionStaysMarked(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	attempts := 0
+	d.evictFn = func(context.Context, types.NamespacedName) error {
+		attempts++
+		return apierrors.NewTooManyRequests("blocked by PodDisruptionBudget", 1)
+	}
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if attempts == 0 {
+		t.Fatalf("eviction should have been attempted")
+	}
+	if got := testutil.ToFloat64(telemetry.MemoryEvictionsBlocked.WithLabelValues("node-a", "default", "slice-1", "pdb")); got != 1 {
+		t.Fatalf("pdb blocked metric = %v, want 1", got)
+	}
+	// PDB block is NOT terminal: the slice stays marked and a later cycle retries.
+	if !sliceEnforcementTrue(t, c, "slice-1") {
+		t.Fatalf("PDB-blocked slice should remain MemoryEnforcement=True")
+	}
+	before := attempts
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if attempts <= before {
+		t.Fatalf("PDB-blocked eviction should retry next cycle (attempts %d -> %d)", before, attempts)
+	}
+}
+
+func sliceEnforcementReason(t *testing.T, c client.Client, name string) string {
+	t.Helper()
+	var s vgpuv1alpha1.VGPUSlice
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &s); err != nil {
+		t.Fatal(err)
+	}
+	for _, cond := range s.Status.Conditions {
+		if cond.Type == memoryEnforcementCondition {
+			return cond.Reason
+		}
+	}
+	return ""
 }
 
 // podBlindClient wraps a client.Client but returns NotFound for Pod Gets — it

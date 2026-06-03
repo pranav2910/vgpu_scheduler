@@ -11,6 +11,7 @@ import (
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,14 +37,18 @@ type EnforcementMode int
 const (
 	// EnforcementOff keeps 3.4b marking only — no pod surfaces, no enforcement.
 	EnforcementOff EnforcementMode = iota
-	// EnforcementSoftWarn is the 3.4c ceiling: label/annotate + record + warn,
-	// never evict/throttle.
+	// EnforcementSoftWarn (3.4c): label/annotate + record + warn, never destroys.
 	EnforcementSoftWarn
-	// (future: EnforcementThrottle, EnforcementEvict — Phase 3.4d.)
+	// EnforcementEvict (3.4d): everything softwarn does, plus — for over-use that
+	// persists past the eviction deadline — evicts the offending pod (PDB-
+	// respecting, rate-limited, exemptable) to reclaim VRAM. Opt-in only.
+	EnforcementEvict
 )
 
 func (m EnforcementMode) String() string {
 	switch m {
+	case EnforcementEvict:
+		return "evict"
 	case EnforcementSoftWarn:
 		return "softwarn"
 	default:
@@ -52,18 +57,20 @@ func (m EnforcementMode) String() string {
 }
 
 // ParseEnforcementMode maps a config string to a mode. The default (empty) is
-// softwarn — non-destructive, so it is safe on by default. Hard-enforcement
-// values (evict, throttle) are intentionally NOT honored in this build: they
-// fall back to softwarn with a warning, so turning on real teeth (3.4d) stays a
-// deliberate, separate change rather than a one-character config edit.
+// softwarn — non-destructive, so it is safe on by default. "evict" is opt-in and
+// enables destructive enforcement (3.4d). "throttle"/"hard" are NOT honored
+// (VRAM cannot be throttled per-process on a non-MIG GPU) and fall back to
+// softwarn, so enabling eviction stays a deliberate, explicit choice.
 func ParseEnforcementMode(s string) EnforcementMode {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "softwarn", "soft", "warn":
 		return EnforcementSoftWarn
 	case "off", "none", "disabled", "observe":
 		return EnforcementOff
-	case "evict", "throttle", "hard", "enforce":
-		log.Printf("[enforcement] mode %q is not available in this build (hard enforcement is Phase 3.4d) — using softwarn (observe-and-warn only)", s)
+	case "evict", "evicting", "hard-evict":
+		return EnforcementEvict
+	case "throttle", "hard", "enforce":
+		log.Printf("[enforcement] mode %q is not a valid VRAM-enforcement action (VRAM cannot be throttled per-process on a non-MIG GPU) — using softwarn; set 'evict' for opt-in eviction", s)
 		return EnforcementSoftWarn
 	default:
 		log.Printf("[enforcement] unknown mode %q — using softwarn", s)
@@ -77,10 +84,28 @@ const (
 	// so it is operator-meaningful (~90s detect + 60s grace ≈ 150s to SoftWarned).
 	enforcementGracePeriod = 60 * time.Second
 
-	memoryEnforcementCondition = "MemoryEnforcement"
-	enforcementReasonEngaged   = "SoftWarnEngaged"
-	enforcementReasonCleared   = "WithinGrant"
-	enforcementJobReason       = "ChildSliceSoftWarn"
+	// evictionGracePeriod (3.4d) is the ADDITIONAL grace after soft enforcement
+	// engages before an over-using pod is evicted in evict mode — a window for the
+	// workload to self-correct. The enforcement-deadline = onset + soft + evict
+	// grace (≈ 90s detect + 60s warn + 120s ≈ 270s to eviction).
+	evictionGracePeriod = 120 * time.Second
+
+	// Per-node eviction rate limit — a backstop so a detection bug can't mass-
+	// evict. Conservative by design.
+	maxEvictionsPerWindow = 3
+	evictionWindow        = 5 * time.Minute
+
+	// enforcementExemptLabel opts a pod (or its namespace) out of eviction. It is
+	// still detected, marked, and soft-warned — only the destructive step is
+	// skipped. Reuses the existing infrastructure.pranav2910.com/ label domain.
+	enforcementExemptLabel = "infrastructure.pranav2910.com/enforcement-exempt"
+
+	memoryEnforcementCondition  = "MemoryEnforcement"
+	enforcementReasonEngaged    = "SoftWarnEngaged"
+	enforcementReasonCleared    = "WithinGrant"
+	enforcementReasonEvicted    = "Evicted"
+	enforcementJobReason        = "ChildSliceSoftWarn"
+	enforcementJobReasonEvicted = "ChildSliceEvicted"
 
 	// Pod surfaces (workload-owner visibility). The label is selector-friendly
 	// (`kubectl get pods -l`); the annotations carry detail. The deadline is
@@ -124,20 +149,28 @@ func (d *SliceViolationDetector) enforce(ctx context.Context, u *sliceUsage, exc
 		start = d.now()
 		d.violationStart[key] = start
 	}
-	deadline := start.Add(enforcementGracePeriod)
-	if d.now().Before(deadline) {
+	softDeadline := start.Add(enforcementGracePeriod)
+	if d.now().Before(softDeadline) {
 		telemetry.MemoryEnforcementActive.WithLabelValues(d.nodeName, u.namespace, u.name).Set(0)
 		return // Observed — within grace; enforcement not engaged yet.
 	}
+	// The enforcement-deadline shown to the workload is the EVICTION time, so it
+	// is honest in both modes: in softwarn it is when evict mode WOULD act.
+	evictDeadline := start.Add(enforcementGracePeriod + evictionGracePeriod)
 
 	telemetry.MemoryEnforcementActive.WithLabelValues(d.nodeName, u.namespace, u.name).Set(1)
-	if d.enforced[key] {
-		return // already engaged; surfaces are in place.
+	if !d.enforced[key] {
+		d.enforced[key] = true
+		d.stampedPods[key] = append([]types.NamespacedName(nil), u.pods...)
+		telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "warn").Inc()
+		d.engageSoftWarn(ctx, u, excess, start, evictDeadline)
 	}
-	d.enforced[key] = true
-	d.stampedPods[key] = append([]types.NamespacedName(nil), u.pods...)
-	telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "warn").Inc()
-	d.engageSoftWarn(ctx, u, excess, start, deadline)
+	// 3.4d: once over-use persists past the eviction deadline, evict mode reclaims
+	// VRAM by evicting the offending pod(s) — PDB-respecting, rate-limited, and
+	// skipping exempt workloads. softwarn never reaches here.
+	if d.enforceMode >= EnforcementEvict && !d.now().Before(evictDeadline) {
+		d.maybeEvict(ctx, u, excess)
+	}
 }
 
 // engageSoftWarn applies every soft-enforcement surface for a slice that has been
@@ -146,7 +179,7 @@ func (d *SliceViolationDetector) engageSoftWarn(ctx context.Context, u *sliceUsa
 	msg := fmt.Sprintf("Soft enforcement engaged (warn-only, mode=%s): slice exceeded its VRAM grant by %d MiB for over %ds. The pod is labeled/annotated and is NOT evicted or throttled. enforcement-deadline=%s is informational (when a future hard mode would act).",
 		d.enforceMode.String(), excess>>20, int(enforcementGracePeriod.Seconds()), deadline.UTC().Format(time.RFC3339))
 
-	d.setSliceEnforcementCondition(ctx, u, metav1.ConditionTrue, enforcementReasonEngaged, msg)
+	d.setSliceEnforcementCondition(ctx, u, metav1.ConditionTrue, enforcementReasonEngaged, msg, "MemoryEnforcementSoftWarn")
 	d.mirrorEnforcementToJob(ctx, u, true)
 	for _, nn := range d.stampedPods[sliceKey(u.namespace, u.name)] {
 		d.stampPod(ctx, nn, excess, since, deadline)
@@ -163,7 +196,7 @@ func (d *SliceViolationDetector) clearEnforcement(ctx context.Context, u *sliceU
 		d.clearPod(ctx, nn)
 	}
 	d.setSliceEnforcementCondition(ctx, u, metav1.ConditionFalse, enforcementReasonCleared,
-		"GPU memory returned within grant; soft-enforcement surfaces cleared")
+		"GPU memory returned within grant; soft-enforcement surfaces cleared", "MemoryEnforcementCleared")
 	d.mirrorEnforcementToJob(ctx, u, false)
 	telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "clear").Inc()
 	delete(d.enforced, key)
@@ -186,8 +219,10 @@ func (d *SliceViolationDetector) cleanupEnforcement(ctx context.Context, key str
 }
 
 // setSliceEnforcementCondition upserts the MemoryEnforcement condition on the
-// slice and emits the matching slice Event. The slice phase is never changed.
-func (d *SliceViolationDetector) setSliceEnforcementCondition(ctx context.Context, u *sliceUsage, status metav1.ConditionStatus, reason, msg string) {
+// slice and emits a slice Event with the given reason (empty = no event). The
+// event type follows the status (True → Warning, False → Normal). The slice
+// phase is never changed.
+func (d *SliceViolationDetector) setSliceEnforcementCondition(ctx context.Context, u *sliceUsage, status metav1.ConditionStatus, reason, msg, eventReason string) {
 	var slice vgpuv1alpha1.VGPUSlice
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: u.namespace, Name: u.name}, &slice); err != nil {
 		return
@@ -203,14 +238,14 @@ func (d *SliceViolationDetector) setSliceEnforcementCondition(ctx context.Contex
 		log.Printf("[enforcement] update slice %s/%s MemoryEnforcement: %v", u.namespace, u.name, err)
 		return
 	}
-	if d.recorder == nil {
+	if d.recorder == nil || eventReason == "" {
 		return
 	}
-	if status == metav1.ConditionTrue {
-		d.recorder.Eventf(&slice, corev1.EventTypeWarning, "MemoryEnforcementSoftWarn", "%s", msg)
-	} else {
-		d.recorder.Eventf(&slice, corev1.EventTypeNormal, "MemoryEnforcementCleared", "%s", msg)
+	etype := corev1.EventTypeWarning
+	if status != metav1.ConditionTrue {
+		etype = corev1.EventTypeNormal
 	}
+	d.recorder.Eventf(&slice, etype, eventReason, "%s", msg)
 }
 
 // mirrorEnforcementToJob writes a summary MemoryEnforcement condition onto the
@@ -322,6 +357,149 @@ func (d *SliceViolationDetector) unstampPod(ctx context.Context, nn types.Namesp
 		return false
 	}
 	return true
+}
+
+// ── Phase 3.4d: opt-in eviction ──────────────────────────────────────────────
+
+// maybeEvict attempts to evict the pod(s) currently over-using the slice's grant,
+// once over-use has persisted past the eviction deadline (evict mode only). Each
+// pod runs the full safety gauntlet — exemption, per-node rate limit, then a
+// PDB-respecting Eviction API call — and every block is recorded, never silent.
+func (d *SliceViolationDetector) maybeEvict(ctx context.Context, u *sliceUsage, excess int64) {
+	for _, nn := range u.pods {
+		podK := nn.Namespace + "/" + nn.Name
+		if _, done := d.evictHandled[podK]; done {
+			continue // already evicted or exempted — terminal, do not reprocess
+		}
+		if d.isExempt(ctx, nn) {
+			d.evictHandled[podK] = "exempt"
+			d.notifyBlocked(u, nn, "exempt",
+				fmt.Sprintf("Pod is exempt from eviction (%s=true); over-use stays marked + soft-warned but the pod is NOT evicted", enforcementExemptLabel))
+			continue
+		}
+		if !d.evictionAllowed() {
+			d.notifyBlocked(u, nn, "ratelimited",
+				fmt.Sprintf("Per-node eviction rate limit reached (%d per %s); deferring eviction", maxEvictionsPerWindow, evictionWindow))
+			continue // transient — retry next cycle
+		}
+		if err := d.evictFn(ctx, nn); err != nil {
+			switch {
+			case apierrors.IsNotFound(err):
+				d.evictHandled[podK] = "evicted" // pod already gone
+			case apierrors.IsTooManyRequests(err):
+				d.notifyBlocked(u, nn, "pdb",
+					"Eviction blocked by a PodDisruptionBudget — not deleting; over-use stays marked + soft-warned")
+			default:
+				log.Printf("[enforcement] evict pod %s: %v", podK, err)
+			}
+			continue
+		}
+		// Evicted.
+		d.evictHandled[podK] = "evicted"
+		delete(d.blockedNotified, podK)
+		d.recordEvictionTime()
+		telemetry.MemoryEnforcementActionsTotal.WithLabelValues(d.nodeName, u.namespace, u.name, d.enforceMode.String(), "evict").Inc()
+		d.recordEvictionAudit(ctx, u, nn, excess)
+	}
+}
+
+// evictViaAPI issues a Kubernetes Eviction (pods/eviction subresource) — PDB-
+// respecting and graceful, never a raw delete or force-delete. It is the default
+// evictFn; tests override evictFn to exercise the policy without a live cluster.
+func (d *SliceViolationDetector) evictViaAPI(ctx context.Context, nn types.NamespacedName) error {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: nn.Namespace, Name: nn.Name}}
+	eviction := &policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Namespace: nn.Namespace, Name: nn.Name}}
+	return d.client.SubResource("eviction").Create(ctx, pod, eviction)
+}
+
+// isExempt reports whether a pod — or its namespace — opted out of eviction. An
+// exempt workload is still detected, marked, and soft-warned; only the
+// destructive step is skipped.
+func (d *SliceViolationDetector) isExempt(ctx context.Context, nn types.NamespacedName) bool {
+	var pod corev1.Pod
+	if err := d.apiReader.Get(ctx, nn, &pod); err == nil && pod.Labels[enforcementExemptLabel] == "true" {
+		return true
+	}
+	var ns corev1.Namespace
+	if err := d.apiReader.Get(ctx, types.NamespacedName{Name: nn.Namespace}, &ns); err == nil && ns.Labels[enforcementExemptLabel] == "true" {
+		return true
+	}
+	return false
+}
+
+// evictionAllowed reports whether the per-node eviction budget has headroom,
+// pruning timestamps outside the sliding window.
+func (d *SliceViolationDetector) evictionAllowed() bool {
+	cutoff := d.now().Add(-evictionWindow)
+	kept := d.evictionTimes[:0]
+	for _, t := range d.evictionTimes {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	d.evictionTimes = kept
+	return len(d.evictionTimes) < maxEvictionsPerWindow
+}
+
+func (d *SliceViolationDetector) recordEvictionTime() {
+	d.evictionTimes = append(d.evictionTimes, d.now())
+}
+
+// notifyBlocked records a blocked eviction once per (pod, reason) episode — the
+// metric + Event fire on the transition, not every cycle, so a persistently
+// blocked pod does not spam.
+func (d *SliceViolationDetector) notifyBlocked(u *sliceUsage, nn types.NamespacedName, reason, msg string) {
+	podK := nn.Namespace + "/" + nn.Name
+	if d.blockedNotified[podK] == reason {
+		return
+	}
+	d.blockedNotified[podK] = reason
+	telemetry.MemoryEvictionsBlocked.WithLabelValues(d.nodeName, u.namespace, u.name, reason).Inc()
+	if d.recorder != nil {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: nn.Namespace, Name: nn.Name}}
+		d.recorder.Eventf(pod, corev1.EventTypeWarning, "MemoryEvictionBlocked", "%s", msg)
+	}
+	log.Printf("[enforcement] eviction blocked (%s): pod %s/%s slice %s — %s", reason, nn.Namespace, nn.Name, u.name, msg)
+}
+
+// recordEvictionAudit emits the durable audit trail for an eviction: a pod Event,
+// the slice MemoryEnforcement condition (reason=Evicted), and the job mirror.
+func (d *SliceViolationDetector) recordEvictionAudit(ctx context.Context, u *sliceUsage, nn types.NamespacedName, excess int64) {
+	msg := fmt.Sprintf("Evicted pod %s for sustained GPU VRAM over-use (%d MiB over grant) past the enforcement deadline — reclaiming VRAM (policy=evict, PDB-respecting)", nn.Name, excess>>20)
+	if d.recorder != nil {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: nn.Namespace, Name: nn.Name}}
+		d.recorder.Eventf(pod, corev1.EventTypeWarning, "MemoryEnforcementEvicted", "%s", msg)
+	}
+	d.setSliceEnforcementCondition(ctx, u, metav1.ConditionTrue, enforcementReasonEvicted, msg, "MemoryEnforcementEvicted")
+	d.mirrorEvictionToJob(ctx, u)
+	log.Printf("[enforcement] EVICTED pod %s/%s (slice %s, excess=%d MiB) to reclaim VRAM", nn.Namespace, nn.Name, u.name, excess>>20)
+}
+
+// mirrorEvictionToJob marks the parent VGPUJob's MemoryEnforcement summary with
+// reason ChildSliceEvicted (slice → claim.JobRef → job).
+func (d *SliceViolationDetector) mirrorEvictionToJob(ctx context.Context, u *sliceUsage) {
+	var slice vgpuv1alpha1.VGPUSlice
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: u.namespace, Name: u.name}, &slice); err != nil || slice.Spec.ClaimRef == "" {
+		return
+	}
+	var claim vgpuv1alpha1.VGPUClaim
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: u.namespace, Name: slice.Spec.ClaimRef}, &claim); err != nil || claim.Spec.JobRef == "" {
+		return
+	}
+	var job vgpuv1alpha1.VGPUJob
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: u.namespace, Name: claim.Spec.JobRef}, &job); err != nil {
+		return
+	}
+	job.Status.Conditions = upsertNodeCondition(job.Status.Conditions, metav1.Condition{
+		Type:               memoryEnforcementCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             enforcementJobReasonEvicted,
+		Message:            "A child slice's pod was evicted for sustained GPU memory over-use (policy=evict)",
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := d.client.Status().Update(ctx, &job); err != nil {
+		log.Printf("[enforcement] mirror eviction to job %s/%s: %v", job.Namespace, job.Name, err)
+	}
 }
 
 // sweepOrphanStamps runs once at startup: it drops any soft-enforcement pod
