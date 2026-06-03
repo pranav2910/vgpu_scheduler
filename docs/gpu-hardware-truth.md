@@ -53,12 +53,28 @@ node (healthy devices only). The node agent exposes metrics on `:8083/metrics`:
 | Metric | Labels | Meaning |
 |---|---|---|
 | `vgpu_gpu_total_memory_bytes` | node, device | observed total VRAM (healthy only) |
-| `vgpu_gpu_used_memory_bytes` | node, device | observed used VRAM |
-| `vgpu_gpu_free_memory_bytes` | node, device | observed free VRAM |
+| `vgpu_gpu_used_memory_bytes` | node, device | active / process-allocated VRAM |
+| `vgpu_gpu_reserved_memory_bytes` | node, device | driver/device-reserved VRAM |
+| `vgpu_gpu_free_memory_bytes` | node, device | **allocatable free VRAM — the scheduling-relevant figure** |
 | `vgpu_gpu_healthy` | node, device | 1 healthy / 0 not |
 | `vgpu_gpu_provider_info` | node, provider | active provider: fake \| nvml \| degraded |
 | `vgpu_gpu_observation_errors_total` | node | failed observation cycles |
 | `vgpu_gpu_capacity_drift_bytes` | node | observed healthy-total − scheduler-assumed (negative = hardware shows less) |
+
+**Memory accounting (NVML v2):** `total = used + reserved + free`.
+
+| Figure | Meaning |
+|---|---|
+| `used` | active / process-allocated memory |
+| `reserved` | driver/device-reserved memory (ECC, contexts, etc.) |
+| `free` | allocatable free memory reported by NVML — **scheduling decisions use this** |
+
+The provider prefers `nvmlDeviceGetMemoryInfo_v2` (which separates `reserved`)
+and falls back to v1 on older drivers (v1 rolls `reserved` into `used`, so
+`reserved=0` and `used` is larger). This is why `used` may differ from
+`nvidia-smi`'s "used" on a v1 fallback — but `free` always matches, and `free`
+is what the scheduler cares about. Enforcement (later phases) must key off
+`free`, never `used`.
 
 **Drift** is the bridge to the scheduler's view. The scheduler exposes
 `vgpu_node_capacity_bytes`; hardware truth is `sum(vgpu_gpu_total_memory_bytes)`.

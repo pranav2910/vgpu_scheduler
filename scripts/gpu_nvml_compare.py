@@ -33,6 +33,7 @@ def main():
     total = series(metrics, "vgpu_gpu_total_memory_bytes")
     used = series(metrics, "vgpu_gpu_used_memory_bytes")
     free = series(metrics, "vgpu_gpu_free_memory_bytes")
+    reserved = series(metrics, "vgpu_gpu_reserved_memory_bytes")
     healthy = series(metrics, "vgpu_gpu_healthy")
 
     smi = {}
@@ -67,19 +68,25 @@ def main():
     else:
         fails += 1
 
-    # Check 4: used + free reconcile with total (used/free are actually read).
+    # Check 4: NVML v2 accounting reconciles (used + free + reserved == total),
+    # AND our free matches nvidia-smi's free — the scheduling-relevant figure.
     c_ok = True
-    for u in smi:
-        t, uu, ff = total.get(u), used.get(u), free.get(u)
+    for u, (t_smi, _, f_smi) in smi.items():
+        t, uu, ff, rr = total.get(u), used.get(u), free.get(u), reserved.get(u, 0.0)
         if None in (t, uu, ff):
             c_ok = False
             print("  %s used/free missing for %s" % (RED, u))
             continue
-        if abs((uu + ff) - t) > tol:
+        if abs((uu + ff + rr) - t) > tol:
             c_ok = False
-            print("  %s used+free != total for %s: %d + %d vs %d" % (RED, u, int(uu), int(ff), int(t)))
+            print("  %s used+free+reserved != total for %s: %d + %d + %d vs %d"
+                  % (RED, u, int(uu), int(ff), int(rr), int(t)))
+        if abs(ff - f_smi) > tol:
+            c_ok = False
+            print("  %s free mismatch %s: nvml=%d nvidia-smi=%d (diff %d > tol %d)"
+                  % (RED, u, int(ff), f_smi, int(ff - f_smi), tol))
     if c_ok:
-        print("  %s used+free reconcile with total (used/free are being read)" % GRN)
+        print("  %s memory reconciles (used+free+reserved=total) and free matches nvidia-smi" % GRN)
     else:
         fails += 1
 
@@ -95,8 +102,8 @@ def main():
     print("  ---- observed (bytes) ----")
     for u in smi:
         h = healthy.get(u, "?")
-        print("     %s  total=%d used=%d free=%d healthy=%s"
-              % (u, int(total.get(u, 0)), int(used.get(u, 0)), int(free.get(u, 0)), h))
+        print("     %s  total=%d used=%d reserved=%d free=%d healthy=%s"
+              % (u, int(total.get(u, 0)), int(used.get(u, 0)), int(reserved.get(u, 0)), int(free.get(u, 0)), h))
 
     return 1 if fails else 0
 

@@ -39,26 +39,32 @@ func NewProvider() (GPUProvider, error) {
 	count := envInt("VGPU_FAKE_GPU_COUNT", 1)
 	mem := envInt64("VGPU_FAKE_GPU_MEM_BYTES", fakeDefaultGPUMemBytes)
 	used := envInt64("VGPU_FAKE_GPU_USED_BYTES", 0)
-	if used > mem {
-		used = mem
+	reserved := envInt64("VGPU_FAKE_GPU_RESERVED_BYTES", 0)
+	if used+reserved > mem {
+		used = mem - reserved
+		if used < 0 {
+			used, reserved = 0, mem
+		}
 	}
 	unhealthyIdx := envInt("VGPU_FAKE_UNHEALTHY_IDX", -1)
 
 	devices := make([]GPUDevice, 0, count)
 	for i := 0; i < count; i++ {
+		// v2 semantics: total = used + free + reserved.
 		d := GPUDevice{
-			UUID:             fmt.Sprintf("GPU-FAKE-%08d", i),
-			Index:            i,
-			Name:             "FAKE-GPU",
-			TotalMemoryBytes: mem,
-			UsedMemoryBytes:  used,
-			FreeMemoryBytes:  mem - used,
-			Healthy:          true,
+			UUID:                fmt.Sprintf("GPU-FAKE-%08d", i),
+			Index:               i,
+			Name:                "FAKE-GPU",
+			TotalMemoryBytes:    mem,
+			UsedMemoryBytes:     used,
+			ReservedMemoryBytes: reserved,
+			FreeMemoryBytes:     mem - used - reserved,
+			Healthy:             true,
 		}
 		if i == unhealthyIdx {
 			d.Healthy = false
 			d.Error = "fake: marked unhealthy via VGPU_FAKE_UNHEALTHY_IDX"
-			d.UsedMemoryBytes, d.FreeMemoryBytes = 0, 0
+			d.UsedMemoryBytes, d.FreeMemoryBytes, d.ReservedMemoryBytes = 0, 0, 0
 		}
 		devices = append(devices, d)
 	}

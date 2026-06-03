@@ -198,12 +198,17 @@ var (
 
 	GPUDeviceUsedBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "vgpu_gpu_used_memory_bytes",
-		Help: "Observed used VRAM of a physical GPU, in bytes (healthy devices only).",
+		Help: "Observed active/process-used VRAM of a physical GPU, in bytes (NVML v2 excludes driver-reserved; healthy devices only).",
 	}, []string{"node", "device"})
 
 	GPUDeviceFreeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "vgpu_gpu_free_memory_bytes",
-		Help: "Observed free VRAM of a physical GPU, in bytes (healthy devices only).",
+		Help: "Observed allocatable free VRAM of a physical GPU, in bytes (the scheduling-relevant figure; healthy devices only).",
+	}, []string{"node", "device"})
+
+	GPUDeviceReservedBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_gpu_reserved_memory_bytes",
+		Help: "Observed driver/device-reserved VRAM of a physical GPU, in bytes (NVML v2; healthy devices only).",
 	}, []string{"node", "device"})
 
 	GPUDeviceHealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -257,8 +262,8 @@ func init() {
 		CacheWarmupComplete, CacheWarmupDuration, QueueDepth, ReconcileErrors,
 		LeaderActive, ReservationsActive,
 		// gpu hardware truth
-		GPUDeviceTotalBytes, GPUDeviceUsedBytes, GPUDeviceFreeBytes, GPUDeviceHealthy,
-		GPUProviderInfo, GPUObservationErrors, GPUCapacityDriftBytes,
+		GPUDeviceTotalBytes, GPUDeviceUsedBytes, GPUDeviceFreeBytes, GPUDeviceReservedBytes,
+		GPUDeviceHealthy, GPUProviderInfo, GPUObservationErrors, GPUCapacityDriftBytes,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

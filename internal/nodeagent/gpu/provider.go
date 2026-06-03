@@ -35,14 +35,19 @@ type GPUProvider interface {
 // are in bytes. When Healthy is false, Error explains why and the memory
 // figures should be treated as unknown (they are zeroed).
 type GPUDevice struct {
-	UUID             string
-	Index            int
-	Name             string
-	TotalMemoryBytes int64
-	UsedMemoryBytes  int64
-	FreeMemoryBytes  int64
-	Healthy          bool
-	Error            string
+	UUID  string
+	Index int
+	Name  string
+	// Memory figures follow NVML's v2 accounting (Total = Used + Free + Reserved):
+	//   Used     = active/process-allocated memory
+	//   Reserved = driver/device-reserved memory (NVML v1 lumps this into Used)
+	//   Free     = allocatable free memory — the SCHEDULING-RELEVANT value
+	TotalMemoryBytes    int64
+	UsedMemoryBytes     int64
+	FreeMemoryBytes     int64
+	ReservedMemoryBytes int64
+	Healthy             bool
+	Error               string
 }
 
 // Aggregate is the node-level rollup of a device snapshot.
@@ -52,6 +57,7 @@ type Aggregate struct {
 	TotalBytes    int64 // summed over healthy devices
 	UsedBytes     int64 // summed over healthy devices
 	FreeBytes     int64 // summed over healthy devices
+	ReservedBytes int64 // summed over healthy devices
 	AllHealthy    bool
 }
 
@@ -117,6 +123,7 @@ func aggregate(devices []GPUDevice) Aggregate {
 		a.TotalBytes += d.TotalMemoryBytes
 		a.UsedBytes += d.UsedMemoryBytes
 		a.FreeBytes += d.FreeMemoryBytes
+		a.ReservedBytes += d.ReservedMemoryBytes
 	}
 	if len(devices) == 0 {
 		a.AllHealthy = false

@@ -35,6 +35,19 @@ func TestAggregate_HealthyOnly(t *testing.T) {
 	}
 }
 
+func TestAggregate_SumsReserved(t *testing.T) {
+	a := dev("a", 100, 30, true)
+	a.ReservedMemoryBytes = 10
+	a.FreeMemoryBytes = 60 // total(100) - used(30) - reserved(10)
+	b := dev("b", 200, 40, true)
+	b.ReservedMemoryBytes = 20
+	b.FreeMemoryBytes = 140
+	agg := aggregate([]GPUDevice{a, b})
+	if agg.ReservedBytes != 30 || agg.UsedBytes != 70 || agg.FreeBytes != 200 || agg.TotalBytes != 300 {
+		t.Fatalf("aggregate with reserved: %+v", agg)
+	}
+}
+
 func TestAggregate_Empty(t *testing.T) {
 	a := aggregate(nil)
 	if a.DeviceCount != 0 || a.HealthyCount != 0 || a.TotalBytes != 0 || a.AllHealthy {

@@ -58,11 +58,12 @@ func main() {
 			healthy++
 		}
 		fmt.Printf("\nGPU %d: %s\n", d.Index, d.Name)
-		fmt.Printf("  UUID:   %s\n", d.UUID)
-		fmt.Printf("  total:  %5d MiB (%d bytes)\n", d.TotalMemoryBytes/miB, d.TotalMemoryBytes)
-		fmt.Printf("  used:   %5d MiB (%d bytes)\n", d.UsedMemoryBytes/miB, d.UsedMemoryBytes)
-		fmt.Printf("  free:   %5d MiB (%d bytes)\n", d.FreeMemoryBytes/miB, d.FreeMemoryBytes)
-		fmt.Printf("  health: %s\n", status)
+		fmt.Printf("  UUID:     %s\n", d.UUID)
+		fmt.Printf("  total:    %5d MiB (%d bytes)\n", d.TotalMemoryBytes/miB, d.TotalMemoryBytes)
+		fmt.Printf("  used:     %5d MiB (%d bytes)  [active/process]\n", d.UsedMemoryBytes/miB, d.UsedMemoryBytes)
+		fmt.Printf("  reserved: %5d MiB (%d bytes)  [driver]\n", d.ReservedMemoryBytes/miB, d.ReservedMemoryBytes)
+		fmt.Printf("  free:     %5d MiB (%d bytes)  [allocatable — scheduling-relevant]\n", d.FreeMemoryBytes/miB, d.FreeMemoryBytes)
+		fmt.Printf("  health:   %s\n", status)
 	}
 
 	fmt.Printf("\n%d device(s), %d healthy. Compare UUID/total/used/free against:\n", len(devices), healthy)

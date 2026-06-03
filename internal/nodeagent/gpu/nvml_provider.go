@@ -90,13 +90,24 @@ func queryDevice(i int) GPUDevice {
 		d.Name = name
 	}
 
+	// Prefer GetMemoryInfo_v2, which separates driver-Reserved memory from Used
+	// (Total = Used + Free + Reserved). Fall back to v1 on any driver that
+	// doesn't support it — v1 rolls Reserved into Used (Total = Used + Free).
+	if mem2, ret := handle.GetMemoryInfo_v2(); ret == nvml.SUCCESS && mem2.Total > 0 {
+		d.TotalMemoryBytes = int64(mem2.Total)
+		d.UsedMemoryBytes = int64(mem2.Used)
+		d.FreeMemoryBytes = int64(mem2.Free)
+		d.ReservedMemoryBytes = int64(mem2.Reserved)
+		return d
+	}
 	mem, ret := handle.GetMemoryInfo()
 	if ret != nvml.SUCCESS {
 		return unhealthy(i, fmt.Sprintf("GetMemoryInfo(%d): %s", i, nvml.ErrorString(ret)))
 	}
 	d.TotalMemoryBytes = int64(mem.Total)
-	d.UsedMemoryBytes = int64(mem.Used)
+	d.UsedMemoryBytes = int64(mem.Used) // v1: includes reserved
 	d.FreeMemoryBytes = int64(mem.Free)
+	// ReservedMemoryBytes left 0 — v1 does not separate it.
 	return d
 }
 

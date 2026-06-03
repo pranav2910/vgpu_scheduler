@@ -87,6 +87,7 @@ func (c *Collector) collectOnce(ctx context.Context) {
 	telemetry.GPUDeviceTotalBytes.Reset()
 	telemetry.GPUDeviceUsedBytes.Reset()
 	telemetry.GPUDeviceFreeBytes.Reset()
+	telemetry.GPUDeviceReservedBytes.Reset()
 	telemetry.GPUDeviceHealthy.Reset()
 	for _, d := range devices {
 		telemetry.GPUDeviceHealthy.WithLabelValues(c.nodeName, d.UUID).Set(boolToFloat(d.Healthy))
@@ -96,6 +97,7 @@ func (c *Collector) collectOnce(ctx context.Context) {
 			telemetry.GPUDeviceTotalBytes.WithLabelValues(c.nodeName, d.UUID).Set(float64(d.TotalMemoryBytes))
 			telemetry.GPUDeviceUsedBytes.WithLabelValues(c.nodeName, d.UUID).Set(float64(d.UsedMemoryBytes))
 			telemetry.GPUDeviceFreeBytes.WithLabelValues(c.nodeName, d.UUID).Set(float64(d.FreeMemoryBytes))
+			telemetry.GPUDeviceReservedBytes.WithLabelValues(c.nodeName, d.UUID).Set(float64(d.ReservedMemoryBytes))
 		}
 	}
 

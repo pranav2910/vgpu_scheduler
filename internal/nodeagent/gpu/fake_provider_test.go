@@ -39,6 +39,32 @@ func TestNewProvider_FakeFromEnv(t *testing.T) {
 	}
 }
 
+func TestNewProvider_FakeReserved_V2Semantics(t *testing.T) {
+	t.Setenv("VGPU_FAKE_GPU_COUNT", "1")
+	t.Setenv("VGPU_FAKE_GPU_MEM_BYTES", "1000")
+	t.Setenv("VGPU_FAKE_GPU_USED_BYTES", "100")
+	t.Setenv("VGPU_FAKE_GPU_RESERVED_BYTES", "200")
+
+	p, err := NewProvider()
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	d, err := p.ListDevices(context.Background())
+	if err != nil || len(d) != 1 {
+		t.Fatalf("ListDevices: %v (n=%d)", err, len(d))
+	}
+	g := d[0]
+	if g.UsedMemoryBytes != 100 || g.ReservedMemoryBytes != 200 || g.FreeMemoryBytes != 700 {
+		t.Fatalf("v2 fake: used=%d reserved=%d free=%d, want 100/200/700",
+			g.UsedMemoryBytes, g.ReservedMemoryBytes, g.FreeMemoryBytes)
+	}
+	// Invariant: total = used + free + reserved.
+	if g.UsedMemoryBytes+g.FreeMemoryBytes+g.ReservedMemoryBytes != g.TotalMemoryBytes {
+		t.Fatalf("v2 invariant broken: %d + %d + %d != %d",
+			g.UsedMemoryBytes, g.FreeMemoryBytes, g.ReservedMemoryBytes, g.TotalMemoryBytes)
+	}
+}
+
 func TestNewProvider_FakeFailInjection(t *testing.T) {
 	t.Setenv("VGPU_FAKE_FAIL", "true")
 	p, err := NewProvider()
