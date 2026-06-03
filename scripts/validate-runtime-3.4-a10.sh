@@ -145,11 +145,16 @@ M=$(scrape)
 [[ "$(echo "$M" | grep "vgpu_memory_enforcement_active{[^}]*slice=\"$SLICE\"" | head -1 | awk '{print $2}')" == "1" ]] \
     && ok "soft enforcement engaged (vgpu_memory_enforcement_active=1)" \
     || bad "soft enforcement did not engage — check VGPU_ENFORCEMENT_MODE=softwarn and the 60s grace"
-lbl=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.labels['infrastructure.pranav2910.com/memory-violation']}" 2>/dev/null)
-[[ "$lbl" == "true" ]] && ok "pod labeled memory-violation=true (kubectl get pods -l)" || bad "pod missing violation label (got '${lbl:-<none>}')"
-enfa=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.annotations['infrastructure.pranav2910.com/enforcement']}" 2>/dev/null)
-[[ "$enfa" == "SoftWarn" ]] && ok "pod annotated enforcement=SoftWarn" || bad "pod missing enforcement annotation (got '${enfa:-<none>}')"
-dl=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.annotations['infrastructure.pranav2910.com/enforcement-deadline']}" 2>/dev/null)
+# Read the pod once as JSON and grep — kubectl jsonpath's bracket form for keys
+# containing dots/slashes is unreliable across versions, so don't depend on it.
+PODJSON=$(kubectl get pod "$POD" -n "$NS" -o json 2>/dev/null)
+echo "$PODJSON" | grep -Eq '"infrastructure\.pranav2910\.com/memory-violation": *"true"' \
+    && ok "pod labeled memory-violation=true (kubectl get pods -l)" \
+    || bad "pod missing violation label"
+echo "$PODJSON" | grep -Eq '"infrastructure\.pranav2910\.com/enforcement": *"SoftWarn"' \
+    && ok "pod annotated enforcement=SoftWarn" \
+    || bad "pod missing enforcement annotation"
+dl=$(echo "$PODJSON" | grep -oE '"infrastructure\.pranav2910\.com/enforcement-deadline": *"[^"]+"' | head -1 | sed -E 's/.*: *"//; s/"$//')
 [[ -n "$dl" ]] && ok "pod carries informational enforcement-deadline ($dl)" || bad "pod missing enforcement-deadline annotation"
 scond=$(kubectl get vgpuslice "$SLICE" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="MemoryEnforcement")].status}' 2>/dev/null)
 [[ "$scond" == "True" ]] && ok "VGPUSlice MemoryEnforcement condition = True" || bad "slice MemoryEnforcement not True (got '${scond:-<none>}')"
