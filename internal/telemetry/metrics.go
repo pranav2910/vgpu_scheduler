@@ -245,6 +245,23 @@ var (
 		Help: "1 while a GPU has sustained VRAM over-use beyond what was granted, else 0.",
 	}, []string{"node", "gpu_uuid"})
 
+	// Per-slice attribution (Phase 3.4b). Same observe-only semantics, but now
+	// naming the slice whose workload exceeded its grant.
+	SliceMemoryViolationActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_memory_violation_active",
+		Help: "1 while a slice's attributed GPU VRAM use sustainably exceeds its grant, else 0.",
+	}, []string{"node", "namespace", "slice"})
+
+	SliceMemoryViolationExcessBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_memory_violation_excess_bytes",
+		Help: "Attributed GPU VRAM a slice is using beyond its grant, in bytes (0 when within grant).",
+	}, []string{"node", "namespace", "slice"})
+
+	SliceMemoryViolationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_memory_violations_total",
+		Help: "Count of times a slice transitioned into a sustained over-use violation, by reason.",
+	}, []string{"node", "namespace", "slice", "reason"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -278,8 +295,9 @@ func init() {
 		// gpu hardware truth
 		GPUDeviceTotalBytes, GPUDeviceUsedBytes, GPUDeviceFreeBytes, GPUDeviceReservedBytes,
 		GPUDeviceHealthy, GPUProviderInfo, GPUObservationErrors, GPUCapacityDriftBytes,
-		// runtime over-use detection (3.4a)
+		// runtime over-use detection (3.4a node-level, 3.4b per-slice)
 		NodeMemoryOveruseBytes, NodeMemoryViolationActive,
+		SliceMemoryViolationActive, SliceMemoryViolationExcessBytes, SliceMemoryViolationsTotal,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

@@ -27,8 +27,19 @@ type GPUProvider interface {
 	ListDevices(ctx context.Context) ([]GPUDevice, error)
 	// GetDevice returns a single device by UUID, or an error if absent.
 	GetDevice(ctx context.Context, uuid string) (*GPUDevice, error)
+	// ListProcesses returns the GPU-using processes across all devices (Phase
+	// 3.4b attribution). PIDs are in the host PID namespace.
+	ListProcesses(ctx context.Context) ([]GPUProcess, error)
 	// Shutdown releases any provider resources (e.g. nvml.Shutdown()).
 	Shutdown() error
+}
+
+// GPUProcess is one process holding VRAM on a GPU, as reported by NVML. The PID
+// is in the host PID namespace (so reading /proc/<pid>/cgroup requires hostPID).
+type GPUProcess struct {
+	PID             int
+	DeviceUUID      string
+	UsedMemoryBytes int64
 }
 
 // GPUDevice is a point-in-time observation of one physical GPU. Memory figures
@@ -159,6 +170,10 @@ func (d *degradedProvider) ListDevices(context.Context) ([]GPUDevice, error) {
 }
 
 func (d *degradedProvider) GetDevice(context.Context, string) (*GPUDevice, error) {
+	return nil, fmt.Errorf("GPU provider degraded: %w", d.err)
+}
+
+func (d *degradedProvider) ListProcesses(context.Context) ([]GPUProcess, error) {
 	return nil, fmt.Errorf("GPU provider degraded: %w", d.err)
 }
 

@@ -5,8 +5,8 @@ granted. Phase 3.4 closes that loop — but deliberately, in stages, so nothing 
 ever evicted on untrusted accounting:
 
 ```
-3.4a  detect node-level over-use            ← HERE (observe-only)
-3.4b  attribute + mark the slice Violating  (observe-only)
+3.4a  detect node-level over-use            ✅ observe-only
+3.4b  attribute + mark the slice Violating  ✅ observe-and-mark only ← HERE
 3.4c  soft enforcement (warn / annotate)
 3.4d  hard enforcement (evict / throttle)
 3.4e  MIG-backed hard partitioning
@@ -55,29 +55,56 @@ No eviction, no throttling, no CRD changes to slices, no per-slice attribution.
 A node-level flag says *that* a node is over-subscribed in reality, not yet
 *which* workload — that's 3.4b.
 
-## 3.4b — per-slice attribution + mark `Violating` (next)
+## 3.4b — per-slice attribution + mark `Violating` (current)
 
-- Per-process GPU memory via `nvmlDeviceGetComputeRunningProcesses` →
-  `(pid, usedMem)`; map `pid → pod` (parse `/proc/<pid>/cgroup`) `→ VGPUSlice`.
-- A slice over its grant (sustained) gets a status **Condition**, not a phase
-  change — it stays `Ready`:
+Now over-use is attributed to the *exact slice* and marked Kubernetes-natively.
 
-  ```yaml
-  status:
-    conditions:
-      - type: MemoryViolation
-        status: "True"
-        reason: ObservedGpuMemoryOveruse
-        message: "Observed GPU memory usage exceeded allocated VRAM by 512MiB for 60s"
-  ```
+**Attribution chain** (no new CRD field — reuses existing contracts):
 
-  A summary `MemoryViolation` condition is mirrored onto the parent `VGPUJob`.
-- Per-slice metrics gain the attribution labels:
-  `vgpu_memory_violation_active{node, namespace, slice}`,
-  `vgpu_memory_violation_excess_bytes{node, namespace, slice}`,
-  `vgpu_memory_violations_total{node, namespace, slice, reason}`.
-- A `Warning`/`MemoryViolation` Event is emitted on the slice/pod.
+```
+GPU process (NVML) → PID → pod (/proc/<pid>/cgroup) → claim-ref annotation → VGPUSlice (matching ClaimRef)
+```
+
+- `nvmlDeviceGetComputeRunningProcesses` / `GetGraphicsRunningProcesses` →
+  `(host pid, usedMem)` per GPU.
+- `pid → pod UID` by parsing `/proc/<pid>/cgroup` (cgroup v1/v2, systemd &
+  cgroupfs drivers). Requires `hostPID: true` so NVML's host PIDs are readable.
+- `pod → slice`: the pod carries `infrastructure.pranav2910.com/claim-ref`
+  (stamped by the mutating webhook); the slice's `spec.claimRef` matches it.
+- Each process's VRAM is summed onto its slice and compared to the slice's grant
+  (same tolerance + hysteresis as 3.4a).
+
+**Marking** — a sustained over-use gets a status **Condition**, *not* a phase
+change (the slice stays `Ready`):
+
+```yaml
+status:
+  conditions:
+    - type: MemoryViolation
+      status: "True"
+      reason: ObservedGpuMemoryOveruse
+      message: "Observed GPU memory usage exceeded allocated VRAM by 512 MiB for ~90s (observe-only, no eviction)"
+```
+
+A summary `MemoryViolation` condition (reason `ChildSliceViolation`) is mirrored
+onto the parent `VGPUJob`. Per-slice metrics gain attribution labels —
+`vgpu_memory_violation_active{node,namespace,slice}`,
+`vgpu_memory_violation_excess_bytes{node,namespace,slice}`,
+`vgpu_memory_violations_total{node,namespace,slice,reason}` — and a
+`Warning`/`MemoryViolation` Event is emitted on the slice. So an operator sees
+the offending slice via `kubectl describe vgpuslice`, `kubectl get events`, and
+Prometheus.
 
 Marking ≠ termination: a violating slice is `Ready + MemoryViolation=True`, never
-`Failed`, because 3.4b is still observe-only. The condition is the hook
-enforcement (3.4c+) will later act on.
+`Failed`. The condition is the hook enforcement (3.4c+) will later act on.
+
+**Deployment**: the NVML node agent (`nodeagent_daemonset_nvml.yaml`) sets
+`hostPID: true`; RBAC grants `pods:list` + `vgpuclaims/vgpujobs:get` +
+`vgpujobs/status`. The default (fake) build has no real GPU processes, so it
+attributes nothing — no false positives on kind.
+
+**Validation**: the full attribution + marking logic is unit-tested
+deterministically (synthetic `/proc` cgroups, fake pods/slices, stub provider).
+The two hardware-only reads — real `/proc/<pid>/cgroup` and NVML process
+listing — get their E2E proof on a real GPU node (an A10 run with live CUDA
+processes).

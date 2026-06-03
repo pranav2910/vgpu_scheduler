@@ -61,6 +61,45 @@ func (p *nvmlProvider) GetDevice(ctx context.Context, uuid string) (*GPUDevice, 
 	return nil, fmt.Errorf("nvml: device %q not found", uuid)
 }
 
+func (p *nvmlProvider) ListProcesses(_ context.Context) ([]GPUProcess, error) {
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("nvml.DeviceGetCount: %s", nvml.ErrorString(ret))
+	}
+	var procs []GPUProcess
+	for i := 0; i < count; i++ {
+		handle, ret := nvml.DeviceGetHandleByIndex(i)
+		if ret != nvml.SUCCESS {
+			continue // a single bad device must not blank the rest
+		}
+		uuid, ret := handle.GetUUID()
+		if ret != nvml.SUCCESS || uuid == "" {
+			uuid = fmt.Sprintf("GPU-INDEX-%d", i)
+		}
+		for _, getter := range []func() ([]nvml.ProcessInfo, nvml.Return){
+			handle.GetComputeRunningProcesses,
+			handle.GetGraphicsRunningProcesses,
+		} {
+			infos, ret := getter()
+			if ret != nvml.SUCCESS {
+				continue
+			}
+			for _, pi := range infos {
+				used := int64(pi.UsedGpuMemory)
+				if used < 0 {
+					used = 0 // NVML_VALUE_NOT_AVAILABLE sentinel → unknown
+				}
+				procs = append(procs, GPUProcess{
+					PID:             int(pi.Pid),
+					DeviceUUID:      uuid,
+					UsedMemoryBytes: used,
+				})
+			}
+		}
+	}
+	return procs, nil
+}
+
 func (p *nvmlProvider) Shutdown() error {
 	if ret := nvml.Shutdown(); ret != nvml.SUCCESS {
 		return fmt.Errorf("nvml.Shutdown: %s", nvml.ErrorString(ret))

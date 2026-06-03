@@ -95,6 +95,17 @@ func main() {
 		log.Fatalf("adding over-use detector: %v", err)
 	}
 
+	// Phase 3.4b: per-slice attribution + marking. Maps GPU processes to slices
+	// (PID -> pod cgroup -> claim-ref -> slice) and sets a MemoryViolation
+	// Condition + per-slice metrics + Event on sustained over-use. No eviction.
+	// Uses the API reader for the pod-by-node list (server-side field selector).
+	sliceDetector := nodeagent.NewSliceViolationDetector(
+		ctrlMgr.GetClient(), ctrlMgr.GetAPIReader(), nodeName, gpuProvider,
+		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second)
+	if err := ctrlMgr.Add(sliceDetector); err != nil {
+		log.Fatalf("adding per-slice over-use detector: %v", err)
+	}
+
 	// Drift detection runs before any new slice work starts, using a one-shot
 	// Runnable so the informer cache is synced first.
 	if err := ctrlMgr.Add(manager.RunnableFunc(func(ctx context.Context) error {

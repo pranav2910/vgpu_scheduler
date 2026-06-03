@@ -27,8 +27,9 @@ const RealBuild = false
 const fakeDefaultGPUMemBytes = int64(80) << 30 // 80 GiB — matches the kind node model
 
 type fakeProvider struct {
-	devices []GPUDevice
-	failErr error // when set, ListDevices/GetDevice return this (degraded simulation)
+	devices   []GPUDevice
+	processes []GPUProcess
+	failErr   error // when set, list calls return this (degraded simulation)
 }
 
 // NewProvider is the build-tag-selected constructor. The fake build never fails
@@ -103,6 +104,15 @@ func (f *fakeProvider) GetDevice(_ context.Context, uuid string) (*GPUDevice, er
 		}
 	}
 	return nil, fmt.Errorf("fake: device %q not found", uuid)
+}
+
+func (f *fakeProvider) ListProcesses(context.Context) ([]GPUProcess, error) {
+	if f.failErr != nil {
+		return nil, f.failErr
+	}
+	out := make([]GPUProcess, len(f.processes))
+	copy(out, f.processes)
+	return out, nil
 }
 
 func (f *fakeProvider) Shutdown() error { return nil }

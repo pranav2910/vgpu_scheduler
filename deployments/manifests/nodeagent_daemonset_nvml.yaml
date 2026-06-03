@@ -32,6 +32,9 @@ spec:
         app: vgpu-nodeagent
     spec:
       serviceAccountName: vgpu-nodeagent-sa
+      # Phase 3.4b: see host PIDs so the agent can read /proc/<pid>/cgroup and
+      # attribute NVML-reported GPU processes (host PIDs) to their pod/slice.
+      hostPID: true
       # Uncomment if the nvidia runtime is not the node default:
       # runtimeClassName: nvidia
       containers:

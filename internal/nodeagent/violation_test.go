@@ -8,6 +8,7 @@ import (
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -72,6 +73,9 @@ func TestEvaluate_WithinToleranceNotFlagged(t *testing.T) {
 func nodeAgentScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatalf("clientgo AddToScheme: %v", err)
+	}
 	if err := vgpuv1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("AddToScheme: %v", err)
 	}
