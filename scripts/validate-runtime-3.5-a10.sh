@@ -54,18 +54,12 @@ hdr "speed up node-agent observation (2s interval)"
 kubectl -n "$AGENT_NS" set env daemonset/vgpu-nodeagent VGPU_OBSERVE_INTERVAL=2s >/dev/null
 kubectl -n "$AGENT_NS" rollout status daemonset/vgpu-nodeagent --timeout=120s || { echo "agent rollout failed"; exit 2; }
 
-# ── deploy the controller in minimal (no-webhook) mode ───────────────────────
-hdr "deploy controller (minimal, no cert-manager)"
-$DOCKER build --provenance=false -t vgpu-controller:latest -f Dockerfile.controller . >/dev/null \
-    || { echo "controller build failed"; exit 2; }
-$DOCKER save vgpu-controller:latest | sudo k3s ctr images import - >/dev/null \
-    || { echo "controller image import failed"; exit 2; }
-kubectl apply -f deployments/manifests/controller_deployment_nowebhook.yaml >/dev/null
-kubectl -n "$AGENT_NS" rollout status deployment/vgpu-controller --timeout=150s \
-    || { echo "controller rollout failed"; kubectl -n "$AGENT_NS" logs deploy/vgpu-controller --tail=30; exit 2; }
-echo "  controller running (reconcilers only)"
-
-# ── deploy the demo (controller naming so it adopts these objects) ───────────
+# ── deploy the demo FIRST, before the controller ─────────────────────────────
+# Critical ordering: there is no scheduler here, so the slice's nodeName must be
+# set by hand. If the controller were already running it would materialize its
+# OWN claim+slice (with no nodeName, which the node agent ignores) the instant the
+# job appears. So we create everything first — slice with nodeName + Ready — then
+# start the controller, which ADOPTS these by name instead of recreating them.
 hdr "deploy demo: request $((GRANT_BYTES>>20)) MiB, workload uses $((HOG_BYTES>>20)) MiB"
 cat <<EOF | kubectl apply -f - >/dev/null
 apiVersion: infrastructure.pranav2910.com/v1alpha1
@@ -104,8 +98,21 @@ spec:
     - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
     - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
 EOF
+# Mark the slice Ready (nodeName already in spec) so the node agent observes it.
 kubectl patch vgpuslice "$SLICE" -n "$NS" --subresource=status --type=merge \
     -p "{\"status\":{\"phase\":\"Ready\",\"allocatedBytes\":$GRANT_BYTES}}" >/dev/null 2>&1
+echo "  demo created (slice $SLICE bound to $NODE, Ready)"
+
+# ── now deploy the controller in minimal (no-webhook) mode; it adopts the above ─
+hdr "deploy controller (minimal, no cert-manager)"
+$DOCKER build --provenance=false -t vgpu-controller:latest -f Dockerfile.controller . >/dev/null \
+    || { echo "controller build failed"; exit 2; }
+$DOCKER save vgpu-controller:latest | sudo k3s ctr images import - >/dev/null \
+    || { echo "controller image import failed"; exit 2; }
+kubectl apply -f deployments/manifests/controller_deployment_nowebhook.yaml >/dev/null
+kubectl -n "$AGENT_NS" rollout status deployment/vgpu-controller --timeout=150s \
+    || { echo "controller rollout failed"; kubectl -n "$AGENT_NS" logs deploy/vgpu-controller --tail=30; exit 2; }
+echo "  controller running (reconcilers only)"
 
 echo "  waiting for the workload to allocate GPU memory (image pull can take a few min)..."
 for i in $(seq 1 72); do
