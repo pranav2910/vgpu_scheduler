@@ -290,6 +290,25 @@ var (
 		Help: "Eviction attempts blocked by a safety rail, by reason (pdb|exempt|ratelimited).",
 	}, []string{"node", "namespace", "slice", "reason"})
 
+	// ── Runtime feedback / behavior profiles (Phase 3.5, controller) ──────
+	// Per-workload learned VRAM behavior. Observe-only — surfaced for dashboards
+	// and alerting (e.g. under-provisioned workloads), never drives scheduling.
+
+	WorkloadPeakObservedVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_workload_peak_observed_vram_bytes",
+		Help: "Observed peak GPU VRAM use for a workload, in bytes (high-water).",
+	}, []string{"namespace", "workload"})
+
+	WorkloadRecommendedVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_workload_recommended_vram_bytes",
+		Help: "Recommended VRAM grant for a workload (peak + headroom), in bytes.",
+	}, []string{"namespace", "workload"})
+
+	WorkloadProfileConfidence = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_workload_profile_confidence",
+		Help: "Confidence in a workload's recommendation: 0=Low, 1=Medium, 2=High.",
+	}, []string{"namespace", "workload"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -329,6 +348,8 @@ func init() {
 		// runtime soft enforcement (3.4c) + opt-in eviction (3.4d)
 		MemoryEnforcementMode, MemoryEnforcementActive, MemoryEnforcementActionsTotal,
 		MemoryEvictionsBlocked,
+		// runtime feedback / behavior profiles (3.5)
+		WorkloadPeakObservedVRAMBytes, WorkloadRecommendedVRAMBytes, WorkloadProfileConfidence,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

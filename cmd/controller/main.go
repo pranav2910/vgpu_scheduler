@@ -93,6 +93,13 @@ func main() {
 		log.Fatalf("setting up VGPUGangReservationReconciler: %v", err)
 	}
 
+	// Phase 3.5: Runtime Feedback Engine — aggregate per-slice runtime stats into
+	// per-workload VGPUWorkloadProfiles (peak/avg, incident counts, recommended
+	// VRAM, confidence). Observe-only; does not affect scheduling.
+	if err := (&controller.VGPUWorkloadProfileReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		log.Fatalf("setting up VGPUWorkloadProfileReconciler: %v", err)
+	}
+
 	// Bug #16: register admission webhooks.
 	decoder := admission.NewDecoder(scheme)
 	mgr.GetWebhookServer().Register("/mutate-v1-pod",

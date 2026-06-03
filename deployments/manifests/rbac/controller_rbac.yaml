@@ -36,6 +36,14 @@ rules:
   - apiGroups: ["infrastructure.pranav2910.com"]
     resources: ["vgpugangjobs/status", "vgpugangreservations/status"]
     verbs: ["get", "update", "patch"]
+  # Phase 3.5: Runtime Feedback Engine — the controller is the sole writer of
+  # per-workload behavior profiles, aggregated from per-slice runtime stats.
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuworkloadprofiles"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuworkloadprofiles/status"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: ["infrastructure.pranav2910.com"]
     resources: ["vgpugangjobs/finalizers", "vgpugangreservations/finalizers"]
     verbs: ["update"]
