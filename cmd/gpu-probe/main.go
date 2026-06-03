@@ -69,6 +69,20 @@ func main() {
 	fmt.Printf("\n%d device(s), %d healthy. Compare UUID/total/used/free against:\n", len(devices), healthy)
 	fmt.Println("  nvidia-smi --query-gpu=index,name,uuid,memory.total,memory.used,memory.free --format=csv")
 
+	// Phase 3.4b read: per-process GPU memory (NVML GetComputeRunningProcesses).
+	// This is the attribution input the kind/fake path cannot exercise.
+	procs, perr := provider.ListProcesses(context.Background())
+	fmt.Println("\nGPU processes (NVML, host PIDs — input to per-slice attribution):")
+	if perr != nil {
+		fmt.Printf("  ListProcesses error: %v\n", perr)
+	} else if len(procs) == 0 {
+		fmt.Println("  (none — start a GPU workload, then re-run; compare to: nvidia-smi)")
+	} else {
+		for _, p := range procs {
+			fmt.Printf("  pid=%-8d device=%s  used=%5d MiB\n", p.PID, p.DeviceUUID, p.UsedMemoryBytes/miB)
+		}
+	}
+
 	if provider.Name() == "nvml" && healthy == 0 {
 		os.Exit(1)
 	}
