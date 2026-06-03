@@ -231,6 +231,20 @@ var (
 		Help: "Observed healthy GPU total minus scheduler-assumed capacity, in bytes (negative => hardware shows less than assumed).",
 	}, []string{"node"})
 
+	// ── Runtime over-use detection (Phase 3.4a, node agent, observe-only) ─
+	// Compares observed GPU process-used VRAM against the VRAM the scheduler
+	// granted to bound slices on the node. Detection only — nothing is evicted.
+
+	NodeMemoryOveruseBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_node_memory_overuse_bytes",
+		Help: "Observed GPU process-used VRAM minus the VRAM granted to bound slices, clamped at 0 (bytes). Per GPU; slice attribution arrives in 3.4b.",
+	}, []string{"node", "gpu_uuid"})
+
+	NodeMemoryViolationActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_node_memory_violation_active",
+		Help: "1 while a GPU has sustained VRAM over-use beyond what was granted, else 0.",
+	}, []string{"node", "gpu_uuid"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -264,6 +278,8 @@ func init() {
 		// gpu hardware truth
 		GPUDeviceTotalBytes, GPUDeviceUsedBytes, GPUDeviceFreeBytes, GPUDeviceReservedBytes,
 		GPUDeviceHealthy, GPUProviderInfo, GPUObservationErrors, GPUCapacityDriftBytes,
+		// runtime over-use detection (3.4a)
+		NodeMemoryOveruseBytes, NodeMemoryViolationActive,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

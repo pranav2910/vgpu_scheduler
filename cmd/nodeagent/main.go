@@ -85,6 +85,16 @@ func main() {
 		log.Fatalf("adding GPU observation collector: %v", err)
 	}
 
+	// Phase 3.4a: observe-only over-use detection. Compares observed GPU
+	// process-used VRAM against the VRAM granted to bound slices and surfaces
+	// sustained over-use via metrics + a Node Event. No eviction or throttling.
+	detector := nodeagent.NewViolationDetector(
+		ctrlMgr.GetClient(), nodeName, gpuCollector.Inventory(),
+		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second)
+	if err := ctrlMgr.Add(detector); err != nil {
+		log.Fatalf("adding over-use detector: %v", err)
+	}
+
 	// Drift detection runs before any new slice work starts, using a one-shot
 	// Runnable so the informer cache is synced first.
 	if err := ctrlMgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
