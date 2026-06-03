@@ -95,13 +95,18 @@ func main() {
 		log.Fatalf("adding over-use detector: %v", err)
 	}
 
-	// Phase 3.4b: per-slice attribution + marking. Maps GPU processes to slices
-	// (PID -> pod cgroup -> claim-ref -> slice) and sets a MemoryViolation
-	// Condition + per-slice metrics + Event on sustained over-use. No eviction.
-	// Uses the API reader for the pod-by-node list (server-side field selector).
+	// Phase 3.4b/3.4c: per-slice attribution + marking, plus non-destructive soft
+	// enforcement. Maps GPU processes to slices (PID -> pod cgroup -> claim-ref ->
+	// slice), sets a MemoryViolation Condition + per-slice metrics + Event on
+	// sustained over-use (3.4b), and — past a grace period — engages soft
+	// enforcement (3.4c): labels/annotates the offending pod, records a
+	// MemoryEnforcement decision, and warns. Never evicts, throttles, or changes
+	// the pod phase. Mode via VGPU_ENFORCEMENT_MODE (off|softwarn; default
+	// softwarn). Uses the API reader for the pod-by-node list (field selector).
+	enforceMode := nodeagent.ParseEnforcementMode(os.Getenv("VGPU_ENFORCEMENT_MODE"))
 	sliceDetector := nodeagent.NewSliceViolationDetector(
 		ctrlMgr.GetClient(), ctrlMgr.GetAPIReader(), nodeName, gpuProvider,
-		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second)
+		ctrlMgr.GetEventRecorderFor("vgpu-nodeagent"), 30*time.Second, enforceMode)
 	if err := ctrlMgr.Add(sliceDetector); err != nil {
 		log.Fatalf("adding per-slice over-use detector: %v", err)
 	}
@@ -159,7 +164,6 @@ func main() {
 	}
 }
 
-
 // ─── NodeAgent slice reconciler ──────────────────────────────────────────────
 
 type nodeAgentSliceReconciler struct {
@@ -185,4 +189,3 @@ func (r *nodeAgentSliceReconciler) Reconcile(ctx context.Context, req reconcile.
 	}
 	return reconcile.Result{}, nil
 }
-

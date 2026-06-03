@@ -43,28 +43,44 @@ type SliceViolationDetector struct {
 
 	streak map[string]int  // sliceKey -> consecutive over-budget cycles
 	active map[string]bool // sliceKey -> currently marked
+
+	// Phase 3.4c soft enforcement.
+	enforceMode    EnforcementMode                   // off | softwarn
+	now            func() time.Time                  // injectable clock for the grace timer (defaults to time.Now)
+	violationStart map[string]time.Time              // sliceKey -> when 3.4b flagged it (grace anchor)
+	enforced       map[string]bool                   // sliceKey -> soft enforcement currently engaged
+	stampedPods    map[string][]types.NamespacedName // sliceKey -> pods we labeled/annotated (for exact cleanup)
 }
 
 // NewSliceViolationDetector builds the detector. interval <= 0 defaults to 30s.
-func NewSliceViolationDetector(c client.Client, apiReader client.Reader, nodeName string, provider gpu.GPUProvider, recorder record.EventRecorder, interval time.Duration) *SliceViolationDetector {
+// mode selects the 3.4c enforcement ceiling (off | softwarn).
+func NewSliceViolationDetector(c client.Client, apiReader client.Reader, nodeName string, provider gpu.GPUProvider, recorder record.EventRecorder, interval time.Duration, mode EnforcementMode) *SliceViolationDetector {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
 	return &SliceViolationDetector{
-		client:    c,
-		apiReader: apiReader,
-		nodeName:  nodeName,
-		provider:  provider,
-		recorder:  recorder,
-		interval:  interval,
-		procRoot:  "/proc",
-		streak:    map[string]int{},
-		active:    map[string]bool{},
+		client:         c,
+		apiReader:      apiReader,
+		nodeName:       nodeName,
+		provider:       provider,
+		recorder:       recorder,
+		interval:       interval,
+		procRoot:       "/proc",
+		enforceMode:    mode,
+		now:            time.Now,
+		streak:         map[string]int{},
+		active:         map[string]bool{},
+		violationStart: map[string]time.Time{},
+		enforced:       map[string]bool{},
+		stampedPods:    map[string][]types.NamespacedName{},
 	}
 }
 
 func (d *SliceViolationDetector) Start(ctx context.Context) error {
-	log.Printf("[slice-violation] per-slice over-use detector started: node=%s interval=%s (observe-and-mark only)", d.nodeName, d.interval)
+	telemetry.MemoryEnforcementMode.WithLabelValues(d.nodeName).Set(float64(d.enforceMode))
+	log.Printf("[slice-violation] per-slice over-use detector started: node=%s interval=%s enforcement=%s (no eviction/throttle)",
+		d.nodeName, d.interval, d.enforceMode.String())
+	d.sweepOrphanStamps(ctx) // drop any soft-enforcement stamps left by a prior lifetime
 	t := time.NewTicker(d.interval)
 	defer t.Stop()
 	for {
@@ -84,6 +100,18 @@ type sliceUsage struct {
 	name      string
 	grant     int64
 	used      int64
+	pods      []types.NamespacedName // pods attributed to this slice (3.4c stamp targets)
+}
+
+// addPod appends a pod to the slice's attributed set, de-duplicated (a pod can
+// own several GPU processes on the same slice).
+func (u *sliceUsage) addPod(nn types.NamespacedName) {
+	for _, p := range u.pods {
+		if p == nn {
+			return
+		}
+	}
+	u.pods = append(u.pods, nn)
 }
 
 func sliceKey(ns, name string) string { return ns + "/" + name }
@@ -101,6 +129,7 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 	// Reset per-slice gauges so vanished slices' series disappear.
 	telemetry.SliceMemoryViolationActive.Reset()
 	telemetry.SliceMemoryViolationExcessBytes.Reset()
+	telemetry.MemoryEnforcementActive.Reset()
 
 	seen := make(map[string]bool, len(usage))
 	for key, u := range usage {
@@ -114,12 +143,25 @@ func (d *SliceViolationDetector) detectOnce(ctx context.Context) error {
 		} else if cleared {
 			d.mark(ctx, u, 0, false)
 		}
+		// Phase 3.4c: drive the grace-gated soft-enforcement state machine.
+		d.enforce(ctx, u, excess, violating)
 	}
 	// Prune state for slices no longer present (deleted/unbound).
 	for key := range d.active {
 		if !seen[key] {
 			delete(d.active, key)
 			delete(d.streak, key)
+		}
+	}
+	// 3.4c: clean enforcement state (and un-stamp pods) for vanished slices.
+	for key := range d.enforced {
+		if !seen[key] {
+			d.cleanupEnforcement(ctx, key)
+		}
+	}
+	for key := range d.violationStart {
+		if !seen[key] {
+			delete(d.violationStart, key)
 		}
 	}
 	return nil
@@ -175,7 +217,7 @@ func (d *SliceViolationDetector) attribute(ctx context.Context, procs []gpu.GPUP
 	if err := d.apiReader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": d.nodeName}); err != nil {
 		return nil, fmt.Errorf("listing pods on node: %w", err)
 	}
-	type podRef struct{ namespace, claim string }
+	type podRef struct{ namespace, name, claim string }
 	byPodUID := map[string]podRef{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
@@ -183,7 +225,7 @@ func (d *SliceViolationDetector) attribute(ctx context.Context, procs []gpu.GPUP
 		if claim == "" {
 			continue
 		}
-		byPodUID[string(p.UID)] = podRef{namespace: p.Namespace, claim: claim}
+		byPodUID[string(p.UID)] = podRef{namespace: p.Namespace, name: p.Name, claim: claim}
 	}
 
 	// 3. Attribute each process to its slice via cgroup → pod → claim → slice.
@@ -198,6 +240,7 @@ func (d *SliceViolationDetector) attribute(ctx context.Context, procs []gpu.GPUP
 		}
 		if u, ok := byClaim[ref.namespace+"/"+ref.claim]; ok {
 			u.used += proc.UsedMemoryBytes
+			u.addPod(types.NamespacedName{Namespace: ref.namespace, Name: ref.name})
 		}
 	}
 	return byKey, nil

@@ -23,11 +23,11 @@ import (
 // calls ListProcesses). Tag-agnostic, so the test compiles under any build tag.
 type stubProvider struct{ procs []gpu.GPUProcess }
 
-func (s *stubProvider) Name() string                                            { return "stub" }
-func (s *stubProvider) ListDevices(context.Context) ([]gpu.GPUDevice, error)    { return nil, nil }
+func (s *stubProvider) Name() string                                              { return "stub" }
+func (s *stubProvider) ListDevices(context.Context) ([]gpu.GPUDevice, error)      { return nil, nil }
 func (s *stubProvider) GetDevice(context.Context, string) (*gpu.GPUDevice, error) { return nil, nil }
-func (s *stubProvider) ListProcesses(context.Context) ([]gpu.GPUProcess, error) { return s.procs, nil }
-func (s *stubProvider) Shutdown() error                                         { return nil }
+func (s *stubProvider) ListProcesses(context.Context) ([]gpu.GPUProcess, error)   { return s.procs, nil }
+func (s *stubProvider) Shutdown() error                                           { return nil }
 
 const testPodUID = "3f1e6b7c-1234-5678-9abc-def012345678"
 
@@ -73,7 +73,7 @@ func fixture(t *testing.T, procUsed int64) (*SliceViolationDetector, client.Clie
 
 	d := NewSliceViolationDetector(c, c, "node-a", &stubProvider{
 		procs: []gpu.GPUProcess{{PID: pid, DeviceUUID: "g0", UsedMemoryBytes: procUsed}},
-	}, nil, time.Second)
+	}, nil, time.Second, EnforcementOff)
 	d.procRoot = procRoot
 	return d, c
 }

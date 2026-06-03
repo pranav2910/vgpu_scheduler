@@ -262,6 +262,26 @@ var (
 		Help: "Count of times a slice transitioned into a sustained over-use violation, by reason.",
 	}, []string{"node", "namespace", "slice", "reason"})
 
+	// ── Runtime soft enforcement (Phase 3.4c, node agent, non-destructive) ─
+	// When a slice's over-use persists past a grace period, soft enforcement
+	// engages: it labels/annotates the offending pod and records the decision.
+	// Still observe-and-warn — nothing is evicted, throttled, or phase-failed.
+
+	MemoryEnforcementMode = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_memory_enforcement_mode",
+		Help: "Active runtime enforcement mode on a node: 0=off, 1=softwarn (the 3.4c ceiling; hard modes arrive in 3.4d).",
+	}, []string{"node"})
+
+	MemoryEnforcementActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_memory_enforcement_active",
+		Help: "1 while soft enforcement is engaged on a slice (over-use sustained past the grace period), else 0. Engaged = pod labeled/annotated, never evicted.",
+	}, []string{"node", "namespace", "slice"})
+
+	MemoryEnforcementActionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_memory_enforcement_actions_total",
+		Help: "Soft-enforcement actions taken, by mode and action (warn|clear). Non-destructive — no eviction or throttling.",
+	}, []string{"node", "namespace", "slice", "mode", "action"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -298,6 +318,8 @@ func init() {
 		// runtime over-use detection (3.4a node-level, 3.4b per-slice)
 		NodeMemoryOveruseBytes, NodeMemoryViolationActive,
 		SliceMemoryViolationActive, SliceMemoryViolationExcessBytes, SliceMemoryViolationsTotal,
+		// runtime soft enforcement (3.4c)
+		MemoryEnforcementMode, MemoryEnforcementActive, MemoryEnforcementActionsTotal,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)
