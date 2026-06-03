@@ -11,6 +11,7 @@ import (
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -250,7 +251,12 @@ func (d *SliceViolationDetector) mirrorEnforcementToJob(ctx context.Context, u *
 // touches labels/annotations — never the pod spec. Emits a Warning event.
 func (d *SliceViolationDetector) stampPod(ctx context.Context, nn types.NamespacedName, excess int64, since, deadline time.Time) {
 	var pod corev1.Pod
-	if err := d.client.Get(ctx, nn, &pod); err != nil {
+	// Read via the API reader (direct, uncached) — the node agent runs no Pod
+	// informer, so a cached Get would fail. Same path as the 3.4b pod list.
+	if err := d.apiReader.Get(ctx, nn, &pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("[enforcement] stamp pod %s/%s: get: %v", nn.Namespace, nn.Name, err)
+		}
 		return // pod vanished — nothing to stamp
 	}
 	base := client.MergeFrom(pod.DeepCopy())
@@ -295,7 +301,10 @@ func (d *SliceViolationDetector) clearPod(ctx context.Context, nn types.Namespac
 // decide whether to emit one.
 func (d *SliceViolationDetector) unstampPod(ctx context.Context, nn types.NamespacedName) bool {
 	var pod corev1.Pod
-	if err := d.client.Get(ctx, nn, &pod); err != nil {
+	if err := d.apiReader.Get(ctx, nn, &pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("[enforcement] unstamp pod %s/%s: get: %v", nn.Namespace, nn.Name, err)
+		}
 		return false
 	}
 	if pod.Labels[podViolationLabel] == "" && pod.Annotations[podEnforcementAnno] == "" {

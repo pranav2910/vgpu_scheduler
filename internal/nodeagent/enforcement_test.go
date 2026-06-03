@@ -10,6 +10,8 @@ import (
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -145,6 +147,46 @@ func TestEnforce_OffModeDoesNotStampPod(t *testing.T) {
 	// 3.4b marking is independent of enforcement mode and must still fire.
 	if !sliceConditionTrue(t, c, "slice-1") {
 		t.Fatalf("3.4b MemoryViolation should still mark with enforcement off")
+	}
+}
+
+// podBlindClient wraps a client.Client but returns NotFound for Pod Gets — it
+// simulates the node agent's CACHED client, which runs no Pod informer. All
+// other reads and every write pass through. It guards the regression the A10
+// E2E caught: pod stamping must read via the (direct) apiReader, not the cached
+// client, or the over-using pod is never labeled/annotated on a real cluster.
+type podBlindClient struct{ client.Client }
+
+func (p podBlindClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Pod); ok {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, key.Name)
+	}
+	return p.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestStampPod_ReadsViaAPIReaderNotCachedClient drives a violation past grace
+// with a pod-blind cached client; the pod must still be stamped (proving the
+// read goes through apiReader). Reverting stampPod to d.client.Get fails here.
+func TestStampPod_ReadsViaAPIReaderNotCachedClient(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	d.client = podBlindClient{c} // cached client: cannot Get pods
+	d.apiReader = c              // direct reader: can
+	d.enforceMode = EnforcementSoftWarn
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	ctx := context.Background()
+
+	for i := 0; i < sliceOveruseStreakThreshold; i++ {
+		if err := d.detectOnce(ctx); err != nil {
+			t.Fatalf("detectOnce: %v", err)
+		}
+	}
+	clock = clock.Add(enforcementGracePeriod + time.Second)
+	if err := d.detectOnce(ctx); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if !podStamped(t, c, "wl") {
+		t.Fatalf("pod must be stamped via apiReader even when the cached client is pod-blind")
 	}
 }
 

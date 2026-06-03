@@ -105,6 +105,9 @@ kubectl apply -f deployments/manifests/nodeagent_daemonset_nvml.yaml >/dev/null
 # so the toolkit injects libnvidia-ml.so.1 (NVML) into the container.
 kubectl -n "$AGENT_NS" patch daemonset vgpu-nodeagent --type merge \
     -p '{"spec":{"template":{"spec":{"runtimeClassName":"nvidia"}}}}' >/dev/null
+# Force a restart so a re-run picks up a freshly-built+imported image (same tag,
+# IfNotPresent would otherwise keep the old pod running the old binary).
+kubectl -n "$AGENT_NS" rollout restart daemonset/vgpu-nodeagent >/dev/null
 kubectl -n "$AGENT_NS" rollout status daemonset/vgpu-nodeagent --timeout=180s \
     || die "node-agent daemonset did not become ready (kubectl -n $AGENT_NS describe ds/vgpu-nodeagent)"
 AGENT=$(kubectl -n "$AGENT_NS" get pods -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}')
