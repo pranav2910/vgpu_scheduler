@@ -106,5 +106,8 @@ attributes nothing — no false positives on kind.
 **Validation**: the full attribution + marking logic is unit-tested
 deterministically (synthetic `/proc` cgroups, fake pods/slices, stub provider).
 The two hardware-only reads — real `/proc/<pid>/cgroup` and NVML process
-listing — get their E2E proof on a real GPU node (an A10 run with live CUDA
-processes).
+listing — get their E2E proof on a real GPU node via
+`scripts/validate-runtime-3.4-a10.sh`: it grants a slice 2 GiB, runs a CUDA
+workload that allocates ~4 GiB, and asserts both 3.4a (node over-use) and 3.4b
+(the slice's `MemoryViolation` condition + metric + Event) fire against live
+NVML/cgroup data. Only the node agent + CRDs are needed (no scheduler/controller).
