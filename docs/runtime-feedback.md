@@ -130,3 +130,11 @@ Validation:
 - **3.6 advisory** — fires only when underprovisioned *and* confident; stays quiet
   when the request is adequate, confidence is `Low`, or no profile exists; clears
   when the request is raised; and never changes the job phase (non-blocking).
+- **Hardware (A10)** — `scripts/validate-runtime-3.5-a10.sh` runs the whole loop on
+  real NVML: it deploys the controller in **minimal mode**
+  (`VGPU_DISABLE_WEBHOOKS=true` → no cert-manager) and a workload that over-uses a
+  2 GiB grant, then asserts the slice carries real-NVML peak stats, the
+  `VGPUWorkloadProfile` recommends > requested at Medium/High confidence, and the
+  job's `Underprovisioned` advisory fires while the pod keeps **Running**. The
+  node agent's observation interval is configurable (`VGPU_OBSERVE_INTERVAL`) so
+  confidence ramps in minutes.

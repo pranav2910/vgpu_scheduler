@@ -1,0 +1,58 @@
+# Minimal controller deployment — reconcilers only, NO admission webhooks (so it
+# needs no cert-manager). Used by the runtime-feedback hardware E2E
+# (scripts/validate-runtime-3.5-a10.sh). NOT for production — the real deployment
+# (controller_deployment.yaml) runs the webhooks. Single replica; it still does
+# leader election and acquires the lease on its own.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgpu-controller
+  namespace: vgpu-system
+  labels:
+    control-plane: vgpu-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: vgpu-controller
+  template:
+    metadata:
+      labels:
+        control-plane: vgpu-controller
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: vgpu-controller-sa
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: manager
+          image: vgpu-controller:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VGPU_DISABLE_WEBHOOKS
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: healthz
+              containerPort: 8082
+              protocol: TCP
+          readinessProbe:
+            httpGet: { path: /readyz, port: healthz }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: healthz }
+            initialDelaySeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
