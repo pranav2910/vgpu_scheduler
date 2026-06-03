@@ -6,15 +6,17 @@ ever evicted on untrusted accounting:
 
 ```
 3.4a  detect node-level over-use            ✅ observe-only
-3.4b  attribute + mark the slice Violating  ✅ observe-and-mark only ← HERE
-3.4c  soft enforcement (warn / annotate)
+3.4b  attribute + mark the slice Violating  ✅ observe-and-mark only
+3.4c  soft enforcement (warn / annotate)    ✅ non-destructive      ← HERE
 3.4d  hard enforcement (evict / throttle)
 3.4e  MIG-backed hard partitioning
 ```
 
-Everything through 3.4b is **observe-and-mark only**: it makes over-use visible
-and auditable (metrics, Kubernetes Events, CRD status) but never touches a
-running workload. Enforcement (3.4c+) stays gated behind this being trusted.
+Everything through 3.4c is **non-destructive**: it makes over-use visible and
+auditable (metrics, Kubernetes Events, CRD status) and — in 3.4c — surfaces an
+enforcement *decision* on the offending workload's own pod, but never evicts,
+throttles, or changes a running workload. Workload-disrupting enforcement (3.4d+)
+stays gated behind all of this being trusted.
 
 ## 3.4a — node-level over-use detection (current)
 
@@ -111,3 +113,106 @@ listing — get their E2E proof on a real GPU node via
 workload that allocates ~4 GiB, and asserts both 3.4a (node over-use) and 3.4b
 (the slice's `MemoryViolation` condition + metric + Event) fire against live
 NVML/cgroup data. Only the node agent + CRDs are needed (no scheduler/controller).
+
+## 3.4c — soft enforcement (warn / annotate) (current)
+
+3.4b records over-use on *infrastructure* objects (the slice + job). 3.4c is the
+first stage that *acts* on a sustained violation — but deliberately stops short
+of touching the running workload. It reaches the **workload's own pod** and runs
+a grace-gated decision so the pod owner (not just the cluster operator) sees the
+problem and the consequence:
+
+```
+3.4b = infrastructure visibility   (kubectl describe vgpuslice)
+3.4c = workload-owner visibility   (kubectl describe pod)
+```
+
+`kubectl describe pod` now shows *"this pod is exceeding its GPU-memory grant,
+and this is when enforcement would happen under a future hard mode"* — without
+anything being evicted.
+
+### Enforcement mode (the policy gate)
+
+The node agent reads `VGPU_ENFORCEMENT_MODE`:
+
+| Mode | Behavior | Available |
+|---|---|---|
+| `off` | 3.4b marking only — no pod surfaces | yes |
+| `softwarn` | **3.4c ceiling** — stamp pod, record decision, warn, recover | yes (**default**) |
+| `evict` / `throttle` | parsed but **rejected** → falls back to `softwarn` | no (Phase 3.4d) |
+
+`softwarn` is the default precisely because it is non-destructive. The hard modes
+exist as a parsing seam only, so enabling real teeth (3.4d) is a deliberate code
+change, never a one-character config edit.
+
+### Escalation state machine
+
+Layered on 3.4b's hysteresis, with a wall-clock grace timer:
+
+| State | Meaning | Surfaces |
+|---|---|---|
+| `Clear` | within grant | none (cleared) |
+| `Observed` | 3.4b violating, **within** grace | 3.4b condition only |
+| `SoftWarned` | violating **past** grace | pod + slice + job + events + metrics |
+
+The grace anchor is the moment 3.4b flags the slice (`MemoryViolation=True`); the
+default `enforcementGracePeriod` is **60s**, so ~90s detect + 60s grace ≈ 150s to
+`SoftWarned`.
+
+### Surfaces
+
+| Object | What 3.4c writes |
+|---|---|
+| **Pod** (new) | label `…/memory-violation=true` (selector-friendly); annotations `…/enforcement=SoftWarn`, `…/memory-excess-bytes`, `…/violation-since`, `…/enforcement-deadline`, and an explicit `…/enforcement-note` |
+| **Slice** | `MemoryEnforcement` condition (`SoftWarnEngaged` ⇄ `WithinGrant`) — alongside 3.4b's `MemoryViolation` |
+| **Job** | summary `MemoryEnforcement` condition (reason `ChildSliceSoftWarn`) |
+| **Events** | engage → `Warning`/`MemoryEnforcementSoftWarn` on pod + slice; recover → `Normal`/`MemoryEnforcementCleared` |
+| **Metrics** | `vgpu_memory_enforcement_mode{node}`; `vgpu_memory_enforcement_active{node,namespace,slice}`; `vgpu_memory_enforcement_actions_total{node,namespace,slice,mode,action}` |
+
+> The `enforcement-deadline` is **informational** in softwarn mode — nothing is
+> evicted. It marks when a future hard mode (3.4d) *would* act. The
+> `enforcement-note` annotation states this verbatim so a deadline is never
+> mistaken for an impending kill.
+
+### Recovery is first-class
+
+When the slice returns within grant, 3.4c reverses **every** surface it added:
+the pod label/annotations are removed (the unrelated `claim-ref` annotation is
+left intact), the slice/job `MemoryEnforcement` conditions flip to `False`, a
+`Normal` event is emitted, and `vgpu_memory_enforcement_active` drops to 0. Exact
+cleanup is driven by remembering which pods were stamped — not by re-deriving
+them — so a workload that stopped using the GPU entirely is still un-stamped. A
+startup sweep also drops any stamp left behind by a previous agent lifetime, so a
+restart can never strand a label.
+
+### Tunables (`internal/nodeagent/enforcement.go`)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `enforcementGracePeriod` | 60s | how long over-use must persist *after* 3.4b flags it before soft enforcement engages |
+| `VGPU_ENFORCEMENT_MODE` | `softwarn` | enforcement ceiling (`off` \| `softwarn`) |
+
+### Explicitly NOT done in 3.4c
+
+No pod eviction, no eviction-API call, no cgroup/MPS throttle, no MIG, no
+scheduler feedback (the offender's future claims are *not* blocked), no
+`phase: Failed`. A `SoftWarned` slice is still `Ready`. The pod is mutated only on
+its labels/annotations — never its spec. The decision + deadline are the hook
+that 3.4d will act on.
+
+### Deployment
+
+`VGPU_ENFORCEMENT_MODE=softwarn` is set in `nodeagent_daemonset_nvml.yaml`. RBAC
+adds `pods: patch` (merge-patch of labels/annotations) on top of 3.4b's
+`pods: get,list`. The default (fake) build attributes no real processes, so it
+engages nothing on kind — no false positives.
+
+**Validation**: the state machine is unit-tested deterministically with an
+injected clock — within grace nothing is stamped; past grace the pod is
+labeled/annotated and the slice/job carry `MemoryEnforcement=True`; on recovery
+every surface (including the pod) is reversed while unrelated metadata survives;
+`off` mode stamps nothing. The hardware E2E in `scripts/validate-runtime-3.4-a10.sh`
+additionally asserts, against live NVML, that the over-using **pod** carries the
+violation label + enforcement annotations + deadline, the `MemoryEnforcement`
+condition is `True`, and — critically — the pod is **still `Running`** (soft =
+non-destructive).

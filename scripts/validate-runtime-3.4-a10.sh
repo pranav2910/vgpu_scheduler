@@ -5,6 +5,11 @@
 #   3.4a  the node flags GPU over-use beyond what was granted
 #   3.4b  the over-using workload is attributed to its VGPUSlice and marked
 #         (MemoryViolation condition + metric + Event)
+#   3.4c  soft enforcement engages past the grace period: the over-using POD is
+#         labeled/annotated (enforcement=SoftWarn + informational deadline), the
+#         slice/job carry a MemoryEnforcement condition, and the pod stays Running
+#         (non-destructive). Requires the daemonset's VGPU_ENFORCEMENT_MODE=softwarn
+#         (the default in nodeagent_daemonset_nvml.yaml).
 #
 # It does NOT need the scheduler/controller/webhook — the node-agent detectors
 # read slices, pods, and NVML directly. So the minimal stack is just:
@@ -105,15 +110,16 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
-# ── poll detection (node 3.4a + slice 3.4b) ──────────────────────────────────
-hdr "poll for detection (hysteresis ≈ 90s)"
-for i in $(seq 1 18); do
+# ── poll detection + soft enforcement (3.4a + 3.4b ≈ 90s, then +60s grace) ────
+hdr "poll for detection + soft enforcement (≈90s detect + 60s grace)"
+for i in $(seq 1 30); do
     M=$(scrape)
     nodeov=$(echo "$M" | grep '^vgpu_node_memory_overuse_bytes' | head -1 | awk '{print $2}')
     nodevi=$(echo "$M" | grep '^vgpu_node_memory_violation_active' | head -1 | awk '{print $2}')
     slicevi=$(echo "$M" | grep "vgpu_memory_violation_active{[^}]*slice=\"$SLICE\"" | head -1 | awk '{print $2}')
-    echo "  t=$((i*10))s  node_overuse=${nodeov:-0}  node_violation=${nodevi:-0}  slice_violation=${slicevi:-0}"
-    [[ "${nodevi:-0}" == "1" && "${slicevi:-0}" == "1" ]] && break
+    enf=$(echo "$M" | grep "vgpu_memory_enforcement_active{[^}]*slice=\"$SLICE\"" | head -1 | awk '{print $2}')
+    echo "  t=$((i*10))s  node_violation=${nodevi:-0}  slice_violation=${slicevi:-0}  soft_enforcement=${enf:-0}"
+    [[ "${nodevi:-0}" == "1" && "${slicevi:-0}" == "1" && "${enf:-0}" == "1" ]] && break
     sleep 10
 done
 
@@ -136,7 +142,28 @@ kubectl get events -n "$NS" --field-selector reason=MemoryViolation 2>/dev/null 
     && ok "Warning/MemoryViolation Event emitted on the slice" \
     || bad "no MemoryViolation Event for the slice"
 
+hdr "3.4c — soft enforcement (non-destructive)"
+M=$(scrape)
+[[ "$(echo "$M" | grep "vgpu_memory_enforcement_active{[^}]*slice=\"$SLICE\"" | head -1 | awk '{print $2}')" == "1" ]] \
+    && ok "soft enforcement engaged (vgpu_memory_enforcement_active=1)" \
+    || bad "soft enforcement did not engage — check VGPU_ENFORCEMENT_MODE=softwarn and the 60s grace"
+lbl=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.labels['infrastructure.pranav2910.com/memory-violation']}" 2>/dev/null)
+[[ "$lbl" == "true" ]] && ok "pod labeled memory-violation=true (kubectl get pods -l)" || bad "pod missing violation label (got '${lbl:-<none>}')"
+enfa=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.annotations['infrastructure.pranav2910.com/enforcement']}" 2>/dev/null)
+[[ "$enfa" == "SoftWarn" ]] && ok "pod annotated enforcement=SoftWarn" || bad "pod missing enforcement annotation (got '${enfa:-<none>}')"
+dl=$(kubectl get pod "$POD" -n "$NS" -o jsonpath="{.metadata.annotations['infrastructure.pranav2910.com/enforcement-deadline']}" 2>/dev/null)
+[[ -n "$dl" ]] && ok "pod carries informational enforcement-deadline ($dl)" || bad "pod missing enforcement-deadline annotation"
+scond=$(kubectl get vgpuslice "$SLICE" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="MemoryEnforcement")].status}' 2>/dev/null)
+[[ "$scond" == "True" ]] && ok "VGPUSlice MemoryEnforcement condition = True" || bad "slice MemoryEnforcement not True (got '${scond:-<none>}')"
+jcond2=$(kubectl get vgpujob "$JOB" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="MemoryEnforcement")].status}' 2>/dev/null)
+[[ "$jcond2" == "True" ]] && ok "parent VGPUJob mirrors MemoryEnforcement = True" || bad "job did not mirror enforcement (got '${jcond2:-<none>}')"
+pphase=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+[[ "$pphase" == "Running" ]] && ok "pod still Running — soft enforcement is non-destructive" || bad "pod phase '${pphase:-<none>}' — soft enforcement must NOT evict/kill"
+kubectl get events -n "$NS" --field-selector reason=MemoryEnforcementSoftWarn 2>/dev/null | grep -qE "$POD|$SLICE" \
+    && ok "Warning/MemoryEnforcementSoftWarn Event emitted" \
+    || bad "no MemoryEnforcementSoftWarn Event"
+
 hdr "summary"
 echo "  PASS=$PASS  FAIL=$FAIL"
-[[ $FAIL -eq 0 ]] && { echo; echo "${C_GRN}Phase 3.4a/3.4b validated on real hardware${C_RST}"; exit 0; }
+[[ $FAIL -eq 0 ]] && { echo; echo "${C_GRN}Phase 3.4a/3.4b/3.4c validated on real hardware${C_RST}"; exit 0; }
 echo; echo "${C_RED}validation had failures${C_RST}"; exit 1
