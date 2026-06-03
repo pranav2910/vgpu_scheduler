@@ -23,6 +23,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "patch"]
+  # Phase 3.4d: opt-in eviction uses the PDB-respecting Eviction API (a create on
+  # the pods/eviction subresource — never a raw pod delete). Namespace read backs
+  # the enforcement-exempt opt-out at the namespace level.
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

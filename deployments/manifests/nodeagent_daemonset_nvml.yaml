@@ -52,12 +52,17 @@ spec:
           value: "all"
         - name: NVIDIA_DRIVER_CAPABILITIES
           value: "utility"
-        # Phase 3.4c: runtime soft-enforcement mode. "softwarn" (default) labels +
-        # annotates pods that sustain GPU-memory over-use and records the decision
-        # on the slice/job — it NEVER evicts, throttles, or changes the pod phase,
-        # and reverses every surface on recovery. "off" disables enforcement (3.4b
-        # marking still happens). Hard modes (evict/throttle) are Phase 3.4d and
-        # are rejected by this build (fall back to softwarn).
+        # Runtime enforcement mode:
+        #   off      — 3.4b marking only (no pod surfaces)
+        #   softwarn — (default, 3.4c) label/annotate over-using pods + record the
+        #              decision on the slice/job; NEVER evicts/throttles/phase-fails,
+        #              and reverses every surface on recovery
+        #   evict    — (3.4d, opt-in) everything softwarn does, PLUS evicting a pod
+        #              that stays over-budget past the eviction deadline. Uses the
+        #              PDB-respecting Eviction API (never a raw delete), is rate-
+        #              limited per node, and skips pods/namespaces labeled
+        #              infrastructure.pranav2910.com/enforcement-exempt=true.
+        # Default is the non-destructive softwarn; set "evict" only deliberately.
         - name: VGPU_ENFORCEMENT_MODE
           value: "softwarn"
         # Optional: scheduler-assumed capacity for the drift gauge. Set to the
