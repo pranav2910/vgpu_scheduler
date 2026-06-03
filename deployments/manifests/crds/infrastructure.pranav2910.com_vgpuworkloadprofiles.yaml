@@ -2,14 +2,15 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: vgpuslices.infrastructure.pranav2910.com
+  name: vgpuworkloadprofiles.infrastructure.pranav2910.com
 spec:
   group: infrastructure.pranav2910.com
   names:
-    kind: VGPUSlice
-    listKind: VGPUSliceList
-    plural: vgpuslices
-    singular: vgpuslice
+    kind: VGPUWorkloadProfile
+    listKind: VGPUWorkloadProfileList
+    plural: vgpuworkloadprofiles
+    singular: vgpuworkloadprofile
+    shortNames: [vgpuprofile, vgpuprof]
   scope: Namespaced
   versions:
     - name: v1alpha1
@@ -18,61 +19,53 @@ spec:
       subresources:
         status: {}
       additionalPrinterColumns:
-        - name: Node
+        - name: Requested
+          type: integer
+          jsonPath: .status.requestedVramBytes
+        - name: Peak
+          type: integer
+          jsonPath: .status.peakObservedVramBytes
+        - name: Recommended
+          type: integer
+          jsonPath: .status.recommendedVramBytes
+        - name: Confidence
           type: string
-          jsonPath: .spec.nodeName
-        - name: Phase
-          type: string
-          jsonPath: .status.phase
-        - name: UUID
-          type: string
-          jsonPath: .status.deviceUuid
-        - name: Alloc
-          type: string
-          jsonPath: .status.allocationId
+          jsonPath: .status.confidence
+        - name: Evictions
+          type: integer
+          jsonPath: .status.evictionCount
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
       schema:
         openAPIV3Schema:
           type: object
+          description: Learned GPU-memory behavior of a workload (observe-only, Phase 3.5).
           properties:
             apiVersion: { type: string }
             kind:       { type: string }
             metadata:   { type: object }
             spec:
               type: object
-              required: [claimRef, requestedVramBytes]
               properties:
-                claimRef:
+                workloadRef:
                   type: string
-                  description: Name of the VGPUClaim this slice satisfies.
-                nodeName:
-                  type: string
-                  description: Populated by the scheduler once placement is decided.
-                requestedVramBytes:
-                  type: integer
-                  format: int64
-                  minimum: 1
+                  description: Name of the VGPUJob this profile aggregates.
             status:
               type: object
               properties:
-                phase:
-                  type: string
-                  default: Pending
-                deviceUuid:     { type: string }
-                allocationId:   { type: string }
-                allocatedBytes: { type: integer, format: int64 }
-                failureReason:  { type: string }
-                lastError:      { type: string }
-                # Phase 3.5 runtime feedback (written by the node agent, observe-only).
-                observedVramBytes:     { type: integer, format: int64 }
+                observations:          { type: integer, format: int64 }
+                requestedVramBytes:    { type: integer, format: int64 }
                 peakObservedVramBytes: { type: integer, format: int64 }
                 avgObservedVramBytes:  { type: integer, format: int64 }
-                observations:          { type: integer, format: int64 }
+                recommendedVramBytes:  { type: integer, format: int64 }
                 violationCount:        { type: integer, format: int64 }
                 softWarnCount:         { type: integer, format: int64 }
                 evictionCount:         { type: integer, format: int64 }
+                confidence:
+                  type: string
+                  enum: [Low, Medium, High]
+                lastUpdated: { type: string, format: date-time }
                 conditions:
                   type: array
                   items:

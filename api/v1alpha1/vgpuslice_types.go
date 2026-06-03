@@ -51,6 +51,32 @@ type VGPUSliceStatus struct {
 	// Conditions hold structured state transitions (e.g., IsolationVerified).
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// ── Phase 3.5 runtime feedback (written by the node agent, observe-only) ──
+	// Accumulated GPU-memory behavior for this slice. The controller aggregates
+	// these per workload into a VGPUWorkloadProfile. Never affects scheduling.
+
+	// ObservedVRAMBytes is the most recent attributed GPU memory use, in bytes.
+	// +optional
+	ObservedVRAMBytes int64 `json:"observedVramBytes,omitempty"`
+	// PeakObservedVRAMBytes is the maximum attributed GPU memory ever observed (monotonic).
+	// +optional
+	PeakObservedVRAMBytes int64 `json:"peakObservedVramBytes,omitempty"`
+	// AvgObservedVRAMBytes is a recency-weighted (EWMA) average of observed use.
+	// +optional
+	AvgObservedVRAMBytes int64 `json:"avgObservedVramBytes,omitempty"`
+	// Observations is the number of accumulated samples (cumulative).
+	// +optional
+	Observations int64 `json:"observations,omitempty"`
+	// ViolationCount counts sustained over-use onsets (3.4b), cumulative.
+	// +optional
+	ViolationCount int64 `json:"violationCount,omitempty"`
+	// SoftWarnCount counts soft-enforcement engagements (3.4c), cumulative.
+	// +optional
+	SoftWarnCount int64 `json:"softWarnCount,omitempty"`
+	// EvictionCount counts evictions (3.4d), cumulative.
+	// +optional
+	EvictionCount int64 `json:"evictionCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true
