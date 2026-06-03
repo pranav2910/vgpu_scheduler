@@ -309,6 +309,14 @@ var (
 		Help: "Confidence in a workload's recommendation: 0=Low, 1=Medium, 2=High.",
 	}, []string{"namespace", "workload"})
 
+	// Phase 3.6: soft feedback-aware scheduling. 1 while a workload's requested
+	// VRAM is below its profile's recommendation (at sufficient confidence). A
+	// warning only — the request is still admitted and scheduled.
+	WorkloadUnderprovisioned = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_workload_underprovisioned",
+		Help: "1 while a workload requests less VRAM than its profile recommends (advisory only, non-blocking).",
+	}, []string{"namespace", "workload"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -348,8 +356,9 @@ func init() {
 		// runtime soft enforcement (3.4c) + opt-in eviction (3.4d)
 		MemoryEnforcementMode, MemoryEnforcementActive, MemoryEnforcementActionsTotal,
 		MemoryEvictionsBlocked,
-		// runtime feedback / behavior profiles (3.5)
+		// runtime feedback / behavior profiles (3.5) + soft advisory (3.6)
 		WorkloadPeakObservedVRAMBytes, WorkloadRecommendedVRAMBytes, WorkloadProfileConfidence,
+		WorkloadUnderprovisioned,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

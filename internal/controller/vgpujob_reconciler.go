@@ -10,19 +10,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // VGPUJobReconciler manages the lifecycle of VGPUJob resources.
 // In Phase 2.1a it ensures each Job has a corresponding VGPUClaim materialized
 // from claimTemplate, and mirrors the claim's status into the Job's phase.
+// Phase 3.6 adds a non-blocking VRAM-rightsizing advisory driven by the job's
+// workload profile.
 type VGPUJobReconciler struct {
-	Client client.Client
-	Scheme *runtime.Scheme
+	Client   client.Client
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // SetupWithManager registers the reconciler with the controller manager.
@@ -30,6 +35,14 @@ func (r *VGPUJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vgpuv1alpha1.VGPUJob{}).
 		Owns(&vgpuv1alpha1.VGPUClaim{}).
+		// Phase 3.6: a profile update (new recommendation) re-evaluates the
+		// advisory for its workload. The profile is named 1:1 with the job.
+		Watches(
+			&vgpuv1alpha1.VGPUWorkloadProfile{},
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
+			}),
+		).
 		Complete(r)
 }
 
@@ -73,6 +86,11 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		if _, err := r.updatePhase(ctx, &job, desired, msg); err != nil {
 			return reconcile.Result{}, err
 		}
+	}
+
+	// 3. Phase 3.6: non-blocking VRAM-rightsizing advisory from the profile.
+	if err := r.reconcileAdvisory(ctx, &job); err != nil {
+		return reconcile.Result{}, err
 	}
 
 	return reconcile.Result{}, nil

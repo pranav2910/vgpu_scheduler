@@ -61,9 +61,11 @@ func main() {
 	}
 
 	// Layer 2 Phase 2.1a: VGPUJobReconciler manages workload-intent jobs.
+	// Phase 3.6: also emits the non-blocking VRAM-rightsizing advisory.
 	if err := (&controller.VGPUJobReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("vgpu-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Fatalf("setting up VGPUJobReconciler: %v", err)
 	}
