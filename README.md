@@ -45,8 +45,9 @@ surfaces under combined load.
 ### Runtime VRAM accounting — hardware-validated (NVIDIA A10)
 
 The runtime over-use chain is validated end-to-end against **real NVML + Linux
-cgroups** on an A10 (`scripts/a10-bootstrap.sh` + `scripts/validate-runtime-3.4-a10.sh`,
-`13/13 green`), not just mocks:
+cgroups + the Kubernetes Eviction API** on an A10 (`scripts/a10-bootstrap.sh` +
+`scripts/validate-runtime-3.4-a10.sh` `13/13` and `scripts/validate-runtime-3.4d-a10.sh`
+`5/5`), not just mocks:
 
 - **Hardware truth** — per-GPU VRAM read via NVML v2 accounting (process-used vs
   driver-reserved separated), matching `nvidia-smi`
@@ -54,13 +55,17 @@ cgroups** on an A10 (`scripts/a10-bootstrap.sh` + `scripts/validate-runtime-3.4-
   its bound slices (hysteresis; no flapping)
 - **Per-slice attribution** — the over-using workload is traced to the exact
   `VGPUSlice` (GPU PID → `/proc` cgroup → claim-ref → slice) using host-PID NVML
-- **Soft enforcement (non-destructive)** — the offending **pod** is labeled +
-  annotated with the violation and an informational enforcement deadline, the
+- **Soft enforcement (non-destructive, default)** — the offending **pod** is
+  labeled + annotated with the violation and an enforcement deadline, the
   slice/job carry a `MemoryEnforcement` condition, events fire — and the pod
-  keeps **running**. Mode is gated (`off | softwarn`, default `softwarn`);
-  nothing is evicted, throttled, or phase-failed.
+  keeps **running**. Nothing is evicted, throttled, or phase-failed.
+- **Opt-in eviction** — set `VGPU_ENFORCEMENT_MODE=evict` and a pod that stays
+  over-budget past the deadline is evicted via the **PDB-respecting Eviction API**
+  (rate-limited per node; never a raw delete). Pods/namespaces labeled
+  `…/enforcement-exempt=true` are spared — proven on hardware: victim evicted,
+  exempt pod left Running.
 
-The A10 run also surfaced a real cached-vs-direct client bug in pod stamping that
+The A10 runs also surfaced a real cached-vs-direct client bug in pod stamping that
 unit tests structurally couldn't — caught and fixed on hardware.
 
 ## Quick start (kind)
@@ -97,10 +102,9 @@ See [docs/metrics.md](docs/metrics.md).
 Done and validated: single-slice lifecycle · gang scheduling (atomic,
 live under contention) · preemption · quota (gang-atomic) · soft topology ·
 observability · HA failover · GPU hardware-truth **observation** · runtime
-over-use **detection → attribution → soft enforcement** (3.4a/b/c,
-hardware-validated on an A10, non-destructive).
+over-use **detection → attribution → soft enforcement → opt-in eviction**
+(3.4a–d, hardware-validated on an A10; default stays non-destructive `softwarn`).
 
-Next frontier (in progress): 3.4d **opt-in pod eviction** for sustained GPU
-memory over-use — policy-driven, PDB-respecting, rate-limited, exemptable;
-default stays `softwarn`. True per-process VRAM partitioning (MIG, 3.4e),
-federation, and a managed SaaS layer are deferred.
+Next frontier: 3.4e **MIG-backed hard partitioning** — true per-process VRAM
+caps, where a workload *cannot* exceed its slice (eviction reclaims after the
+fact; MIG prevents). Federation and a managed SaaS layer are deferred.
