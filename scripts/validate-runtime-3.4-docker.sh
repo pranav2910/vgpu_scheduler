@@ -44,7 +44,9 @@ done
 sleep 3
 
 echo; echo "── ${C_GRN}OUR NVML PROVIDER${C_RST} — GPU processes (3.4b attribution input) ──"
-$DOCKER run --rm --gpus all vgpu-gpu-probe:nvml
+# --pid=host is REQUIRED so NVML can enumerate processes from OTHER containers'
+# PID namespaces — the same reason the 3.4b node-agent daemonset sets hostPID.
+$DOCKER run --rm --gpus all --pid=host vgpu-gpu-probe:nvml
 
 echo; echo "── ${C_GRN}nvidia-smi${C_RST} ground truth ──"
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv

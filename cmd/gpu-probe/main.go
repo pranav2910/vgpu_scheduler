@@ -76,7 +76,8 @@ func main() {
 	if perr != nil {
 		fmt.Printf("  ListProcesses error: %v\n", perr)
 	} else if len(procs) == 0 {
-		fmt.Println("  (none — start a GPU workload, then re-run; compare to: nvidia-smi)")
+		fmt.Println("  (none — start a GPU workload; and in a container, run with --pid=host so")
+		fmt.Println("   NVML can see other namespaces' processes, as the node agent does via hostPID)")
 	} else {
 		for _, p := range procs {
 			fmt.Printf("  pid=%-8d device=%s  used=%5d MiB\n", p.PID, p.DeviceUUID, p.UsedMemoryBytes/miB)
