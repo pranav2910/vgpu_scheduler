@@ -72,11 +72,43 @@ climbing. Per-workload gauges are also exported:
 `vgpu_workload_recommended_vram_bytes`, `vgpu_workload_peak_observed_vram_bytes`,
 `vgpu_workload_profile_confidence{0=Low,1=Medium,2=High}`.
 
-## Explicitly NOT done in 3.5 (→ 3.6)
+## Explicitly NOT done in 3.5
 
-No effect on scheduling, admission, quota, or enforcement. The scheduler/webhook
-reading `recommendedVramBytes` to auto-right-size or flag risky requests is Phase
-3.6, gated behind these profiles being trusted.
+3.5 itself has no effect on scheduling, admission, quota, or enforcement — it only
+produces the recommendation. *Consuming* that recommendation is 3.6 (below).
+
+## 3.6 — soft feedback-aware scheduling (current)
+
+The first consumer of the profile, and deliberately the gentlest: a **non-blocking
+advisory**. When a `VGPUJob`'s requested VRAM is below its profile's
+recommendation — *at sufficient confidence* — the controller warns, but the job
+is still admitted and scheduled exactly as before.
+
+On each job reconcile (and whenever the profile's recommendation changes — the
+job reconciler watches profiles), it compares
+`job.spec.claimTemplate.spec.requestedVramBytes` against
+`profile.status.recommendedVramBytes`, and if the request is lower **and**
+confidence is `Medium`/`High` (never warn on a thin `Low` profile), it surfaces:
+
+| Surface | What |
+|---|---|
+| Condition | `Underprovisioned=True` on the job (reason `RequestBelowRecommendation`, message naming requested vs recommended + confidence) |
+| Annotation | `infrastructure.pranav2910.com/recommended-vram-bytes` on the job (machine-readable) |
+| Event | `Warning`/`UnderprovisionedRequest` on the job (on the False→True transition) |
+| Metric | `vgpu_workload_underprovisioned{namespace,workload}` = 1 |
+
+Raising the request (or losing confidence) clears every surface. It **never**
+blocks admission, mutates the request, changes the job phase, or touches quota/
+enforcement. Hard actions — *blocking* a request below recommendation, or auto-
+adjusting it — are explicitly deferred (3.7+), gated behind this advisory being
+trusted. Same observe-first discipline, one more rung up.
+
+The flow end-to-end:
+
+```
+run workload → NVML sees real peak → slice stats → profile recommends →
+  re-submit with a too-low request → Underprovisioned warning (still admitted)
+```
 
 ## Deployment & validation
 
@@ -95,3 +127,6 @@ Validation:
   observation never lowers the recommendation).
 - **Node agent** — observed stats flushed to the slice status on peak growth, and
   violation onsets counted after a flush.
+- **3.6 advisory** — fires only when underprovisioned *and* confident; stays quiet
+  when the request is adequate, confidence is `Low`, or no profile exists; clears
+  when the request is raised; and never changes the job phase (non-blocking).

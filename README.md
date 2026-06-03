@@ -96,7 +96,7 @@ See [docs/metrics.md](docs/metrics.md).
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics reference + sample scrape config
 - [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md) — NVML observation scaffolding + g5 validation runbook
 - [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement → opt-in eviction (3.4a–d), tunables, A10 E2E
-- [docs/runtime-feedback.md](docs/runtime-feedback.md) — GPU behavior profiles: learn peak usage → recommend right-sized grants (3.5, observe-only)
+- [docs/runtime-feedback.md](docs/runtime-feedback.md) — GPU behavior profiles: learn peak usage → recommend right-sized grants (3.5) → non-blocking under-provisioning advisory (3.6)
 
 ## Status & roadmap
 
@@ -106,8 +106,10 @@ observability · HA failover · GPU hardware-truth **observation** · runtime
 over-use **detection → attribution → soft enforcement → opt-in eviction**
 (3.4a–d, hardware-validated on an A10; default non-destructive `softwarn`) ·
 **runtime feedback engine** — per-workload GPU behavior profiles that learn peak
-usage and recommend right-sized grants (3.5, observe-only, unit-validated).
+usage and recommend right-sized grants (3.5) · **soft feedback-aware scheduling**
+— a non-blocking advisory when a request is below its profile's recommendation
+(3.6). 3.5/3.6 are observe-and-recommend only, unit-validated.
 
-Next frontier: 3.6 **feedback-aware scheduling** — the scheduler acts on profile
-recommendations (right-size grants, flag risky requests). MIG-backed hard
-partitioning (3.4e), federation, and a managed SaaS layer are deferred.
+Next frontier: 3.7 **enforcing the recommendation** (block / auto-right-size
+under-provisioned requests). MIG-backed hard partitioning (3.4e), federation, and
+a managed SaaS layer are deferred.
