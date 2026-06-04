@@ -16,7 +16,10 @@ import (
 //	go build -tags nvml ./cmd/nodeagent   # real-hardware build (g5)
 
 // RealBuild reports whether this binary was compiled against real NVML.
-// nvml build → true (real provider + real allocator).
+// nvml build → true. NOTE: this makes the *observation* path real (discovery,
+// memory accounting, process listing, drift/over-use detection). It does NOT yet
+// make allocation real — internal/nodeagent/nvml/allocator.go still returns a
+// synthetic handle on every build (no MIG/MPS partition, no CDI device nodes).
 const RealBuild = true
 
 type nvmlProvider struct{}
