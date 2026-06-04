@@ -49,13 +49,19 @@ adversarial). The Wave 3 adversarial suite found and closed a real
 gang-vs-quota composition bug — the kind of cross-subsystem defect that only
 surfaces under combined load.
 
-### Runtime VRAM accounting — hardware-validated (NVIDIA A10)
+### Runtime + data plane — hardware-validated (NVIDIA A10 and H100)
 
-The runtime chain is validated end-to-end against **real NVML + Linux cgroups +
-the Kubernetes Eviction API** on an A10 (`scripts/a10-bootstrap.sh` +
-`validate-runtime-3.4-a10.sh` `13/13`, `validate-runtime-3.4d-a10.sh` `5/5`,
-`validate-runtime-3.5-a10.sh` `8/8`), not just mocks:
+The full chain is validated end-to-end against **real NVML + Linux cgroups +
+containerd CDI + the Kubernetes Eviction API** on actual GPUs (`scripts/a10-bootstrap.sh`
++ `validate-alloc-a10.sh` `11/11`, `validate-runtime-3.4-a10.sh` `13/13`,
+`validate-runtime-3.4d-a10.sh` `5/5`, `validate-runtime-3.5-a10.sh` `8/8` — the
+3.4/3.5/alloc suites all green on a 1× H100), not just mocks:
 
+- **Data plane (allocate → CDI → inject)** — a slice is bound to a real GPU UUID
+  via NVML, the node agent writes a CDI spec, and a pod referencing it gets the
+  GPU: `nvidia-smi` works *inside the pod* and its GPU UUID matches the slice's
+  `deviceUuid`. Proven on an H100 (`validate-alloc-a10.sh` 11/11) — a workload
+  actually runs on a shared GPU.
 - **Hardware truth** — per-GPU VRAM read via NVML v2 accounting (process-used vs
   driver-reserved separated), matching `nvidia-smi`
 - **Over-use detection** — a node flags GPU memory use beyond the VRAM granted to
@@ -120,15 +126,18 @@ Done and validated: single-slice lifecycle · gang scheduling (atomic,
 live under contention) · preemption · quota (gang-atomic) · soft topology ·
 observability · HA failover · GPU hardware-truth **observation** · runtime
 over-use **detection → attribution → soft enforcement → opt-in eviction**
-(3.4a–d, hardware-validated on an A10; default non-destructive `softwarn`) ·
-**runtime feedback engine** — per-workload GPU behavior profiles that learn peak
-usage and recommend right-sized grants (3.5) · **soft feedback-aware scheduling**
-— a non-blocking advisory when a request is below its profile's recommendation
-(3.6). 3.5/3.6 are observe-and-recommend only, hardware-validated on an A10.
+(3.4a–d) · **runtime feedback engine** that learns peak usage and recommends
+right-sized grants (3.5) · **soft feedback-aware scheduling** (3.6) · and the
+**data plane** — a slice bound to a real GPU UUID, a CDI spec, and a pod that
+actually receives the GPU. All hardware-validated on an A10 **and a 1× H100**;
+defaults stay non-destructive (`softwarn`, recommend-only).
 
-Next frontier: 3.7 **enforcing the recommendation** (block / auto-right-size
-under-provisioned requests). MIG-backed hard partitioning (3.4e), federation, and
-a managed SaaS layer are deferred.
+Next frontier: wire the **full submit→run path** end to end (the mutating webhook
+auto-injecting the CDI device, validated `validate-alloc`-style but through the
+admission path); then 3.7 **enforcing the recommendation** (block / auto-right-size).
+True per-process VRAM isolation today is soft (record + evict); **MIG-backed hard
+partitioning** (3.4e), multi-GPU-per-node, federation, and a managed SaaS layer
+are deferred.
 
 ## License
 
