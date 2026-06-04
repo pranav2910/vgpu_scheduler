@@ -29,17 +29,20 @@ say() { echo; echo "── $* ──"; }
 ok()  { echo "  ${C_GRN}✓${C_RST} $*"; }
 die() { echo "  ${C_RED}✗ $*${C_RST}" >&2; exit 1; }
 
-command -v kubectl >/dev/null 2>&1 || die "kubectl not found"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found — this targets a real GPU node"
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo docker"
 
-# ── 0. base: the NVML node agent (idempotent; runs the base bootstrap if absent) ─
-if ! kubectl -n "$NS" get daemonset vgpu-nodeagent >/dev/null 2>&1; then
+# ── 0. base: the NVML node agent. On a FRESH box (no k3s/kubectl yet) OR if the
+#         node agent is absent, run the base bootstrap first — it installs k3s
+#         (which provides kubectl) + the NVML node agent. GPU-agnostic.
+if ! command -v kubectl >/dev/null 2>&1 || ! kubectl -n "$NS" get daemonset vgpu-nodeagent >/dev/null 2>&1; then
     say "base stack not found — running scripts/a10-bootstrap.sh (k3s + NVML node agent; GPU-agnostic)"
     bash scripts/a10-bootstrap.sh || die "base bootstrap failed"
+    hash -r 2>/dev/null || true   # refresh PATH so the just-installed kubectl is found
 fi
+command -v kubectl >/dev/null 2>&1 || die "kubectl not found even after the base bootstrap"
 NODE=$(kubectl -n "$NS" get pods -l app=vgpu-nodeagent -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
-[[ -z "$NODE" ]] && die "no node agent pod — run scripts/a10-bootstrap.sh first"
+[[ -z "$NODE" ]] && die "no node agent pod — the base bootstrap may have failed"
 ok "node agent on $NODE"
 
 # ── 1. advertise the node's vGPU capacity (the scheduler schedules against this) ─
