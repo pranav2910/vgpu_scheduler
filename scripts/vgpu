@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# vgpu — a thin, zero-dependency CLI for the infrastructure.pranav2910.com vGPU
+# scheduler. It wraps kubectl so an ML engineer never has to hand-author a
+# VGPUJob, a claim-ref pod, or remember the CRD field names.
+#
+#   vgpu submit --name llama --vram 16Gi --image pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+#   vgpu status  llama
+#   vgpu profile llama
+#
+# Install: cp to scripts/vgpu, chmod +x. Requires kubectl on PATH with a working
+# context. (jq is not required — all reads use kubectl jsonpath.)
+set -euo pipefail
+
+GROUP="infrastructure.pranav2910.com"
+APIVERSION="${GROUP}/v1alpha1"
+CLAIM_ANNOTATION="${GROUP}/claim-ref"
+RECOMMENDED_ANNOTATION="${GROUP}/recommended-vram-bytes"
+CLAIM_LABEL="vgpu-claim"
+NS_DEFAULT="default"
+
+die()  { printf 'vgpu: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have kubectl || die "kubectl not found on PATH"
+
+# ── byte parsing: "16Gi" / "512Mi" / "8G" / "1073741824" -> integer bytes ─────
+# Ki/Mi/Gi/Ti are 1024-based, K/M/G/T are 1000-based (Kubernetes quantity rules),
+# case-insensitive. A plain integer passes through unchanged.
+to_bytes() {
+    local q="$1" num unit
+    [[ "$q" =~ ^([0-9]+)([KkMmGgTt]i?|[Bb])?$ ]] \
+        || die "invalid VRAM quantity '$q' (use e.g. 16Gi, 512Mi, 8G, or a raw byte count)"
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        ""|B|b)        echo  "$num" ;;
+        Ki|ki)         echo "$(( num * 1024 ))" ;;
+        Mi|mi)         echo "$(( num * 1024 * 1024 ))" ;;
+        Gi|gi)         echo "$(( num * 1024 * 1024 * 1024 ))" ;;
+        Ti|ti)         echo "$(( num * 1024 * 1024 * 1024 * 1024 ))" ;;
+        K|k)           echo "$(( num * 1000 ))" ;;
+        M|m)           echo "$(( num * 1000000 ))" ;;
+        G|g)           echo "$(( num * 1000000000 ))" ;;
+        T|t)           echo "$(( num * 1000000000000 ))" ;;
+        *)             die "invalid VRAM unit in '$q'" ;;
+    esac
+}
+
+# Human-readable bytes for display (GiB to 1 decimal, MiB whole, else raw).
+human() {
+    local b="${1:-0}"
+    [[ "$b" =~ ^[0-9]+$ ]] || { echo "$b"; return; }
+    if (( b >= 1073741824 )); then
+        awk -v b="$b" 'BEGIN{ printf "%.1f GiB", b/1073741824 }'
+    elif (( b >= 1048576 )); then
+        awk -v b="$b" 'BEGIN{ printf "%.0f MiB", b/1048576 }'
+    else
+        echo "${b} B"
+    fi
+}
+
+# kubectl get <type> <name> -n <ns> -o jsonpath=<path>; empty string if absent.
+kget() {
+    local type="$1" name="$2" ns="$3" path="$4"
+    kubectl get "$type" "$name" -n "$ns" -o jsonpath="$path" 2>/dev/null || true
+}
+
+usage() {
+    cat <<EOF
+vgpu — submit and observe GPU workloads on the vGPU scheduler
+
+USAGE:
+  vgpu submit --name NAME --vram SIZE --image IMAGE [options]
+  vgpu status  NAME [-n NAMESPACE]
+  vgpu profile NAME [-n NAMESPACE]
+
+SUBMIT OPTIONS:
+  --name NAME          workload name (required; becomes the VGPUJob name)
+  --vram SIZE          VRAM request, e.g. 16Gi / 512Mi / 8G (required)
+  --image IMAGE        container image to run (required)
+  --priority N         scheduling priority 0-1000 (default 50)
+  --class CLASS        Training|Inference|Batch|Interactive (default Training)
+  --tier TIER          Guaranteed|BestEffort (default Guaranteed)
+  -n, --namespace NS   target namespace (default ${NS_DEFAULT})
+  --command 'CMD'      override container command (shell string)
+  --node NODE          pin the pod to a node (demo/no-scheduler setups)
+  --wait SECONDS       how long to wait for slice allocation (default 120)
+  --no-wait            skip the wait (only safe once the slice is allocated)
+  --dry-run            print the manifests, do not apply
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# submit: a VGPUJob ALONE schedules a slice but nothing ever runs on it. So we
+# also create the workload Pod (carrying the claim-ref annotation+label) that the
+# mutating webhook injects the GPU into. The webhook (failurePolicy=Fail) rejects
+# that pod until the slice has an allocationId, so submit is a 3-step sequence:
+# apply Job -> wait for slice allocation -> apply Pod.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_submit() {
+    local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
+    local ns="$NS_DEFAULT" command_override="" node="" dry_run=0 wait_secs=120
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)            name="$2"; shift 2 ;;
+            --vram)            vram="$2"; shift 2 ;;
+            --image)           image="$2"; shift 2 ;;
+            --priority)        priority="$2"; shift 2 ;;
+            --class)           class="$2"; shift 2 ;;
+            --tier)            tier="$2"; shift 2 ;;
+            -n|--namespace)    ns="$2"; shift 2 ;;
+            --command)         command_override="$2"; shift 2 ;;
+            --node)            node="$2"; shift 2 ;;
+            --wait)            wait_secs="$2"; shift 2 ;;
+            --no-wait)         wait_secs=0; shift ;;
+            --dry-run)         dry_run=1; shift ;;
+            -h|--help)         usage; exit 0 ;;
+            *)                 die "unknown submit flag: $1" ;;
+        esac
+    done
+    [[ -n "$name"  ]] || die "submit requires --name"
+    [[ -n "$vram"  ]] || die "submit requires --vram"
+    [[ -n "$image" ]] || die "submit requires --image"
+
+    local bytes; bytes="$(to_bytes "$vram")"
+    (( bytes >= 1 && bytes <= 85899345920 )) \
+        || die "VRAM $vram ($bytes bytes) out of range (1 .. 85899345920 / 80Gi)"
+
+    # Deterministic names mirror the controller exactly:
+    #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice
+    local claim="${name}-claim"
+
+    # Optional container command block (YAML), only emitted when overridden.
+    local cmd_block=""
+    if [[ -n "$command_override" ]]; then
+        cmd_block=$(printf '    command: ["/bin/sh","-c"]\n    args: [%s]\n' "$(printf '%q' "$command_override")")
+    fi
+    # Optional nodeName (demo/no-scheduler clusters where slices need a hand-set node).
+    local node_block=""
+    [[ -n "$node" ]] && node_block="  nodeName: ${node}"$'\n'
+
+    local job_manifest pod_manifest
+    job_manifest=$(cat <<EOF
+apiVersion: ${APIVERSION}
+kind: VGPUJob
+metadata:
+  name: ${name}
+  namespace: ${ns}
+spec:
+  priority: ${priority}
+  workloadClass: ${class}
+  claimTemplate:
+    spec:
+      requestedVramBytes: ${bytes}
+      serviceTier: ${tier}
+EOF
+)
+    pod_manifest=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${name}-workload
+  namespace: ${ns}
+  labels:
+    ${CLAIM_LABEL}: ${claim}
+  annotations:
+    ${CLAIM_ANNOTATION}: ${claim}
+spec:
+${node_block}  restartPolicy: Never
+  containers:
+  - name: workload
+    image: ${image}
+${cmd_block}    resources: {}
+EOF
+)
+
+    if (( dry_run )); then
+        printf '%s\n---\n%s\n' "$job_manifest" "$pod_manifest"
+        return 0
+    fi
+
+    # 1) Apply the Job. The controller materializes VGPUClaim/${claim}; the
+    #    scheduler then creates + binds VGPUSlice/${claim}-slice.
+    printf '%s\n' "$job_manifest" | kubectl apply -f - >/dev/null \
+        || die "applying VGPUJob failed"
+    printf 'submitted: %s  (%s VRAM, class=%s, tier=%s, ns=%s)\n' \
+        "$name" "$(human "$bytes")" "$class" "$tier" "$ns"
+    printf '  VGPUJob/%s  ->  VGPUClaim/%s  ->  VGPUSlice/%s-slice\n' "$name" "$claim" "$claim"
+
+    # 2) The mutating webhook (failurePolicy=Fail) REJECTS the workload pod until
+    #    its slice carries an allocationId. So we must wait for allocation before
+    #    creating the pod — applying both at once races the scheduler and fails.
+    local slice="${claim}-slice"
+    if (( wait_secs > 0 )); then
+        printf '  waiting up to %ss for the slice to be allocated...\n' "$wait_secs"
+        local waited=0 alloc=""
+        while (( waited < wait_secs )); do
+            alloc="$(kget vgpuslice "$slice" "$ns" '{.status.allocationId}')"
+            [[ -n "$alloc" ]] && break
+            sleep 3; waited=$((waited+3))
+        done
+        if [[ -z "$alloc" ]]; then
+            local sp; sp="$(kget vgpuslice "$slice" "$ns" '{.status.phase}')"
+            printf '  slice not allocated yet (phase=%s) after %ss.\n' "${sp:-<none>}" "$wait_secs" >&2
+            printf '  the Pod was NOT created (the webhook would reject it). Re-run once allocated,\n' >&2
+            printf '  or inspect:  vgpu status %s\n' "$name" >&2
+            exit 1
+        fi
+        printf '  slice allocated (alloc=%s) — creating the workload pod\n' "$alloc"
+    fi
+
+    # 3) Apply the workload Pod. The webhook now resolves the slice and injects
+    #    the CDI device so the container actually gets the GPU partition.
+    printf '%s\n' "$pod_manifest" | kubectl apply -f - >/dev/null \
+        || die "applying workload Pod failed (is the slice allocated? try: vgpu status $name)"
+    printf '  Pod/%s-workload created (GPU injected by the webhook)\n' "$name"
+    printf '  next:  vgpu status %s\n' "$name"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# status: one line per layer of the stack — Job -> Claim -> Slice -> Pod — so an
+# engineer can see exactly where a workload is in the pipeline and on which node.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+    local name="" ns="$NS_DEFAULT"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace) ns="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            -*)             die "unknown status flag: $1" ;;
+            *)              name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "status requires a NAME"
+
+    local claim slice pod
+    claim="${name}-claim"; slice="${claim}-slice"; pod="${name}-workload"
+
+    kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1 \
+        || die "no VGPUJob '$name' in namespace '$ns' (did you 'vgpu submit'?)"
+
+    local job_phase claim_phase bound slice_phase node alloc pod_phase req
+    job_phase="$(kget vgpujob   "$name"  "$ns" '{.status.phase}')"
+    req="$(kget vgpujob "$name" "$ns" '{.spec.claimTemplate.spec.requestedVramBytes}')"
+    claim_phase="$(kget vgpuclaim "$claim" "$ns" '{.status.phase}')"
+    bound="$(kget vgpuclaim "$claim" "$ns" '{.status.boundSliceName}')"
+    slice_phase="$(kget vgpuslice "$slice" "$ns" '{.status.phase}')"
+    node="$(kget vgpuslice "$slice" "$ns" '{.spec.nodeName}')"
+    alloc="$(kget vgpuslice "$slice" "$ns" '{.status.allocationId}')"
+    pod_phase="$(kget pod "$pod" "$ns" '{.status.phase}')"
+
+    printf 'workload %s  (ns=%s, requested %s)\n' "$name" "$ns" "$(human "${req:-0}")"
+    printf '  Job    %-12s %s\n' "${job_phase:-<none>}"   "VGPUJob/$name"
+    printf '  Claim  %-12s %s%s\n' "${claim_phase:-<none>}" "VGPUClaim/$claim" \
+        "$( [[ -n "$bound" ]] && printf '  bound=%s' "$bound" )"
+    printf '  Slice  %-12s %s%s%s\n' "${slice_phase:-<none>}" "VGPUSlice/$slice" \
+        "$( [[ -n "$node"  ]] && printf '  node=%s'  "$node" )" \
+        "$( [[ -n "$alloc" ]] && printf '  alloc=%s' "$alloc" )"
+    printf '  Pod    %-12s Pod/%s\n' "${pod_phase:-<none>}" "$pod"
+
+    # Surface the learned advisory inline if the feedback loop has flagged it.
+    local adv
+    adv="$(kget vgpujob "$name" "$ns" \
+        '{.status.conditions[?(@.type=="Underprovisioned")].status}')"
+    if [[ "$adv" == "True" ]]; then
+        local rec
+        rec="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${RECOMMENDED_ANNOTATION//./\\.}}")"
+        printf '  ! underprovisioned — recommended %s  (run: vgpu profile %s)\n' \
+            "$(human "${rec:-0}")" "$name"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# profile: the learned GPU-memory behavior — recommended vs requested, peak,
+# confidence, and the under-provisioning verdict. The product's edge:
+# "you asked for X, you actually need Y." Reads the VGPUWorkloadProfile named
+# after the job.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_profile() {
+    local name="" ns="$NS_DEFAULT"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace) ns="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            -*)             die "unknown profile flag: $1" ;;
+            *)              name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "profile requires a NAME"
+
+    kubectl get vgpuworkloadprofile "$name" -n "$ns" >/dev/null 2>&1 || die \
+        "no profile for '$name' yet — profiles appear once the node agent has
+       observed the running workload (a minute or two after it starts).
+       Check it is running:  vgpu status $name"
+
+    local requested peak recommended avg conf obs evictions adv
+    requested="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.requestedVramBytes}')"
+    peak="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.peakObservedVramBytes}')"
+    recommended="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.recommendedVramBytes}')"
+    avg="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.avgObservedVramBytes}')"
+    conf="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.confidence}')"
+    obs="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.observations}')"
+    evictions="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.evictionCount}')"
+    adv="$(kget vgpuworkloadprofile "$name" "$ns" \
+        '{.status.conditions[?(@.type=="Underprovisioned")].status}')"
+
+    printf 'profile %s  (ns=%s)\n' "$name" "$ns"
+    printf '  requested    %s\n'              "$(human "${requested:-0}")"
+    printf '  peak observed%s\n'              "  $(human "${peak:-0}")"
+    printf '  avg observed %s\n'              "  $(human "${avg:-0}")"
+    printf '  recommended  %s   <- request this next time\n' "$(human "${recommended:-0}")"
+    printf '  confidence   %s  (%s observations)\n' "${conf:-<none>}" "${obs:-0}"
+    [[ "${evictions:-0}" != "0" ]] && printf '  evictions    %s\n' "$evictions"
+
+    if [[ "$adv" == "True" ]]; then
+        local msg
+        msg="$(kget vgpuworkloadprofile "$name" "$ns" \
+            '{.status.conditions[?(@.type=="Underprovisioned")].message}')"
+        printf '  VERDICT      UNDERPROVISIONED — %s\n' "${msg:-request is below the observed peak}"
+    elif [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
+        printf '  VERDICT      OK — request covers the observed peak (with headroom)\n'
+    fi
+}
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+sub="$1"; shift
+case "$sub" in
+    submit)        cmd_submit  "$@" ;;
+    status)        cmd_status  "$@" ;;
+    profile)       cmd_profile "$@" ;;
+    -h|--help|help) usage ;;
+    *)             die "unknown command '$sub' (try: submit, status, profile)" ;;
+esac

@@ -1,0 +1,24 @@
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: bert-finetune
+  namespace: vgpu-demo
+  labels:
+    app: bert-finetune
+    demo: single-workload
+spec:
+  # Higher = scheduled first when capacity is contended (0-1000, default 50).
+  priority: 100
+  # Training | Inference | Batch | Interactive. Drives class-aware scoring only;
+  # it never changes the VRAM math.
+  workloadClass: Training
+  # Reserved for preemption (Phase 2.3+). Leave false for a normal training run.
+  preemptible: false
+  # The actual GPU demand. This is the field that matters.
+  claimTemplate:
+    spec:
+      # 16 GiB. Bytes, not Gi — this is a raw int64 (16 * 1024^3).
+      requestedVramBytes: 17179869184
+      # Guaranteed = hard, isolated grant. BestEffort = may be packed tighter.
+      serviceTier: Guaranteed
+

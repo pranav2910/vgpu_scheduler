@@ -1,0 +1,71 @@
+# BEFORE: vanilla K8s, whole-GPU granularity. 4 pods, 1 GPU node => 3 Pending.
+# Each asks for an ENTIRE nvidia.com/gpu, the smallest unit the stock
+# device plugin can hand out. This is the baseline we're about to beat.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-gpu-0
+  namespace: vgpu-demo
+  labels: { demo: before, group: plain-gpu }
+spec:
+  restartPolicy: Never
+  # If you have >1 node, pin all four to the single GPU box so the contention
+  # is real. Replace with your node's label (e.g. nvidia.com/gpu.present: "true").
+  # nodeSelector:
+  #   kubernetes.io/hostname: <your-gpu-node>
+  containers:
+    - name: trainer
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'pretend training on a whole GPU'; sleep 3600"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1     # <-- whole GPU. The crux of the BEFORE pain.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-gpu-1
+  namespace: vgpu-demo
+  labels: { demo: before, group: plain-gpu }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'pretend training on a whole GPU'; sleep 3600"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-gpu-2
+  namespace: vgpu-demo
+  labels: { demo: before, group: plain-gpu }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'pretend training on a whole GPU'; sleep 3600"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plain-gpu-3
+  namespace: vgpu-demo
+  labels: { demo: before, group: plain-gpu }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'pretend training on a whole GPU'; sleep 3600"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+

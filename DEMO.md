@@ -9,6 +9,22 @@ Every command below is a script that's already green in CI / on hardware.
 
 ## Track A — control plane, no GPU needed (~5 min)
 
+The fastest "see it work": the **[`vgpu` CLI](scripts/vgpu)** + the **[`demo/`](demo/)**
+before/after.
+
+```sh
+scripts/setup-kind-cluster.sh                 # control plane + an 80 GiB mock GPU (one node)
+scripts/vgpu submit --name llama --vram 16Gi --image busybox:1.36 --command 'sleep 3600'
+scripts/vgpu status  llama                    # Job → Claim → Slice → Pod, one line each
+scripts/vgpu profile llama                    # learned: requested vs recommended vs peak
+```
+
+Then run the **before/after packing demo** in [`demo/README.md`](demo/README.md):
+vanilla K8s strands 3 of 4 whole-GPU pods `Pending`; the scheduler packs all 4
+VGPUJobs onto one 80 GiB GPU.
+
+For the full battery + raw flow:
+
 ```sh
 # One idempotent command: kind cluster + CRDs + scheduler/controller/node-agent.
 scripts/setup-kind-cluster.sh

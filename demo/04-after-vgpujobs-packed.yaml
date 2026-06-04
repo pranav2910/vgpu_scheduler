@@ -1,0 +1,58 @@
+# AFTER: vGPU scheduler, byte-granular slices. 4 jobs x 16 GiB = 64 GiB,
+# all packed onto ONE 80 GiB GPU. Nothing Pending. Same hardware, 4x the work.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-0
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-1
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-2
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-3
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+
