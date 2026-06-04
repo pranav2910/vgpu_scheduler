@@ -83,6 +83,7 @@ SUBMIT OPTIONS:
   -n, --namespace NS   target namespace (default ${NS_DEFAULT})
   --command 'CMD'      override container command (shell string)
   --node NODE          pin the pod to a node (demo/no-scheduler setups)
+  --runtime-class RC   pod runtimeClassName (real GPU nodes: --runtime-class nvidia)
   --wait SECONDS       how long to wait for slice allocation (default 120)
   --no-wait            skip the wait (only safe once the slice is allocated)
   --dry-run            print the manifests, do not apply
@@ -98,7 +99,7 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_submit() {
     local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
-    local ns="$NS_DEFAULT" command_override="" node="" dry_run=0 wait_secs=120
+    local ns="$NS_DEFAULT" command_override="" node="" runtime_class="" dry_run=0 wait_secs=120
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)            name="$2"; shift 2 ;;
@@ -110,6 +111,7 @@ cmd_submit() {
             -n|--namespace)    ns="$2"; shift 2 ;;
             --command)         command_override="$2"; shift 2 ;;
             --node)            node="$2"; shift 2 ;;
+            --runtime-class)   runtime_class="$2"; shift 2 ;;
             --wait)            wait_secs="$2"; shift 2 ;;
             --no-wait)         wait_secs=0; shift ;;
             --dry-run)         dry_run=1; shift ;;
@@ -137,6 +139,10 @@ cmd_submit() {
     # Optional nodeName (demo/no-scheduler clusters where slices need a hand-set node).
     local node_block=""
     [[ -n "$node" ]] && node_block="  nodeName: ${node}"$'\n'
+    # Optional runtimeClassName — required on real GPU nodes so the NVIDIA runtime
+    # acts on the injected device (e.g. --runtime-class nvidia). Omit on kind.
+    local rtc_block=""
+    [[ -n "$runtime_class" ]] && rtc_block="  runtimeClassName: ${runtime_class}"$'\n'
 
     local job_manifest pod_manifest
     job_manifest=$(cat <<EOF
@@ -165,7 +171,7 @@ metadata:
   annotations:
     ${CLAIM_ANNOTATION}: ${claim}
 spec:
-${node_block}  restartPolicy: Never
+${node_block}${rtc_block}  restartPolicy: Never
   containers:
   - name: workload
     image: ${image}
