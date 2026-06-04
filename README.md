@@ -129,3 +129,7 @@ usage and recommend right-sized grants (3.5) · **soft feedback-aware scheduling
 Next frontier: 3.7 **enforcing the recommendation** (block / auto-right-size
 under-provisioned requests). MIG-backed hard partitioning (3.4e), federation, and
 a managed SaaS layer are deferred.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
