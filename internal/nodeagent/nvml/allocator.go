@@ -46,7 +46,20 @@ func (a *Allocator) Allocate(ctx context.Context, req AllocationRequest) (*Alloc
 	devUUID := fmt.Sprintf("GPU-MOCK-%s-%d", short, now)
 
 	if !a.mockMode {
-		// TODO: real NVML C-binding calls go here.
+		// Real build: bind the slice to a physical GPU and record its TRUE UUID
+		// (physicalGPUUUID is build-tagged — real NVML under -tags nvml, a no-op
+		// stub otherwise). This product models one GPU per node, so the slice
+		// maps to that GPU; per-process VRAM isolation is the runtime-enforcement
+		// layer (Phase 3.4), not a hardware partition. NOTE: the device-node /
+		// driver-library injection that lets the container actually open the GPU
+		// is finalized + validated on real hardware — see docs/runtime-enforcement.md.
+		uuid, err := physicalGPUUUID()
+		if err != nil {
+			return nil, fmt.Errorf("binding physical GPU: %w", err)
+		}
+		if uuid != "" {
+			devUUID = uuid
+		}
 	}
 
 	return &AllocationResult{

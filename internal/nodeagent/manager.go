@@ -63,8 +63,9 @@ func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSl
 		telemetry.RecordHardwareAllocation(m.NodeName, true)
 
 		// 3. Write the CDI firewall so containerd can bind the container to
-		//    this specific partition. Bug C fix.
-		if err := cdi.GenerateFirewall(slice.Name, result.DeviceUUID); err != nil {
+		//    this specific partition. The device is named by AllocationID to
+		//    match exactly what the mutating webhook requests (mutating_pod.go).
+		if err := cdi.GenerateFirewall(result.AllocationID, result.DeviceUUID); err != nil {
 			return fmt.Errorf("generating CDI firewall: %w", err)
 		}
 

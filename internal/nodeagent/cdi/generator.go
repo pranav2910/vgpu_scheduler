@@ -31,8 +31,12 @@ type ContainerEdits struct {
 	Env []string `json:"env,omitempty"`
 }
 
-// GenerateFirewall writes a CDI spec file that locks the container to the given GPU partition.
-func GenerateFirewall(sliceName string, uuid string) error {
+// GenerateFirewall writes a CDI spec file that locks the container to the given
+// GPU partition. deviceName MUST be the slice's AllocationID, because the
+// mutating webhook requests the CDI device as "<vendor>/<class>=<AllocationID>"
+// (internal/webhook/mutating_pod.go) — the device Name here and that request
+// must be identical or containerd's CDI lookup finds nothing.
+func GenerateFirewall(deviceName string, uuid string) error {
 	if err := os.MkdirAll(cdiDirectory, 0750); err != nil {
 		return fmt.Errorf("failed to create CDI directory: %w", err)
 	}
@@ -42,7 +46,7 @@ func GenerateFirewall(sliceName string, uuid string) error {
 		Kind:    cdiKind,
 		Devices: []Device{
 			{
-				Name: sliceName,
+				Name: deviceName,
 				ContainerEdits: ContainerEdits{
 					Env: []string{fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", uuid)},
 				},
