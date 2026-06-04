@@ -132,9 +132,15 @@ cmd_submit() {
     local claim="${name}-claim"
 
     # Optional container command block (YAML), only emitted when overridden.
+    # JSON-escape the command so it is a valid YAML flow-sequence string (JSON is
+    # valid YAML). %q would emit shell escaping (backslashes), which is NOT valid YAML.
     local cmd_block=""
     if [[ -n "$command_override" ]]; then
-        cmd_block=$(printf '    command: ["/bin/sh","-c"]\n    args: [%s]\n' "$(printf '%q' "$command_override")")
+        local esc="${command_override//\\/\\\\}"   # backslash -> \\
+        esc="${esc//\"/\\\"}"                       # double-quote -> \"
+        # Build with literal newlines (NOT $(...), which strips the trailing one
+        # and would merge 'args' into the next line).
+        cmd_block='    command: ["/bin/sh","-c"]'$'\n''    args: ["'"$esc"'"]'$'\n'
     fi
     # Optional nodeName (demo/no-scheduler clusters where slices need a hand-set node).
     local node_block=""
