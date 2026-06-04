@@ -10,6 +10,13 @@ a reserve-or-rollback gang admission gate, preemption, namespace quota,
 soft topology placement, HA failover, and Prometheus observability — and each of
 those is tested **in composition**, under adversarial load, not just in isolation.
 
+On top of scheduling sits a hardware-validated **runtime-intelligence stack**:
+detect VRAM over-use → attribute it to the exact workload → warn → opt-in evict →
+**learn each workload's real footprint and recommend a right-sized grant**.
+
+**→ [DEMO.md](DEMO.md)** walks the whole thing end to end (kind, then one real GPU).
+**→ [docs/architecture.md](docs/architecture.md)** is the one-page system map.
+
 ## Components
 
 | Component | Role |
@@ -98,6 +105,8 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
+- [DEMO.md](DEMO.md) — end-to-end walkthrough: control plane on kind, then runtime intelligence on a real GPU
+- [docs/architecture.md](docs/architecture.md) — one-page system map: CRDs, components, the runtime stack, the safety philosophy
 - [docs/gang-scheduling.md](docs/gang-scheduling.md) — gang guarantees, serialized admission, tunables, limits
 - [docs/ha-failover.md](docs/ha-failover.md) — active/standby model, readiness semantics, failover invariants
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics reference + sample scrape config
