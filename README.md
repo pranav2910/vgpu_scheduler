@@ -57,6 +57,14 @@ containerd CDI + the Kubernetes Eviction API** on actual GPUs (`scripts/a10-boot
 `validate-runtime-3.4d-a10.sh` `5/5`, `validate-runtime-3.5-a10.sh` `8/8` — the
 3.4/3.5/alloc suites all green on a 1× H100), not just mocks:
 
+- **Full submit flow (v0.8) — the whole product in one command** — on an H100,
+  `scripts/h100-control-plane.sh` brings up the entire control plane (scheduler +
+  controller + admission webhooks + node agent), and **`vgpu submit --vram 16Gi`**
+  then runs a workload on a shared GPU with **zero manual wiring**: the controller
+  auto-creates the Claim+Slice, the scheduler places it, the node agent binds a
+  real GPU, the mutating webhook auto-injects it, and the pod runs
+  (`validate-submit-flow-h100.sh` `8/8`). This is the complete ML-engineer
+  experience, end to end on real hardware.
 - **Data plane (allocate → CDI → inject)** — a slice is bound to a real GPU UUID
   via NVML, the node agent writes a CDI spec, and a pod referencing it gets the
   GPU: `nvidia-smi` works *inside the pod* and its GPU UUID matches the slice's
@@ -84,9 +92,10 @@ containerd CDI + the Kubernetes Eviction API** on actual GPUs (`scripts/a10-boot
   Validated end-to-end on the A10 (`validate-runtime-3.5-a10.sh`): real peak →
   `recommended > requested` at `High` confidence → advisory fires, pod still running.
 
-The A10 runs also surfaced two real bugs unit tests structurally couldn't — a
-cached-vs-direct client read in pod stamping, and a controller/slice ordering race
-— both caught and fixed on hardware.
+The hardware runs surfaced several real bugs unit tests structurally couldn't —
+a cached-vs-direct client read in pod stamping, a controller/slice ordering race,
+a CDI device-name mismatch, and malformed pod YAML from the CLI — all caught and
+fixed on hardware.
 
 ## Quick start (kind)
 
@@ -128,16 +137,15 @@ observability · HA failover · GPU hardware-truth **observation** · runtime
 over-use **detection → attribution → soft enforcement → opt-in eviction**
 (3.4a–d) · **runtime feedback engine** that learns peak usage and recommends
 right-sized grants (3.5) · **soft feedback-aware scheduling** (3.6) · and the
-**data plane** — a slice bound to a real GPU UUID, a CDI spec, and a pod that
-actually receives the GPU. All hardware-validated on an A10 **and a 1× H100**;
-defaults stay non-destructive (`softwarn`, recommend-only).
+**full submit flow** — one `vgpu submit` materializes the Job→Claim→Slice, the
+scheduler places it, the node agent binds a real GPU, and the mutating webhook
+injects it so the pod runs (v0.8). All hardware-validated on an A10 **and a 1×
+H100**; defaults stay non-destructive (`softwarn`, recommend-only).
 
-Next frontier: wire the **full submit→run path** end to end (the mutating webhook
-auto-injecting the CDI device, validated `validate-alloc`-style but through the
-admission path); then 3.7 **enforcing the recommendation** (block / auto-right-size).
-True per-process VRAM isolation today is soft (record + evict); **MIG-backed hard
-partitioning** (3.4e), multi-GPU-per-node, federation, and a managed SaaS layer
-are deferred.
+Next frontier: **3.7 enforcing the recommendation** (block / auto-right-size an
+under-provisioned request). True per-process VRAM isolation today is soft (record
++ evict); **MIG-backed hard partitioning** (3.4e), multi-GPU-per-node, federation,
+and a managed SaaS layer are deferred.
 
 ## License
 
