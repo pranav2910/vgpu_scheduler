@@ -120,6 +120,7 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
+- [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: run a workload step by step (`vgpu submit / status / profile`), right-sizing, gang jobs, troubleshooting
 - [DEMO.md](DEMO.md) — end-to-end walkthrough: control plane on kind, then runtime intelligence on a real GPU
 - [docs/architecture.md](docs/architecture.md) — one-page system map: CRDs, components, the runtime stack, the safety philosophy
 - [docs/gang-scheduling.md](docs/gang-scheduling.md) — gang guarantees, serialized admission, tunables, limits
