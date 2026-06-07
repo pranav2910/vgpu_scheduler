@@ -15,6 +15,7 @@ GROUP="infrastructure.pranav2910.com"
 APIVERSION="${GROUP}/v1alpha1"
 CLAIM_ANNOTATION="${GROUP}/claim-ref"
 RECOMMENDED_ANNOTATION="${GROUP}/recommended-vram-bytes"
+OVERRIDE_ANNOTATION="${GROUP}/override-recommendation"
 CLAIM_LABEL="vgpu-claim"
 NS_DEFAULT="default"
 VGPU_VERSION="dev"   # replaced with the git tag at release time (see .github/workflows/release.yaml)
@@ -86,6 +87,8 @@ SUBMIT OPTIONS:
   --command 'CMD'      override container command (shell string)
   --node NODE          pin the pod to a node (demo/no-scheduler setups)
   --runtime-class RC   pod runtimeClassName (real GPU nodes: --runtime-class nvidia)
+  --override           run under a requireOverride policy even if below the
+                       profile's recommended VRAM (i.e. submit undersized on purpose)
   --wait SECONDS       how long to wait for the controller to place the pod (default 120)
   --no-wait            return immediately after applying the VGPUJob
   --dry-run            print the VGPUJob manifest, do not apply
@@ -102,7 +105,7 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_submit() {
     local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
-    local ns="$NS_DEFAULT" command_override="" node="" runtime_class="" dry_run=0 wait_secs=120
+    local ns="$NS_DEFAULT" command_override="" node="" runtime_class="" dry_run=0 wait_secs=120 override=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)            name="$2"; shift 2 ;;
@@ -115,6 +118,7 @@ cmd_submit() {
             --command)         command_override="$2"; shift 2 ;;
             --node)            node="$2"; shift 2 ;;
             --runtime-class)   runtime_class="$2"; shift 2 ;;
+            --override)        override=1; shift ;;
             --wait)            wait_secs="$2"; shift 2 ;;
             --no-wait)         wait_secs=0; shift ;;
             --dry-run)         dry_run=1; shift ;;
@@ -154,6 +158,11 @@ cmd_submit() {
     [[ -n "$node" ]]          && node_block="      nodeName: ${node}"$'\n'
     [[ -n "$runtime_class" ]] && rtc_block="      runtimeClassName: ${runtime_class}"$'\n'
 
+    # 3.7: --override stamps the VGPUJob so a `requireOverride` policy admits an
+    # under-provisioned request (i.e. "I know it's below the recommendation — run it").
+    local override_block=""
+    [[ $override -eq 1 ]] && override_block="  annotations:"$'\n'"    ${OVERRIDE_ANNOTATION}: \"true\""$'\n'
+
     # ONE manifest: the VGPUJob now carries the podTemplate, so the controller
     # owns the whole chain (claim -> slice -> pod). The controller stamps the
     # claim-ref label+annotation on the pod itself, so we don't need them here.
@@ -164,7 +173,7 @@ kind: VGPUJob
 metadata:
   name: ${name}
   namespace: ${ns}
-spec:
+${override_block}spec:
   priority: ${priority}
   workloadClass: ${class}
   claimTemplate:
@@ -189,10 +198,21 @@ EOF
     # Apply the single VGPUJob. The controller materializes VGPUClaim/${claim},
     # the scheduler binds VGPUSlice/${slice}, and once it is allocated the
     # controller creates Pod/${pod} (the mutating webhook injects the GPU).
-    printf '%s\n' "$job_manifest" | kubectl apply -f - >/dev/null \
-        || die "applying VGPUJob failed"
-    printf 'submitted: %s  (%s VRAM, class=%s, tier=%s, ns=%s)\n' \
-        "$name" "$(human "$bytes")" "$class" "$tier" "$ns"
+    local apply_out
+    if ! apply_out="$(printf '%s\n' "$job_manifest" | kubectl apply -f - 2>&1)"; then
+        # 3.7: a requireOverride policy rejects an under-provisioned request — turn
+        # the raw admission error into an actionable hint.
+        if printf '%s' "$apply_out" | grep -qiE 'denied|override-recommendation|recommended'; then
+            printf 'vgpu: submission rejected by the recommendation policy:\n  %s\n' \
+                "$(printf '%s' "$apply_out" | tail -1)" >&2
+            printf '  → raise --vram to the recommended size (see: vgpu profile %s), or\n' "$name" >&2
+            printf '    re-submit with --override to run undersized on purpose.\n' >&2
+            exit 1
+        fi
+        die "applying VGPUJob failed: $(printf '%s' "$apply_out" | tail -1)"
+    fi
+    printf 'submitted: %s  (%s VRAM, class=%s, tier=%s, ns=%s%s)\n' \
+        "$name" "$(human "$bytes")" "$class" "$tier" "$ns" "$( ((override)) && printf ', override=on' )"
     printf '  VGPUJob/%s  ->  VGPUClaim/%s  ->  VGPUSlice/%s  ->  Pod/%s  (all by the controller)\n' \
         "$name" "$claim" "$slice" "$pod"
 
@@ -310,11 +330,21 @@ cmd_profile() {
     printf '  confidence   %s  (%s observations)\n' "${conf:-<none>}" "${obs:-0}"
     [[ "${evictions:-0}" != "0" ]] && printf '  evictions    %s\n' "$evictions"
 
+    # Best-effort: surface the cluster's enforcement mode (needs read access to the
+    # control-plane namespace; silently skipped if the caller can't see it).
+    local pmode
+    pmode="$(kubectl get deploy vgpu-controller -n vgpu-system \
+        -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VGPU_RECOMMENDATION_MODE")].value}' 2>/dev/null)"
+    [[ -n "$pmode" ]] && printf '  policy mode  %s\n' "$pmode"
+
     if [[ "$adv" == "True" ]]; then
         local msg
         msg="$(kget vgpuworkloadprofile "$name" "$ns" \
             '{.status.conditions[?(@.type=="Underprovisioned")].message}')"
         printf '  VERDICT      UNDERPROVISIONED — %s\n' "${msg:-request is below the observed peak}"
+        printf '  next time    request %s  —  or keep this size and add --override\n' "$(human "${recommended:-0}")"
+        [[ "$pmode" == "requireOverride" ]] && \
+            printf '               (this cluster enforces requireOverride: an undersized re-submit is rejected without --override)\n'
     elif [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
         printf '  VERDICT      OK — request covers the observed peak (with headroom)\n'
     fi

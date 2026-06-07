@@ -131,6 +131,7 @@ See [docs/metrics.md](docs/metrics.md).
 - [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md) — NVML observation scaffolding + g5 validation runbook
 - [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement → opt-in eviction (3.4a–d), tunables, A10 E2E
 - [docs/runtime-feedback.md](docs/runtime-feedback.md) — GPU behavior profiles: learn peak usage → recommend right-sized grants (3.5) → non-blocking under-provisioning advisory (3.6)
+- [docs/recommendation-policy.md](docs/recommendation-policy.md) — recommendation enforcement (3.7a): `recommendOnly` / `warn` / `requireOverride` modes, the override annotation, safety gates, and the `vgpu --override` flow
 
 ## Status & roadmap
 
