@@ -122,6 +122,7 @@ See [docs/metrics.md](docs/metrics.md).
 
 - [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: run a workload step by step (`vgpu submit / status / profile`), right-sizing, gang jobs, troubleshooting
 - [docs/INSTALL-H100.md](docs/INSTALL-H100.md) — **for platform/admins**: from-scratch control-plane install on a real GPU node (clone → `h100-control-plane.sh` → validate), with the before/after packing proof
+- [docs/benchmarks.md](docs/benchmarks.md) — **the numbers**: 4× packing / ~80% utilization / no over-commit / right-sizing on a 1× H100, the 14-test battery, and how to reproduce it all
 - [DEMO.md](DEMO.md) — end-to-end walkthrough: control plane on kind, then runtime intelligence on a real GPU
 - [docs/architecture.md](docs/architecture.md) — one-page system map: CRDs, components, the runtime stack, the safety philosophy
 - [docs/gang-scheduling.md](docs/gang-scheduling.md) — gang guarantees, serialized admission, tunables, limits
