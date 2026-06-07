@@ -11,6 +11,7 @@ this scheduler packs many workloads onto one card.
 | `02-vgpugangjob-allreduce.yaml` | a 4-rank gang (all-or-nothing) |
 | `03-before-plain-gpu-pods.yaml` | **before**: 4 plain pods each demanding a whole `nvidia.com/gpu` |
 | `04-after-vgpujobs-packed.yaml` | **after**: the same 4 workloads as VGPUJobs, 16 GiB each |
+| `h100-before-after.sh` | **on a real GPU**: the same before/after, auto-sized to the card (runs the packing live + reports utilization) |
 
 Submit workloads with the [`vgpu` CLI](../scripts/vgpu) (`vgpu submit/status/profile`)
 or raw `kubectl apply` as below.
@@ -70,14 +71,35 @@ Bump `gangSize`/`minAvailable` to 8 (8×12 = 96 GiB > 80) and re-apply to watch 
 in `Reserving`, then roll back cleanly within `reservationTimeoutSeconds` — no deadlock,
 no stranded half-gang.
 
+## On real hardware (the same story, live)
+
+The manifests above run on a mock-GPU kind cluster so you can see the packing on a
+laptop. To run it on an actual GPU node, stand up the full control plane and use the
+auto-sizing script:
+
+```sh
+bash scripts/h100-control-plane.sh            # full control plane on the GPU node
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+bash demo/h100-before-after.sh                # submits one more than fits; --keep to leave running
+```
+
+On an 80 GiB H100 this packs **4× 16 GiB workloads onto one physical GPU** (~80%
+utilization) and shows the 5th **held Pending** — the no-over-admission guarantee.
+Each pod's `nvidia-smi` reports the same GPU UUID as its slice. Full runbook:
+[../docs/INSTALL-H100.md](../docs/INSTALL-H100.md).
+
 ## Honest note on what's real here
 
 The scheduling, VRAM bin-packing, claim/slice lifecycle, gang reservations, and the
-metrics above are **genuinely implemented** — this demo's before/after is real on the
-mock-GPU kind cluster. What is **not** real yet: the node agent does not physically
-partition a GPU or inject real device nodes (allocation returns a synthetic handle on
-every build, including `-tags nvml`). So a pod scheduled here does not get a hardware-
-isolated slice of silicon — that last mile (NVML/MIG/MPS allocation + a real CDI spec)
-is the next engineering step. This demo proves the **scheduling-efficiency** half of the
-story; the right-sizing feedback loop is hardware-validated separately (see
-[../docs/runtime-feedback.md](../docs/runtime-feedback.md)).
+metrics above are **genuinely implemented**, and on a real GPU node the data plane is
+real too: with the `-tags nvml` node agent the allocator binds an actual GPU UUID,
+writes a CDI spec, and the mutating webhook injects the device — a pod gets the GPU and
+`nvidia-smi` works inside it (validated end to end on an A10 **and** a 1× H100;
+`scripts/validate-submit-flow-h100.sh` → 14/14). This kind demo shows only the
+**scheduling** half (mock GPU, no real injection on a laptop).
+
+The one honest limitation: per-pod VRAM isolation is **soft**, not hard. A pod is given
+the whole GPU via `NVIDIA_VISIBLE_DEVICES` and its VRAM budget is governed by
+observe → warn → opt-in evict → right-size (see
+[../docs/runtime-feedback.md](../docs/runtime-feedback.md)), not by a hardware fence.
+**MIG-backed hard partitioning** is the next step, not done yet.
