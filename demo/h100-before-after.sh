@@ -78,6 +78,18 @@ hdr "BEFORE — vanilla Kubernetes (nvidia.com/gpu: 1)"
 say "A stock GPU is one allocatable unit. ${FIT} pods each asking for a GPU →"
 say "${C_RED}1 Running, $(( FIT - 1 )) Pending forever${C_RST}. ~$(awk -v f="$FIT" 'BEGIN{printf "%.0f", 100/f}')% of the card used; the rest stranded."
 
+hdr "reset — start from an idle card"
+existing=$(kubectl get vgpujobs -n "$NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${existing:-0}" -gt 0 ]]; then
+    say "clearing ${existing} existing VGPUJob(s) in ns/${NS} (this demo packs an idle GPU; leftovers would skew it)"
+    kubectl delete vgpujob --all -n "$NS" --wait=false >/dev/null 2>&1
+    for _ in $(seq 1 20); do   # wait for the scheduler to release the freed capacity
+        [[ "$(kubectl get vgpuslices -n "$NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')" == "0" ]] && break
+        sleep 2
+    done
+fi
+say "card idle — $(gib "$CAP") GiB available"
+
 hdr "AFTER — this scheduler: submit ${SUBMIT}× ${PER_JOB} (one more than fits)"
 for i in $(seq 1 "$SUBMIT"); do
     scripts/vgpu submit --name "${PREFIX}${i}" --vram "$PER_JOB" -n "$NS" \
@@ -92,16 +104,22 @@ for _ in $(seq 1 20); do
     [[ "$ready" -ge "$FIT" ]] && break
     sleep 3
 done
+# then give the pods a moment to reach Running (fast when the image is cached)
+for _ in $(seq 1 12); do
+    r=$(kubectl get pods -n "$NS" --no-headers 2>/dev/null | grep "^${PREFIX}.*-workload" | grep -c " Running ")
+    [[ "$r" -ge "$FIT" ]] && break
+    sleep 5
+done
 
-# ── tally what actually happened ─────────────────────────────────────────────
-mapfile -t lines < <(kubectl get vgpuslices -n "$NS" \
-    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.deviceUuid}{"\n"}{end}' 2>/dev/null \
-    | grep "^${PREFIX}")
+# ── tally what actually happened (bash 3.2-safe: no mapfile) ─────────────────
 packed=0; held=0; uuid=""
-for l in "${lines[@]}"; do
+while IFS= read -r l; do
+    [[ -z "$l" ]] && continue
     u=$(echo "$l" | awk '{print $3}')
     if [[ "$u" == GPU-* ]]; then packed=$((packed+1)); uuid="$u"; else held=$((held+1)); fi
-done
+done < <(kubectl get vgpuslices -n "$NS" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.deviceUuid}{"\n"}{end}' 2>/dev/null \
+    | grep "^${PREFIX}")
 running=$(kubectl get pods -n "$NS" --no-headers 2>/dev/null | grep "^${PREFIX}.*-workload" | grep -c " Running ")
 packed_bytes=$(( packed * per_bytes ))
 util=$(awk -v p="$packed_bytes" -v c="$CAP" 'BEGIN{ printf "%.0f", (c>0)? p*100/c : 0 }')
