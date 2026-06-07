@@ -7,6 +7,7 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -67,6 +68,10 @@ type VGPUJobReconciler struct {
 	Client   client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	// RecommendationMode gates the 3.7 advisory event (recommendOnly emits none;
+	// warn/requireOverride do). The requireOverride admission block lives in the
+	// VGPUJob validating webhook, not here. Zero value behaves as recommendOnly.
+	RecommendationMode recommendation.Mode
 }
 
 // SetupWithManager registers the reconciler with the controller manager.

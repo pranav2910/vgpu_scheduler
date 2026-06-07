@@ -110,6 +110,48 @@ run workload → NVML sees real peak → slice stats → profile recommends →
   re-submit with a too-low request → Underprovisioned warning (still admitted)
 ```
 
+## 3.7 — recommendation enforcement (turn advice into policy)
+
+3.6 only *advises*. 3.7 lets an operator make the recommendation a **future-request
+policy**, selected by `VGPU_RECOMMENDATION_MODE` on the controller:
+
+| mode | condition + annotation + metric | Warning event | admission |
+|---|---|---|---|
+| `recommendOnly` *(default)* | ✓ | — | allow |
+| `warn` | ✓ | ✓ | allow |
+| `requireOverride` | ✓ | ✓ | **reject CREATE unless overridden** |
+
+`requireOverride` is enforced by a **VGPUJob validating webhook**: it rejects the
+CREATE of a job whose `requestedVramBytes` is below its profile's
+`recommendedVramBytes` (beyond a 10% tolerance), returning a message that names the
+recommended size and the escape hatch. Two safety properties are deliberate and
+load-bearing:
+
+- **Confidence gate.** It blocks **only at `Medium`+ confidence**. A `Low`-confidence
+  profile (e.g. a few observations) never blocks — early recommendations are
+  directional, not authoritative.
+- **Fail-open.** The webhook is `failurePolicy: Ignore` and never errors a request
+  closed: a missing profile, a lookup failure, or an outage all *admit*. This is
+  advisory policy, not data integrity — it must never halt job submission.
+
+Escape hatch — run undersized on purpose:
+
+```yaml
+metadata:
+  annotations:
+    infrastructure.pranav2910.com/override-recommendation: "true"
+```
+
+The controller then stamps the `Underprovisioned` condition with reason
+`RequestBelowRecommendationOverridden` (and emits no event — it was the user's
+explicit choice). `autoResize` (mutate the request up) and a hard `block` (no
+override path) are intentionally **not** built yet.
+
+Validate on kind (no GPU — this is admission logic):
+`scripts/validate-recommendation-3.7-kind.sh` exercises all three modes incl. the
+reject, the override, and the Low-confidence safety gate (5/5). The decision matrix
+and fail-open are also unit-tested (`internal/recommendation`, `internal/webhook`).
+
 ## Deployment & validation
 
 The new CRD ships in `deployments/manifests/crds/`; the controller RBAC gains

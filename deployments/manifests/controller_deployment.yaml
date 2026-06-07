@@ -39,6 +39,12 @@ spec:
         - name: manager
           image: vgpu-controller:latest
           imagePullPolicy: IfNotPresent
+          env:
+            # Phase 3.7 recommendation enforcement: recommendOnly (default) | warn |
+            # requireOverride. Only requireOverride rejects admission (Medium+
+            # confidence, no override annotation); its webhook is fail-open.
+            - name: VGPU_RECOMMENDATION_MODE
+              value: "recommendOnly"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -317,6 +317,29 @@ var (
 		Help: "1 while a workload requests less VRAM than its profile recommends (advisory only, non-blocking).",
 	}, []string{"namespace", "workload"})
 
+	// ── recommendation enforcement (3.7) ──────────────────────────────────
+
+	// RecommendationMode is set to 1 for the controller's active enforcement mode
+	// (recommendOnly|warn|requireOverride) — observability of the configured policy.
+	RecommendationMode = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_recommendation_mode",
+		Help: "Active recommendation-enforcement mode (1 for the configured mode).",
+	}, []string{"mode"})
+
+	// RecommendationRejectionsTotal counts VGPUJob CREATE requests the webhook
+	// rejected for being under-provisioned (requireOverride, confident profile, no override).
+	RecommendationRejectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_recommendation_rejections_total",
+		Help: "VGPUJob CREATE requests rejected as under-provisioned (requireOverride, no override).",
+	}, []string{"namespace"})
+
+	// RecommendationOverridesTotal counts under-provisioned CREATE requests admitted
+	// because they carried the override annotation.
+	RecommendationOverridesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_recommendation_overrides_total",
+		Help: "Under-provisioned VGPUJob CREATE requests admitted via the override annotation.",
+	}, []string{"namespace"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -359,6 +382,8 @@ func init() {
 		// runtime feedback / behavior profiles (3.5) + soft advisory (3.6)
 		WorkloadPeakObservedVRAMBytes, WorkloadRecommendedVRAMBytes, WorkloadProfileConfidence,
 		WorkloadUnderprovisioned,
+		// recommendation enforcement (3.7)
+		RecommendationMode, RecommendationRejectionsTotal, RecommendationOverridesTotal,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

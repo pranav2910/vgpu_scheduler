@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -40,18 +41,19 @@ func (r *VGPUJobReconciler) reconcileAdvisory(ctx context.Context, job *vgpuv1al
 
 	advise := false
 	var recommended int64
-	if err == nil && requested > 0 && prof.Status.RecommendedVRAMBytes > 0 &&
-		confidentEnough(prof.Status.Confidence) &&
-		requested < prof.Status.RecommendedVRAMBytes {
+	if err == nil &&
+		recommendation.ConfidentEnough(prof.Status.Confidence) &&
+		recommendation.Undersized(requested, prof.Status.RecommendedVRAMBytes) {
 		advise = true
 		recommended = prof.Status.RecommendedVRAMBytes
 	}
+	overridden := job.Annotations[recommendation.OverrideAnnotation] == "true"
 
 	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
 	if err := r.setAdvisoryAnnotation(ctx, key, advise, recommended); err != nil {
 		return err
 	}
-	if err := r.setAdvisoryCondition(ctx, key, advise, requested, recommended, prof.Status.Confidence); err != nil {
+	if err := r.setAdvisoryCondition(ctx, key, advise, overridden, requested, recommended, prof.Status.Confidence); err != nil {
 		return err
 	}
 
@@ -61,10 +63,6 @@ func (r *VGPUJobReconciler) reconcileAdvisory(ctx context.Context, job *vgpuv1al
 	}
 	telemetry.WorkloadUnderprovisioned.WithLabelValues(job.Namespace, job.Name).Set(val)
 	return nil
-}
-
-func confidentEnough(c vgpuv1alpha1.ProfileConfidence) bool {
-	return c == vgpuv1alpha1.ProfileConfidenceMedium || c == vgpuv1alpha1.ProfileConfidenceHigh
 }
 
 // setAdvisoryAnnotation sets or removes the machine-readable recommended-VRAM
@@ -95,8 +93,11 @@ func (r *VGPUJobReconciler) setAdvisoryAnnotation(ctx context.Context, key types
 }
 
 // setAdvisoryCondition sets/clears the Underprovisioned condition (status write)
-// and emits a Warning Event on the False→True transition. Never changes phase.
-func (r *VGPUJobReconciler) setAdvisoryCondition(ctx context.Context, key types.NamespacedName, advise bool, requested, recommended int64, conf vgpuv1alpha1.ProfileConfidence) error {
+// and, in warn/requireOverride mode, emits a Warning Event on the False→True
+// transition (recommendOnly stays silent). Never changes phase. When the request
+// is undersized but the override annotation is set, the condition records that the
+// undersize was intentional.
+func (r *VGPUJobReconciler) setAdvisoryCondition(ctx context.Context, key types.NamespacedName, advise, overridden bool, requested, recommended int64, conf vgpuv1alpha1.ProfileConfidence) error {
 	emitEvent := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var j vgpuv1alpha1.VGPUJob
@@ -115,6 +116,11 @@ func (r *VGPUJobReconciler) setAdvisoryCondition(ctx context.Context, key types.
 			cond.Reason = "RequestBelowRecommendation"
 			cond.Message = fmt.Sprintf("Requested %d MiB but the workload profile recommends %d MiB (confidence %s) from observed peak — advisory only, not blocked.",
 				requested>>20, recommended>>20, conf)
+			if overridden {
+				cond.Reason = "RequestBelowRecommendationOverridden"
+				cond.Message = fmt.Sprintf("Requested %d MiB below the recommended %d MiB (confidence %s) — admitted by override annotation (running undersized intentionally).",
+					requested>>20, recommended>>20, conf)
+			}
 		}
 		// Skip the write if nothing changes (avoid status churn).
 		if existing := apimeta.FindStatusCondition(j.Status.Conditions, advisoryConditionType); existing != nil &&
@@ -125,7 +131,9 @@ func (r *VGPUJobReconciler) setAdvisoryCondition(ctx context.Context, key types.
 		if err := r.Client.Status().Update(ctx, &j); err != nil {
 			return err
 		}
-		emitEvent = advise && !was
+		// recommendOnly is silent; warn/requireOverride emit the nudge. An
+		// overridden request is the user's explicit choice — no event.
+		emitEvent = advise && !was && !overridden && recommendation.EmitsEvent(r.RecommendationMode)
 		return nil
 	}); err != nil {
 		return err

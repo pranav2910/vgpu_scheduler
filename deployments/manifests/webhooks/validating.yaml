@@ -21,3 +21,23 @@ webhooks:
         apiVersions: ["v1alpha1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["vgpuclaims"]
+  # Phase 3.7 — recommendation enforcement. Rejects CREATE of an under-provisioned
+  # VGPUJob (vs its learned profile) only in requireOverride mode, only at Medium+
+  # confidence, and only without the override annotation. failurePolicy: Ignore —
+  # this is advisory policy, NOT data integrity: a webhook outage must never block
+  # job submission cluster-wide.
+  - name: vvgpujob.vgpu.pranav2910.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    clientConfig:
+      service:
+        name: vgpu-controller-webhook
+        namespace: vgpu-system
+        path: /validate-infrastructure-pranav2910-com-v1alpha1-vgpujob
+      caBundle: ""
+    rules:
+      - apiGroups: ["infrastructure.pranav2910.com"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["vgpujobs"]

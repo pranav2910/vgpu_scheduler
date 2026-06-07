@@ -6,6 +6,8 @@ import (
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/controller"
+	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"github.com/pranav2910/vgpu-scheduler/internal/webhook"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -41,6 +43,13 @@ func main() {
 	// feedback hardware E2E. Production leaves them on (the default).
 	webhooksEnabled := os.Getenv("VGPU_DISABLE_WEBHOOKS") != "true"
 
+	// Phase 3.7: recommendation-enforcement mode (recommendOnly|warn|requireOverride).
+	// Default recommendOnly — non-blocking. Only requireOverride rejects admission,
+	// and only on a confident (Medium+) profile with no override annotation.
+	recMode := recommendation.ParseMode(os.Getenv("VGPU_RECOMMENDATION_MODE"))
+	telemetry.RecommendationMode.WithLabelValues(string(recMode)).Set(1)
+	log.Printf("Recommendation enforcement mode: %s", recMode)
+
 	// Bug #16: start the webhook server on :9443, reading TLS material from
 	// the cert-manager-provisioned secret mounted at /tmp/k8s-webhook-server/serving-certs.
 	mgrOpts := ctrl.Options{
@@ -72,9 +81,10 @@ func main() {
 	// Layer 2 Phase 2.1a: VGPUJobReconciler manages workload-intent jobs.
 	// Phase 3.6: also emits the non-blocking VRAM-rightsizing advisory.
 	if err := (&controller.VGPUJobReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("vgpu-controller"),
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		Recorder:           mgr.GetEventRecorderFor("vgpu-controller"),
+		RecommendationMode: recMode,
 	}).SetupWithManager(mgr); err != nil {
 		log.Fatalf("setting up VGPUJobReconciler: %v", err)
 	}
@@ -120,6 +130,11 @@ func main() {
 			&webhookserver.Admission{Handler: webhook.NewClaimValidatorHandler(decoder)})
 		mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpugangjob",
 			&webhookserver.Admission{Handler: webhook.NewGangJobValidatorHandler(decoder)})
+		// Phase 3.7: recommendation enforcement (requireOverride). Fails OPEN —
+		// failurePolicy: Ignore in the webhook config — so an outage never blocks
+		// job submission cluster-wide.
+		mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpujob",
+			&webhookserver.Admission{Handler: webhook.NewJobRecommendationValidator(mgr.GetClient(), decoder, recMode)})
 		log.Println("Webhook server registered on :9443")
 	} else {
 		log.Println("Webhooks DISABLED (VGPU_DISABLE_WEBHOOKS=true) — reconcilers-only mode, no cert-manager required")

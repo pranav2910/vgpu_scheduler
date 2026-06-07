@@ -142,12 +142,18 @@ over-use **detection → attribution → soft enforcement → opt-in eviction**
 right-sized grants (3.5) · **soft feedback-aware scheduling** (3.6) · and the
 **full submit flow** — one `vgpu submit` materializes the Job→Claim→Slice, the
 scheduler places it, the node agent binds a real GPU, and the mutating webhook
-injects it so the pod runs (v0.8). All hardware-validated on an A10 **and a 1×
-H100**; defaults stay non-destructive (`softwarn`, recommend-only).
+injects it so the pod runs (v0.8) · **recommendation enforcement** — an
+under-provisioned request can be required to carry an explicit override (3.7a).
+All hardware-validated on an A10 **and a 1× H100**; defaults stay non-destructive
+(`softwarn`, `recommendOnly`).
 
-Next frontier: **3.7 enforcing the recommendation** (block / auto-right-size an
-under-provisioned request). True per-process VRAM isolation today is soft (record
-+ evict); **MIG-backed hard partitioning** (3.4e), multi-GPU-per-node, federation,
+**Recommendation enforcement (3.7a)** is done: `VGPU_RECOMMENDATION_MODE` =
+`recommendOnly` (default) · `warn` · `requireOverride`. Only `requireOverride`
+rejects, only at **Medium+** confidence, only without the
+`…/override-recommendation` annotation, and its webhook is **fail-open**
+(see [docs/runtime-feedback.md](docs/runtime-feedback.md)). Next frontier:
+**3.7b `autoResize` / `block`** modes. True per-process VRAM isolation today is
+soft (record + evict); **MIG-backed hard partitioning** (3.4e), multi-GPU-per-node, federation,
 and a managed SaaS layer are deferred.
 
 ## License

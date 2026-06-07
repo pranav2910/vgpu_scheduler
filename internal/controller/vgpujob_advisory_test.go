@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -40,14 +41,20 @@ func mkProfile(name string, recommended, peak int64, conf vgpuv1alpha1.ProfileCo
 	}
 }
 
+// advisoryReconciler runs in `warn` mode so the existing tests observe the
+// Warning event (the pre-3.7 default behavior). recommendOnly suppresses events.
 func advisoryReconciler(t *testing.T, objs ...client.Object) (*VGPUJobReconciler, client.Client, *record.FakeRecorder) {
+	return advisoryReconcilerMode(t, recommendation.Warn, objs...)
+}
+
+func advisoryReconcilerMode(t *testing.T, mode recommendation.Mode, objs ...client.Object) (*VGPUJobReconciler, client.Client, *record.FakeRecorder) {
 	t.Helper()
 	c := fake.NewClientBuilder().WithScheme(profileScheme(t)).
 		WithObjects(objs...).
 		WithStatusSubresource(&vgpuv1alpha1.VGPUJob{}, &vgpuv1alpha1.VGPUWorkloadProfile{}).
 		Build()
 	rec := record.NewFakeRecorder(16)
-	return &VGPUJobReconciler{Client: c, Recorder: rec}, c, rec
+	return &VGPUJobReconciler{Client: c, Recorder: rec, RecommendationMode: mode}, c, rec
 }
 
 func runAdvisory(t *testing.T, r *VGPUJobReconciler, c client.Client, job string) {
@@ -102,6 +109,47 @@ func TestAdvisory_FiresWhenUnderprovisionedAndConfident(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected an UnderprovisionedRequest event")
+	}
+}
+
+// 3.7: recommendOnly (the new default) still sets the condition/annotation/metric
+// but emits NO event.
+func TestAdvisory_RecommendOnly_NoEvent(t *testing.T) {
+	r, c, rec := advisoryReconcilerMode(t, recommendation.RecommendOnly,
+		mkJob("job1", 4*giB, vgpuv1alpha1.JobPhaseScheduled),
+		mkProfile("job1", 10*giB, 9*giB, vgpuv1alpha1.ProfileConfidenceHigh),
+	)
+	runAdvisory(t, r, c, "job1")
+	if !underprovisioned(getJob(t, c, "job1")) {
+		t.Fatal("recommendOnly still sets the Underprovisioned condition")
+	}
+	select {
+	case e := <-rec.Events:
+		t.Fatalf("recommendOnly must emit NO event, got %q", e)
+	default:
+	}
+}
+
+// 3.7: an undersized request carrying the override annotation is still flagged,
+// but the condition records it as an intentional override and emits no event.
+func TestAdvisory_OverrideNoted(t *testing.T) {
+	job := mkJob("job1", 4*giB, vgpuv1alpha1.JobPhaseScheduled)
+	job.Annotations = map[string]string{recommendation.OverrideAnnotation: "true"}
+	r, c, rec := advisoryReconcilerMode(t, recommendation.RequireOverride, job,
+		mkProfile("job1", 10*giB, 9*giB, vgpuv1alpha1.ProfileConfidenceHigh))
+	runAdvisory(t, r, c, "job1")
+
+	cond := apimeta.FindStatusCondition(getJob(t, c, "job1").Status.Conditions, advisoryConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatal("expected Underprovisioned=True even with override")
+	}
+	if cond.Reason != "RequestBelowRecommendationOverridden" {
+		t.Fatalf("expected overridden reason, got %q", cond.Reason)
+	}
+	select {
+	case e := <-rec.Events:
+		t.Fatalf("override is the user's explicit choice — no event; got %q", e)
+	default:
 	}
 }
 
