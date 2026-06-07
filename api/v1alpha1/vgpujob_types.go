@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -26,9 +27,16 @@ const (
 	JobPhasePending      VGPUJobPhase = "Pending"
 	JobPhaseClaimCreated VGPUJobPhase = "ClaimCreated"
 	JobPhaseScheduled    VGPUJobPhase = "Scheduled"
-	JobPhaseRunning      VGPUJobPhase = "Running"
-	JobPhaseFailed       VGPUJobPhase = "Failed"
-	JobPhaseCompleted    VGPUJobPhase = "Completed"
+	// JobPhasePodCreating: the slice is allocated and the controller has created
+	// (or is creating) the workload Pod from podTemplate. Only reachable when
+	// podTemplate is set.
+	JobPhasePodCreating VGPUJobPhase = "PodCreating"
+	JobPhaseRunning     VGPUJobPhase = "Running"
+	// JobPhaseSucceeded: the workload Pod ran to completion (exit 0). Distinct
+	// from Completed (which tracks claim release).
+	JobPhaseSucceeded VGPUJobPhase = "Succeeded"
+	JobPhaseFailed    VGPUJobPhase = "Failed"
+	JobPhaseCompleted VGPUJobPhase = "Completed"
 )
 
 // VGPUClaimTemplate is the embedded spec used by VGPUJob to materialize a
@@ -70,6 +78,20 @@ type VGPUJobSpec struct {
 
 	// ClaimTemplate is the VGPUClaim that this Job will materialize.
 	ClaimTemplate VGPUClaimTemplate `json:"claimTemplate"`
+
+	// PodTemplate, when set, makes the VGPUJob OWN its workload Pod: once the
+	// claim's slice is allocated, the controller creates a Pod from this template
+	// — stamping the claim-ref label+annotation the mutating webhook keys on, and
+	// an OwnerReference for cascade-delete — then mirrors the Pod's phase into the
+	// Job status. This is what makes `kubectl apply -f vgpujob.yaml` ALONE run a
+	// workload on a shared GPU (fully declarative).
+	//
+	// When omitted, the Job is a pure resource request (claim+slice only) and the
+	// caller creates the Pod — the original, back-compatible behavior. We use the
+	// native corev1.PodTemplateSpec so any Kubernetes-native tooling and the §17
+	// framework integrations work unchanged.
+	// +optional
+	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 }
 
 // VGPUJobStatus reports the observed state of a Job.
@@ -79,6 +101,17 @@ type VGPUJobStatus struct {
 
 	// ClaimRef is the name of the VGPUClaim this Job created (same namespace).
 	ClaimRef string `json:"claimRef,omitempty"`
+
+	// PodRef is the name of the workload Pod the controller created from
+	// podTemplate. Empty when the Job is a pure resource request (no podTemplate).
+	PodRef string `json:"podRef,omitempty"`
+
+	// NodeName is the node the slice (and therefore the workload Pod) landed on.
+	NodeName string `json:"nodeName,omitempty"`
+
+	// DeviceUUID is the physical GPU UUID the slice bound — the same card the
+	// Pod's container sees via the injected CDI device.
+	DeviceUUID string `json:"deviceUuid,omitempty"`
 
 	// Message is a human-readable explanation of the current phase.
 	Message string `json:"message,omitempty"`
@@ -139,6 +172,9 @@ func (j *VGPUJob) DeepCopyInto(out *VGPUJob) {
 	j.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
 	out.Spec = j.Spec
 	out.Spec.ClaimTemplate.Spec = j.Spec.ClaimTemplate.Spec
+	if j.Spec.PodTemplate != nil {
+		out.Spec.PodTemplate = j.Spec.PodTemplate.DeepCopy()
+	}
 	out.Status = j.Status
 	if j.Status.Conditions != nil {
 		out.Status.Conditions = make([]metav1.Condition, len(j.Status.Conditions))

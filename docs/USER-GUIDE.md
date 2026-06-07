@@ -10,18 +10,28 @@ A step-by-step manual for running your workloads on shared GPUs.
 
 ## 0. Before you start (one-time)
 
-You need access to a cluster where your platform team has installed vGPU, with
-`kubectl` configured. Make the `vgpu` command available:
+You do **not** need this repository or any build tools. You need exactly two
+things: `kubectl` access to a cluster where your platform team has already
+installed vGPU, and the single `vgpu` command.
 
 ```sh
-# point KUBECONFIG at your cluster (your platform team gives you this)
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# 1. point KUBECONFIG at your cluster (your platform team gives you this)
+export KUBECONFIG=/path/to/your/kubeconfig
 
-# install the vgpu command so you can type `vgpu` anywhere
-sudo ln -sf "$PWD/scripts/vgpu" /usr/local/bin/vgpu
+# 2. install the vgpu CLI — one file, no repo, no compiler
+curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
+  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
 
-vgpu --help          # confirm it works
+vgpu version         # confirm it works
+vgpu --help
 ```
+
+That's it. `vgpu` is a zero-dependency wrapper around `kubectl` — it talks to the
+cluster's API server exactly like `kubectl` does, so it needs nothing but a
+working `KUBECONFIG`.
+
+> **Already have the repo cloned?** You can skip the curl and just symlink the
+> script instead: `sudo ln -sf "$PWD/scripts/vgpu" /usr/local/bin/vgpu`.
 
 > On a real GPU cluster, add `--runtime-class nvidia` to every `submit`
 > (examples below already include it). On a local/test cluster, drop it.
@@ -50,14 +60,23 @@ What you'll see:
 
 ```
 submitted: my-job  (16.0 GiB VRAM, class=Training, tier=Guaranteed, ns=default)
-  VGPUJob/my-job  ->  VGPUClaim/my-job-claim  ->  VGPUSlice/my-job-claim-slice
-  waiting for the slice to be allocated...
-  slice allocated — creating the workload pod
-  Pod/my-job-workload created (GPU injected)
+  VGPUJob/my-job  ->  VGPUClaim/my-job-claim  ->  VGPUSlice/my-job-claim-slice  ->  Pod/my-job-workload  (all by the controller)
+  waiting up to 120s for the controller to place the workload...
+  workload pod created by the controller (phase=Pending)
   next:  vgpu status my-job
 ```
 
 Your workload now runs on a slice of a shared GPU.
+
+> **`vgpu` is just convenience.** The `VGPUJob` is the source of truth — the
+> controller owns the whole chain (claim → slice → **pod**). So this is exactly
+> equivalent and works with GitOps (Argo/Flux), no CLI required:
+>
+> ```sh
+> vgpu submit --name my-job --vram 16Gi --image my-model:latest \
+>   --runtime-class nvidia --dry-run > my-job.yaml   # render the VGPUJob
+> kubectl apply -f my-job.yaml                        # apply it directly
+> ```
 
 ---
 

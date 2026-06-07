@@ -5,11 +5,48 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
+  # Publish the standalone `vgpu` CLI so an ML engineer can install it with one
+  # curl — no repo checkout, no build. The script is a zero-dependency kubectl
+  # wrapper, so the release asset IS the whole client install.
+  publish-cli:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Stamp the tag into the vgpu CLI
+      run: |
+        install -m 0755 scripts/vgpu vgpu
+        sed -i "s/^VGPU_VERSION=.*/VGPU_VERSION=\"${GITHUB_REF_NAME}\"   # release build/" vgpu
+        ./vgpu version
+        sha256sum vgpu > vgpu.sha256
+    - name: Attach vgpu to the GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          vgpu
+          vgpu.sha256
+        generate_release_notes: true
+        body: |
+          ## Install the `vgpu` CLI — no repo checkout needed
+
+          ```sh
+          curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/download/${{ github.ref_name }}/vgpu \
+            -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+          vgpu version
+          ```
+
+          `vgpu` is a zero-dependency bash wrapper around `kubectl` — it needs only a
+          working `KUBECONFIG`, not this repository. The cluster control plane is
+          installed once by your platform team. See
+          [docs/USER-GUIDE.md](https://github.com/pranav2910/vgpu_scheduler/blob/main/docs/USER-GUIDE.md).
+
   docker-push:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Build and Push Scheduler Image
       run: |
         docker build -t pranav2910/vgpu-scheduler:${{ github.ref_name }} -f build/scheduler/Dockerfile .

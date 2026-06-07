@@ -17,6 +17,9 @@ VRAM="${VRAM:-16Gi}"
 SMI_IMAGE="${SMI_IMAGE:-nvidia/cuda:12.4.1-base-ubuntu22.04}"
 RUNTIME_CLASS="${RUNTIME_CLASS:-nvidia}"
 CLAIM="${NAME}-claim"; SLICE="${NAME}-claim-slice"; POD="${NAME}-workload"
+# Declarative proof set: a raw VGPUJob-with-podTemplate applied with kubectl (no CLI).
+DNAME="${NAME}decl"; DCLAIM="${DNAME}-claim"; DSLICE="${DCLAIM}-slice"; DPOD="${DNAME}-workload"
+case "$VRAM" in *Gi) DBYTES=$(( ${VRAM%Gi} * 1073741824 )) ;; *) DBYTES=17179869184 ;; esac
 
 C_GRN=$'\033[1;32m'; C_RED=$'\033[1;31m'; C_RST=$'\033[0m'
 PASS=0; FAIL=0
@@ -26,11 +29,13 @@ hdr() { echo; echo "── $* ──"; }
 
 cleanup() {
     hdr "cleanup"
-    kubectl delete pod "$POD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
-    for k in vgpuslice/"$SLICE" vgpuclaim/"$CLAIM" vgpujob/"$NAME" vgpuworkloadprofile/"$NAME"; do
+    kubectl delete pod "$POD" "$DPOD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
+    for k in vgpuslice/"$SLICE" vgpuclaim/"$CLAIM" vgpujob/"$NAME" vgpuworkloadprofile/"$NAME" \
+             vgpuslice/"$DSLICE" vgpuclaim/"$DCLAIM" vgpujob/"$DNAME" vgpuworkloadprofile/"$DNAME"; do
         kubectl patch "$k" -n "$NS" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
     done
-    kubectl delete vgpujob "$NAME" vgpuclaim "$CLAIM" vgpuslice "$SLICE" vgpuworkloadprofile "$NAME" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
+    kubectl delete vgpujob "$NAME" "$DNAME" vgpuclaim "$CLAIM" "$DCLAIM" vgpuslice "$SLICE" "$DSLICE" \
+        vgpuworkloadprofile "$NAME" "$DNAME" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
     echo "  demo objects deleted"
 }
 trap cleanup EXIT
@@ -77,7 +82,53 @@ poduuid=$(kubectl exec "$POD" -n "$NS" -- nvidia-smi --query-gpu=uuid --format=c
     && ok "pod GPU UUID == slice deviceUuid — full submit flow proven end to end" \
     || bad "pod GPU '$poduuid' != slice '$uuid'"
 
+# ── declarative proof: a RAW `kubectl apply -f` (no vgpu CLI) runs the pod ────
+# This is the "VGPUJob owns the Pod" guarantee: the Job alone is the workload.
+hdr "declarative: kubectl apply -f a VGPUJob with podTemplate (no CLI) runs the pod"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata: { name: ${DNAME}, namespace: ${NS} }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: ${DBYTES}
+      serviceTier: Guaranteed
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: ${RUNTIME_CLASS}
+      containers:
+      - name: workload
+        image: ${SMI_IMAGE}
+        command: ["bash","-c","nvidia-smi -L; sleep 3600"]
+        resources: {}
+EOF
+echo "  applied VGPUJob/${DNAME} (with podTemplate) — no CLI, no manual pod"
+dpodphase=""
+for i in $(seq 1 60); do
+    dpodphase=$(kubectl get pod "$DPOD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+    [[ "$dpodphase" == "Running" || "$dpodphase" == "Succeeded" ]] && break
+    [[ "$dpodphase" == "Failed" ]] && { kubectl logs "$DPOD" -n "$NS" 2>/dev/null | tail -5; break; }
+    sleep 5
+done
+dcp=$(kubectl get vgpuclaim "$DCLAIM" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+[[ -n "$dcp" ]] && ok "controller auto-created the Claim from the Job ($dcp)" || bad "no claim — controller didn't process the declarative Job"
+downer=$(kubectl get pod "$DPOD" -n "$NS" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
+[[ "$downer" == "VGPUJob" ]] && ok "Pod is OWNED by the VGPUJob (the CONTROLLER created it, not us)" || bad "pod not owned by VGPUJob (got '${downer:-<none>}')"
+duuid=$(kubectl get vgpuslice "$DSLICE" -n "$NS" -o jsonpath='{.status.deviceUuid}' 2>/dev/null)
+[[ "$duuid" == GPU-* && "$duuid" != GPU-MOCK* ]] && ok "declarative slice bound a REAL GPU ($duuid)" || bad "slice deviceUuid not a real GPU (got '${duuid:-<none>}')"
+[[ "$dpodphase" == "Running" || "$dpodphase" == "Succeeded" ]] && ok "pod auto-ran from a raw kubectl apply ($dpodphase)" || bad "declarative pod did not start (got '${dpodphase:-<none>}')"
+dpoduuid=$(kubectl exec "$DPOD" -n "$NS" -- nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d '\r' | head -1)
+[[ -n "$dpoduuid" && "$dpoduuid" == "$duuid" ]] \
+    && ok "nvidia-smi inside the declarative pod sees the slice's GPU — \`kubectl apply\` alone runs on a shared GPU" \
+    || bad "declarative pod GPU '$dpoduuid' != slice '$duuid'"
+dpc=$(kubectl get vgpujob "$DNAME" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="PodCreated")].status}' 2>/dev/null)
+[[ "$dpc" == "True" ]] && ok "VGPUJob carries PodCreated=True (explainability wedge)" || bad "VGPUJob missing PodCreated=True (got '${dpc:-<none>}')"
+
 hdr "summary"
 echo "  PASS=$PASS  FAIL=$FAIL"
-[[ $FAIL -eq 0 ]] && { echo; echo "${C_GRN}v0.8 — full submit flow proven on real hardware: one \`vgpu submit\` → pod runs on a shared GPU.${C_RST}"; exit 0; }
+[[ $FAIL -eq 0 ]] && { echo; echo "${C_GRN}v0.9 — VGPUJob owns the Pod: both \`vgpu submit\` AND a raw \`kubectl apply -f vgpujob.yaml\` run a workload on a shared GPU (fully declarative).${C_RST}"; exit 0; }
 echo; echo "${C_RED}validation had failures${C_RST}"; exit 1

@@ -45,6 +45,15 @@ NODE=$(kubectl -n "$NS" get pods -l app=vgpu-nodeagent -o jsonpath='{.items[0].s
 [[ -z "$NODE" ]] && die "no node agent pod — the base bootstrap may have failed"
 ok "node agent on $NODE"
 
+# ── 0b. ALWAYS (re)apply CRDs + RBAC, even when the base bootstrap was skipped
+#         (box already had the node agent). Otherwise re-running this script picks
+#         up new controller code but NOT new CRD fields (e.g. spec.podTemplate,
+#         which the API server would prune) or new RBAC (e.g. pods create/delete).
+say "sync CRDs + RBAC (idempotent — picks up schema/permission changes)"
+kubectl apply -f deployments/manifests/crds/ >/dev/null || die "applying CRDs failed"
+kubectl apply -f deployments/manifests/rbac/ >/dev/null || die "applying RBAC failed"
+ok "CRDs + RBAC applied"
+
 # ── 1. advertise the node's vGPU capacity (the scheduler schedules against this) ─
 say "advertise node vGPU capacity"
 total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')

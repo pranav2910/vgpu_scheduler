@@ -68,12 +68,25 @@ spec:
                           default: Guaranteed
                         jobRef:
                           type: string
+                # podTemplate, when set, makes the VGPUJob own its workload Pod:
+                # the controller creates a Pod from this template once the slice
+                # is allocated. It is a native corev1.PodTemplateSpec — we don't
+                # hand-write its (huge) schema, we preserve it as-is.
+                podTemplate:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
             status:
               type: object
               properties:
                 phase:
                   type: string
                 claimRef:
+                  type: string
+                podRef:
+                  type: string
+                nodeName:
+                  type: string
+                deviceUuid:
                   type: string
                 message:
                   type: string

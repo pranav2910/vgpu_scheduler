@@ -20,10 +20,12 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Webhook needs to read pods (for the mutating admission path).
+  # Pods: the webhook reads them (mutating admission path), and — for
+  # "VGPUJob owns the Pod" — the controller creates/deletes the workload Pod
+  # from a Job's podTemplate (cascade-delete is via OwnerReference).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

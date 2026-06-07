@@ -17,6 +17,7 @@ CLAIM_ANNOTATION="${GROUP}/claim-ref"
 RECOMMENDED_ANNOTATION="${GROUP}/recommended-vram-bytes"
 CLAIM_LABEL="vgpu-claim"
 NS_DEFAULT="default"
+VGPU_VERSION="dev"   # replaced with the git tag at release time (see .github/workflows/release.yaml)
 
 die()  { printf 'vgpu: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -72,6 +73,7 @@ USAGE:
   vgpu submit --name NAME --vram SIZE --image IMAGE [options]
   vgpu status  NAME [-n NAMESPACE]
   vgpu profile NAME [-n NAMESPACE]
+  vgpu version
 
 SUBMIT OPTIONS:
   --name NAME          workload name (required; becomes the VGPUJob name)
@@ -84,18 +86,19 @@ SUBMIT OPTIONS:
   --command 'CMD'      override container command (shell string)
   --node NODE          pin the pod to a node (demo/no-scheduler setups)
   --runtime-class RC   pod runtimeClassName (real GPU nodes: --runtime-class nvidia)
-  --wait SECONDS       how long to wait for slice allocation (default 120)
-  --no-wait            skip the wait (only safe once the slice is allocated)
-  --dry-run            print the manifests, do not apply
+  --wait SECONDS       how long to wait for the controller to place the pod (default 120)
+  --no-wait            return immediately after applying the VGPUJob
+  --dry-run            print the VGPUJob manifest, do not apply
 EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# submit: a VGPUJob ALONE schedules a slice but nothing ever runs on it. So we
-# also create the workload Pod (carrying the claim-ref annotation+label) that the
-# mutating webhook injects the GPU into. The webhook (failurePolicy=Fail) rejects
-# that pod until the slice has an allocationId, so submit is a 3-step sequence:
-# apply Job -> wait for slice allocation -> apply Pod.
+# submit: render ONE VGPUJob (claimTemplate + podTemplate) and apply it. The
+# controller OWNS the workload Pod — once the slice is allocated it creates the
+# Pod from podTemplate (stamping the claim-ref the mutating webhook injects the
+# GPU into). So `vgpu submit` and a hand-written `kubectl apply -f job.yaml` are
+# identical: the VGPUJob is the single source of truth. No separate pod, no
+# wait-then-apply dance — that all moved into the controller.
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_submit() {
     local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
@@ -128,29 +131,33 @@ cmd_submit() {
         || die "VRAM $vram ($bytes bytes) out of range (1 .. 85899345920 / 80Gi)"
 
     # Deterministic names mirror the controller exactly:
-    #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice
+    #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice -> pod=NAME-workload
     local claim="${name}-claim"
+    local slice="${claim}-slice"
+    local pod="${name}-workload"
 
     # Optional container command block (YAML), only emitted when overridden.
-    # JSON-escape the command so it is a valid YAML flow-sequence string (JSON is
-    # valid YAML). %q would emit shell escaping (backslashes), which is NOT valid YAML.
+    # JSON-escape so it is a valid YAML flow-sequence string (JSON is valid YAML);
+    # %q would emit shell escaping (backslashes), which is NOT valid YAML. Indented
+    # 8 spaces to sit under spec.podTemplate.spec.containers[].
     local cmd_block=""
     if [[ -n "$command_override" ]]; then
         local esc="${command_override//\\/\\\\}"   # backslash -> \\
         esc="${esc//\"/\\\"}"                       # double-quote -> \"
-        # Build with literal newlines (NOT $(...), which strips the trailing one
-        # and would merge 'args' into the next line).
-        cmd_block='    command: ["/bin/sh","-c"]'$'\n''    args: ["'"$esc"'"]'$'\n'
+        cmd_block='        command: ["/bin/sh","-c"]'$'\n''        args: ["'"$esc"'"]'$'\n'
     fi
-    # Optional nodeName (demo/no-scheduler clusters where slices need a hand-set node).
-    local node_block=""
-    [[ -n "$node" ]] && node_block="  nodeName: ${node}"$'\n'
-    # Optional runtimeClassName — required on real GPU nodes so the NVIDIA runtime
-    # acts on the injected device (e.g. --runtime-class nvidia). Omit on kind.
-    local rtc_block=""
-    [[ -n "$runtime_class" ]] && rtc_block="  runtimeClassName: ${runtime_class}"$'\n'
+    # Optional pod-spec fields, indented 6 spaces (under spec.podTemplate.spec).
+    # runtimeClassName is required on real GPU nodes so the NVIDIA runtime acts on
+    # the injected device (--runtime-class nvidia); omit on kind. nodeName pins the
+    # pod (demo/no-scheduler clusters).
+    local node_block="" rtc_block=""
+    [[ -n "$node" ]]          && node_block="      nodeName: ${node}"$'\n'
+    [[ -n "$runtime_class" ]] && rtc_block="      runtimeClassName: ${runtime_class}"$'\n'
 
-    local job_manifest pod_manifest
+    # ONE manifest: the VGPUJob now carries the podTemplate, so the controller
+    # owns the whole chain (claim -> slice -> pod). The controller stamps the
+    # claim-ref label+annotation on the pod itself, so we don't need them here.
+    local job_manifest
     job_manifest=$(cat <<EOF
 apiVersion: ${APIVERSION}
 kind: VGPUJob
@@ -164,67 +171,47 @@ spec:
     spec:
       requestedVramBytes: ${bytes}
       serviceTier: ${tier}
-EOF
-)
-    pod_manifest=$(cat <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${name}-workload
-  namespace: ${ns}
-  labels:
-    ${CLAIM_LABEL}: ${claim}
-  annotations:
-    ${CLAIM_ANNOTATION}: ${claim}
-spec:
-${node_block}${rtc_block}  restartPolicy: Never
-  containers:
-  - name: workload
-    image: ${image}
-${cmd_block}    resources: {}
+  podTemplate:
+    spec:
+      restartPolicy: Never
+${rtc_block}${node_block}      containers:
+      - name: workload
+        image: ${image}
+${cmd_block}        resources: {}
 EOF
 )
 
     if (( dry_run )); then
-        printf '%s\n---\n%s\n' "$job_manifest" "$pod_manifest"
+        printf '%s\n' "$job_manifest"
         return 0
     fi
 
-    # 1) Apply the Job. The controller materializes VGPUClaim/${claim}; the
-    #    scheduler then creates + binds VGPUSlice/${claim}-slice.
+    # Apply the single VGPUJob. The controller materializes VGPUClaim/${claim},
+    # the scheduler binds VGPUSlice/${slice}, and once it is allocated the
+    # controller creates Pod/${pod} (the mutating webhook injects the GPU).
     printf '%s\n' "$job_manifest" | kubectl apply -f - >/dev/null \
         || die "applying VGPUJob failed"
     printf 'submitted: %s  (%s VRAM, class=%s, tier=%s, ns=%s)\n' \
         "$name" "$(human "$bytes")" "$class" "$tier" "$ns"
-    printf '  VGPUJob/%s  ->  VGPUClaim/%s  ->  VGPUSlice/%s-slice\n' "$name" "$claim" "$claim"
+    printf '  VGPUJob/%s  ->  VGPUClaim/%s  ->  VGPUSlice/%s  ->  Pod/%s  (all by the controller)\n' \
+        "$name" "$claim" "$slice" "$pod"
 
-    # 2) The mutating webhook (failurePolicy=Fail) REJECTS the workload pod until
-    #    its slice carries an allocationId. So we must wait for allocation before
-    #    creating the pod — applying both at once races the scheduler and fails.
-    local slice="${claim}-slice"
     if (( wait_secs > 0 )); then
-        printf '  waiting up to %ss for the slice to be allocated...\n' "$wait_secs"
-        local waited=0 alloc=""
+        printf '  waiting up to %ss for the controller to place the workload...\n' "$wait_secs"
+        local waited=0 podphase=""
         while (( waited < wait_secs )); do
-            alloc="$(kget vgpuslice "$slice" "$ns" '{.status.allocationId}')"
-            [[ -n "$alloc" ]] && break
+            podphase="$(kget pod "$pod" "$ns" '{.status.phase}')"
+            [[ -n "$podphase" ]] && break
             sleep 3; waited=$((waited+3))
         done
-        if [[ -z "$alloc" ]]; then
+        if [[ -n "$podphase" ]]; then
+            printf '  workload pod created by the controller (phase=%s)\n' "$podphase"
+        else
             local sp; sp="$(kget vgpuslice "$slice" "$ns" '{.status.phase}')"
-            printf '  slice not allocated yet (phase=%s) after %ss.\n' "${sp:-<none>}" "$wait_secs" >&2
-            printf '  the Pod was NOT created (the webhook would reject it). Re-run once allocated,\n' >&2
-            printf '  or inspect:  vgpu status %s\n' "$name" >&2
-            exit 1
+            printf '  pod not created yet (slice phase=%s) after %ss — the controller\n' "${sp:-<none>}" "$wait_secs" >&2
+            printf '  creates it once the slice is allocated. Inspect:  vgpu status %s\n' "$name" >&2
         fi
-        printf '  slice allocated (alloc=%s) — creating the workload pod\n' "$alloc"
     fi
-
-    # 3) Apply the workload Pod. The webhook now resolves the slice and injects
-    #    the CDI device so the container actually gets the GPU partition.
-    printf '%s\n' "$pod_manifest" | kubectl apply -f - >/dev/null \
-        || die "applying workload Pod failed (is the slice allocated? try: vgpu status $name)"
-    printf '  Pod/%s-workload created (GPU injected by the webhook)\n' "$name"
     printf '  next:  vgpu status %s\n' "$name"
 }
 
@@ -339,6 +326,7 @@ case "$sub" in
     submit)        cmd_submit  "$@" ;;
     status)        cmd_status  "$@" ;;
     profile)       cmd_profile "$@" ;;
+    version|--version|-v) printf 'vgpu %s\n' "$VGPU_VERSION" ;;
     -h|--help|help) usage ;;
-    *)             die "unknown command '$sub' (try: submit, status, profile)" ;;
+    *)             die "unknown command '$sub' (try: submit, status, profile, version)" ;;
 esac
