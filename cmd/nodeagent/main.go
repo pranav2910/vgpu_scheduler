@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
@@ -55,6 +56,49 @@ func main() {
 		log.Fatalf("creating controller manager: %v", err)
 	}
 
+	// GPU provider + observation cadence — both monitor and full modes need these.
+	// A provider init failure (driver/lib/perms) degrades to a provider that
+	// reports the error each cycle; the agent stays up either way.
+	gpuProvider, gerr := gpu.NewProvider()
+	if gerr != nil {
+		log.Printf("[gpu] provider init failed (%v) — running in degraded observation mode", gerr)
+		gpuProvider = gpu.NewDegradedProvider(gerr)
+	}
+	// Observation/detection cadence. Default 30s; lower it (e.g. VGPU_OBSERVE_INTERVAL=2s)
+	// to accumulate observations faster.
+	observeInterval := 30 * time.Second
+	if v := os.Getenv("VGPU_OBSERVE_INTERVAL"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
+			observeInterval = d
+		}
+	}
+
+	// ── Monitor mode (read-only wedge) ───────────────────────────────────────
+	// The "GPU waste report" entry product: observe → attribute → export per-pod
+	// requested-vs-used VRAM beside ANY scheduler (KAI/Volcano/vanilla). NO
+	// allocation, CDI, webhook, eviction, or CRDs — it only emits metrics. Returns
+	// without wiring any of the scheduling/enforcement machinery below.
+	if os.Getenv("VGPU_MODE") == "monitor" {
+		var annKeys []string
+		if v := os.Getenv("VGPU_REQUEST_ANNOTATION_KEY"); v != "" {
+			for _, k := range strings.Split(v, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					annKeys = append(annKeys, k)
+				}
+			}
+		}
+		obs := nodeagent.NewMonitorObserver(ctrlMgr.GetAPIReader(), nodeName, gpuProvider, observeInterval, annKeys)
+		if err := ctrlMgr.Add(obs); err != nil {
+			log.Fatalf("adding monitor observer: %v", err)
+		}
+		log.Println("MONITOR MODE — read-only. No scheduling, no allocation, no CDI, no webhook, no eviction, no CRDs required.")
+		if err := ctrlMgr.Start(ctrl.SetupSignalHandler()); err != nil {
+			log.Fatalf("NodeAgent (monitor) crashed: %v", err)
+		}
+		return
+	}
+
+	// ── Full mode ────────────────────────────────────────────────────────────
 	// Build tag is the single source of truth for "is real hardware present":
 	// default build → mock allocator + fake GPU provider; -tags nvml → real both.
 	mock := !gpu.RealBuild
@@ -63,29 +107,11 @@ func main() {
 	// SAME client the reconciler uses — fixes the stale-read race.
 	mgr := nodeagent.NewManager(nodeName, ctrlMgr.GetClient(), mock)
 
-	// Phase 3.1: GPU hardware-truth observation. Read-only — discovers GPUs,
-	// reports VRAM/health via metrics, and surfaces drift. Never writes node
-	// capacity or enforces limits. A provider init failure (driver/lib/perms)
-	// degrades to a provider that reports the error each cycle; the agent stays
-	// up either way.
-	gpuProvider, gerr := gpu.NewProvider()
-	if gerr != nil {
-		log.Printf("[gpu] provider init failed (%v) — running in degraded observation mode", gerr)
-		gpuProvider = gpu.NewDegradedProvider(gerr)
-	}
 	// Optional: scheduler-assumed capacity for drift (no Node read / RBAC needed).
 	expectedVRAM := int64(0)
 	if v := os.Getenv("VGPU_EXPECTED_VRAM_BYTES"); v != "" {
 		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
 			expectedVRAM = n
-		}
-	}
-	// Observation/detection cadence. Default 30s; lower it (e.g. VGPU_OBSERVE_INTERVAL=2s)
-	// to accumulate runtime-feedback observations faster, e.g. for the 3.5 E2E.
-	observeInterval := 30 * time.Second
-	if v := os.Getenv("VGPU_OBSERVE_INTERVAL"); v != "" {
-		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
-			observeInterval = d
 		}
 	}
 	gpuCollector := gpu.NewCollector(gpuProvider, nodeName, observeInterval, expectedVRAM)

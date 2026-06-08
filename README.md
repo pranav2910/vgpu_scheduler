@@ -121,6 +121,7 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
+- [docs/monitor-mode.md](docs/monitor-mode.md) — **start here, zero-risk**: a read-only GPU **waste report** (`vgpu report`) you drop in beside *any* scheduler (KAI/Volcano/vanilla) — no scheduling, no mutation, no CRDs
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — **for ML engineers, in 5 minutes**: install the CLI, run a workload on a shared GPU, right-size it (copy-paste)
 - [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: the full manual — `vgpu submit / status / profile`, right-sizing, gang jobs, troubleshooting
 - [docs/INSTALL-H100.md](docs/INSTALL-H100.md) — **for platform/admins**: from-scratch control-plane install on a real GPU node (clone → `h100-control-plane.sh` → validate), with the before/after packing proof

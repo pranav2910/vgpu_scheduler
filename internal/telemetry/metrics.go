@@ -365,6 +365,36 @@ var (
 		Name: "vgpu_drift_events_total",
 		Help: "Times the self-healing engine detected state drift.",
 	})
+
+	// ── Monitor mode (read-only wedge) ────────────────────────────────────
+	// Emitted ONLY by VGPU_MODE=monitor: per-pod requested-vs-actually-used VRAM
+	// and per-GPU truth, attributing real usage to the owning pod (PID→cgroup→pod)
+	// beside ANY scheduler — no allocation, CDI, webhook, eviction, or CRDs.
+
+	MonitorPodRequestedVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_monitor_pod_requested_vram_bytes",
+		Help: "VRAM a pod requested (source: nvidia_gpu_limit|annotation|vgpu_claim|unknown).",
+	}, []string{"namespace", "pod", "node", "source"})
+
+	MonitorPodUsedVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_monitor_pod_used_vram_bytes",
+		Help: "VRAM a pod is actually using (NVML process-used, attributed PID→cgroup→pod).",
+	}, []string{"namespace", "pod", "node", "gpu_uuid"})
+
+	MonitorGPUTotalVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_monitor_gpu_total_vram_bytes",
+		Help: "Total VRAM of a physical GPU (monitor mode).",
+	}, []string{"node", "gpu_uuid"})
+
+	MonitorGPUUsedVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_monitor_gpu_used_vram_bytes",
+		Help: "Used VRAM of a physical GPU (monitor mode).",
+	}, []string{"node", "gpu_uuid"})
+
+	MonitorGPUFreeVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_monitor_gpu_free_vram_bytes",
+		Help: "Free VRAM of a physical GPU (monitor mode).",
+	}, []string{"node", "gpu_uuid"})
 )
 
 func init() {
@@ -401,5 +431,8 @@ func init() {
 		RecommendationAutoResizesTotal, RecommendationAutoResizeCappedTotal,
 		// data plane
 		HardwareAllocations, DriftEvents,
+		// monitor mode (read-only wedge)
+		MonitorPodRequestedVRAMBytes, MonitorPodUsedVRAMBytes,
+		MonitorGPUTotalVRAMBytes, MonitorGPUUsedVRAMBytes, MonitorGPUFreeVRAMBytes,
 	)
 }

@@ -1,0 +1,106 @@
+# vGPU monitor mode — the read-only "GPU waste report" wedge.
+#
+#   READ-ONLY. No scheduling. No pod mutation. No eviction. No CRDs.
+#   Runs ALONGSIDE Kubernetes, KAI, Volcano, Run:ai, or Slurm-on-K8s.
+#
+# It observes real per-GPU + per-process VRAM (NVML), attributes usage to the
+# owning pod (PID → cgroup → pod), reads each GPU pod's *requested* VRAM, and
+# exports per-pod requested-vs-used metrics. Turn the metrics into a report with:
+#
+#   vgpu report                          # scrapes these agents, prints the waste table
+#   vgpu report --price-per-gpu-hour 3   # estimate $ wasted/month
+#
+# Install (after building the -tags nvml node agent image on the cluster):
+#   kubectl apply -f deployments/monitor/monitor.yaml
+#
+# RBAC is intentionally minimal: list/watch Pods, nothing else. It cannot create,
+# delete, evict, or modify anything.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vgpu-monitor
+  labels: { app: vgpu-monitor }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vgpu-monitor
+  namespace: vgpu-monitor
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vgpu-monitor-readonly
+rules:
+  # The ONLY permission monitor mode needs: read pods (to map usage → pod and to
+  # read each pod's requested GPU memory). No write verbs anywhere.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vgpu-monitor-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vgpu-monitor-readonly
+subjects:
+  - kind: ServiceAccount
+    name: vgpu-monitor
+    namespace: vgpu-monitor
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vgpu-monitor
+  namespace: vgpu-monitor
+  labels: { app: vgpu-monitor }
+spec:
+  selector:
+    matchLabels: { app: vgpu-monitor }
+  template:
+    metadata:
+      labels: { app: vgpu-monitor }
+    spec:
+      serviceAccountName: vgpu-monitor
+      # hostPID lets the agent resolve a GPU process (host PID, from NVML) to its
+      # owning pod via /proc/<pid>/cgroup. Read-only.
+      hostPID: true
+      tolerations:
+        - operator: Exists   # run on tainted GPU nodes too
+      containers:
+        - name: monitor
+          image: vgpu-nodeagent:latest   # build with -tags nvml for real GPUs
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: VGPU_MODE
+              value: "monitor"            # ← read-only observe/attribute/report; no control plane
+            - name: VGPU_OBSERVE_INTERVAL
+              value: "30s"
+            # Match your scheduler's GPU-memory request annotation (comma-separated).
+            # Defaults already include common keys (gpu-memory, run.ai/gpu-memory, …).
+            # - name: VGPU_REQUEST_ANNOTATION_KEY
+            #   value: "run.ai/gpu-memory"
+            # Only used by the non-NVML (kind) image's fake GPU provider:
+            - name: VGPU_FAKE_GPU_MEM_BYTES
+              value: "85899345920"        # 80 GiB
+          ports:
+            - name: metrics
+              containerPort: 8083
+          securityContext:
+            privileged: true              # NVML access (read-only GPU telemetry)
+          volumeMounts:
+            - name: dev-dir
+              mountPath: /dev
+      volumes:
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory

@@ -80,6 +80,7 @@ USAGE:
   vgpu submit --name NAME --vram SIZE --image IMAGE [options]
   vgpu status  NAME [-n NAMESPACE]
   vgpu profile NAME [-n NAMESPACE]
+  vgpu report  [-n NAMESPACE] [--price-per-gpu-hour N]   # read-only GPU waste report (monitor mode)
   vgpu version
 
 SUBMIT OPTIONS:
@@ -373,13 +374,89 @@ cmd_profile() {
     fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# report: the read-only "GPU waste" report (the monitor-mode wedge). Scrapes the
+# monitor agents' vgpu_monitor_* metrics and prints per-pod requested-vs-used
+# VRAM, utilization, and an ESTIMATED $ waste/month. Reads metrics only — works
+# beside ANY scheduler (KAI/Volcano/vanilla); no CRDs, no mutation.
+# ─────────────────────────────────────────────────────────────────────────────
+report_scrape() { # namespace — scrape every monitor agent's :8083/metrics via API proxy
+    local ns="$1" pods p
+    pods="$(kubectl get pods -n "$ns" -l app=vgpu-monitor -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    [[ -n "$pods" ]] || die "no monitor agents (label app=vgpu-monitor) in namespace '$ns' — install: kubectl apply -f deployments/monitor/"
+    for p in $pods; do
+        kubectl get --raw "/api/v1/namespaces/${ns}/pods/${p}:8083/proxy/metrics" 2>/dev/null
+    done
+}
+
+cmd_report() {
+    local ns="vgpu-monitor" price="3.00" metrics_file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace)        ns="$2"; shift 2 ;;
+            --price-per-gpu-hour)  price="$2"; shift 2 ;;
+            --metrics-file)        metrics_file="$2"; shift 2 ;;  # read metrics from a file (testing)
+            -h|--help)             usage; exit 0 ;;
+            *)                     die "unknown report flag: $1" ;;
+        esac
+    done
+
+    local metrics
+    if [[ -n "$metrics_file" ]]; then
+        [[ -f "$metrics_file" ]] || die "metrics file not found: $metrics_file"
+        metrics="$(grep '^vgpu_monitor_' "$metrics_file" || true)"
+    else
+        need_kubectl
+        metrics="$(report_scrape "$ns" | grep '^vgpu_monitor_' || true)"
+    fi
+    [[ -n "$metrics" ]] || die "no vgpu_monitor_* metrics found (is the monitor DaemonSet installed in ns '$ns'? see docs/monitor-mode.md)"
+
+    printf '%s\n' "$metrics" | awk -v price="$price" '
+        function lbl(line, name,   re, m) {
+            re = name "=\"[^\"]*\""
+            if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub(name "=\"", "", m); sub("\"$", "", m); return m }
+            return ""
+        }
+        function val(line,   n) { n = line; sub(/^[^ ]+ /, "", n); return n + 0 }
+        function gib(b) { return sprintf("%.1f", b / 1073741824) }
+        /^vgpu_monitor_pod_requested_vram_bytes\{/ { k = lbl($0,"namespace") "/" lbl($0,"pod"); req[k] = val($0); src[k] = lbl($0,"source"); seen[k] = 1 }
+        /^vgpu_monitor_pod_used_vram_bytes\{/      { k = lbl($0,"namespace") "/" lbl($0,"pod"); used[k] += val($0); seen[k] = 1 }
+        /^vgpu_monitor_gpu_total_vram_bytes\{/     { v = val($0); gtotal += v; if (v > card) card = v }
+        END {
+            print ""
+            print "Cluster GPU Waste Report  (read-only — no scheduling, no mutation, no eviction)"
+            print ""
+            printf "  %-26s %12s %12s %12s %6s  %s\n", "WORKLOAD (ns/pod)", "REQUESTED", "USED", "WASTE", "UTIL", "SOURCE"
+            n = 0
+            for (k in seen) {
+                r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                ut = (r > 0) ? (u * 100.0 / r) : 0
+                treq += r; tused += u; twaste += w; n++
+                printf "  %-26s %9s GiB %9s GiB %9s GiB %5.0f%%  %s\n", k, gib(r), gib(u), gib(w), ut, (src[k] == "" ? "unknown" : src[k])
+            }
+            if (n == 0) print "  (no GPU workloads observed yet)"
+            ut = (treq > 0) ? (tused * 100.0 / treq) : 0
+            cards = (card > 0) ? (twaste / card) : 0
+            permo = cards * price * 730.0
+            print ""
+            printf "  GPU memory requested:     %s GiB\n", gib(treq)
+            printf "  GPU memory actually used: %s GiB\n", gib(tused)
+            printf "  Estimated waste:          %s GiB\n", gib(twaste)
+            printf "  Utilization:              %.1f%%\n", ut
+            printf "  Estimated waste/month:    $%.0f   (at $%.2f/GPU-hr, ~%.2f cards idle)\n", permo, price, cards
+            print ""
+            print "  Estimated, not guaranteed savings. Read-only; runs alongside Kubernetes, KAI, Volcano, or Slurm-on-K8s."
+        }'
+}
+
 [[ $# -ge 1 ]] || { usage; exit 1; }
 sub="$1"; shift
 case "$sub" in
     submit)        cmd_submit  "$@" ;;
     status)        cmd_status  "$@" ;;
     profile)       cmd_profile "$@" ;;
+    report)        cmd_report  "$@" ;;
     version|--version|-v) printf 'vgpu %s\n' "$VGPU_VERSION" ;;
     -h|--help|help) usage ;;
-    *)             die "unknown command '$sub' (try: submit, status, profile, version)" ;;
+    *)             die "unknown command '$sub' (try: submit, status, profile, report, version)" ;;
 esac
