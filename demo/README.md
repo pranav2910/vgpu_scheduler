@@ -12,6 +12,7 @@ this scheduler packs many workloads onto one card.
 | `03-before-plain-gpu-pods.yaml` | **before**: 4 plain pods each demanding a whole `nvidia.com/gpu` |
 | `04-after-vgpujobs-packed.yaml` | **after**: the same 4 workloads as VGPUJobs, 16 GiB each |
 | `h100-before-after.sh` | **on a real GPU**: the same before/after, auto-sized to the card (runs the packing live + reports utilization) |
+| `autoresize-demo.sh` | **self-correction (3.7b)**: submit under-provisioned → the platform auto-raises the request to the learned recommendation (kind or real GPU) |
 
 Submit workloads with the [`vgpu` CLI](../scripts/vgpu) (`vgpu submit/status/profile`)
 or raw `kubectl apply` as below.

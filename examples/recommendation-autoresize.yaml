@@ -1,0 +1,67 @@
+# autoResize (Phase 3.7b), by example: under-request → auto-corrected → scheduled safely.
+#
+# Story: this workload was profiled (peak ~21.5 GiB → recommends ~24.7 GiB). On a
+# cluster in `autoResize` mode, submitting it with only 16 GiB doesn't get rejected
+# — the platform RAISES the request to the recommendation at admission, before the
+# claim/slice are created, so the workload is scheduled with enough memory. The
+# change is fully audited.
+#
+# Full guide: docs/recommendation-policy.md
+#
+# ── 1. Admin: turn on autoResize (one-time) ──────────────────────────────────
+#
+#   kubectl set env deployment/vgpu-controller -n vgpu-system \
+#     VGPU_RECOMMENDATION_MODE=autoResize
+#
+#   Safety: only acts at Medium+ confidence; never shrinks; caps at fleet max;
+#   honors the override annotation; fail-open (failurePolicy: Ignore).
+#
+# ── 2. User submits UNDER-provisioned (16 GiB) ───────────────────────────────
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: llama-infer
+  namespace: default
+spec:
+  priority: 50
+  workloadClass: Inference
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB — below the ~24.7 GiB recommendation
+      serviceTier: Guaranteed
+  podTemplate:
+    spec:
+      runtimeClassName: nvidia
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: my-model:latest
+          command: ["python", "serve.py"]
+#
+# ── 3. What you get back (the mutating webhook raised it) ─────────────────────
+#
+#   $ kubectl get vgpujob llama-infer -o yaml
+#   metadata:
+#     annotations:
+#       infrastructure.pranav2910.com/original-vram-bytes:    "17179869184"  # 16 GiB (asked)
+#       infrastructure.pranav2910.com/autoresized-vram-bytes: "26534109184"  # ~24.7 GiB (got)
+#       infrastructure.pranav2910.com/autoresized: "true"
+#   spec:
+#     claimTemplate:
+#       spec:
+#         requestedVramBytes: 26534109184   # <- raised before the claim/slice were made
+#   status:
+#     conditions:
+#       - type: AutoResized
+#         status: "True"
+#         reason: RaisedToRecommendation
+#         message: "Auto-resized VRAM request 16384 MiB -> 25305 MiB ..."
+#
+#   $ vgpu status llama-infer
+#     ...
+#     ^ auto-resized 16.0 GiB -> 24.7 GiB  (policy raised your request to the recommendation)
+#
+# ── Opt out: keep your own size even under autoResize ─────────────────────────
+#   Add annotation infrastructure.pranav2910.com/override-recommendation: "true"
+#   (or `vgpu submit ... --override`) and the request is left exactly as you set it.

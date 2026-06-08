@@ -153,4 +153,8 @@ bash scripts/validate-recommendation-3.7-kind.sh   # 5/5: all modes incl. the Lo
 ```
 
 See also: [runtime-feedback.md](runtime-feedback.md) (how the recommendation is
-learned) and [examples/recommendation-require-override.yaml](../examples/recommendation-require-override.yaml).
+learned); examples
+[recommendation-require-override.yaml](../examples/recommendation-require-override.yaml)
+and [recommendation-autoresize.yaml](../examples/recommendation-autoresize.yaml); and
+the runnable [demo/autoresize-demo.sh](../demo/autoresize-demo.sh) (under-request →
+auto-corrected → scheduled, on kind or a real GPU).

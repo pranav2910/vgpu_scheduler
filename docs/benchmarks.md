@@ -114,6 +114,29 @@ This is the loop nothing else in open-source GPU sharing closes: **observe → a
 → learn → recommend.** Static slicing (MIG) and time-slicing give you a fixed slice and
 no idea whether it was the right size.
 
+### Result 3b — acting on the recommendation (enforcement → self-correction)
+
+The recommendation isn't just advice — `VGPU_RECOMMENDATION_MODE` turns it into policy:
+
+| mode | what happens to an under-provisioned request |
+|---|---|
+| `recommendOnly` *(default)* | flagged (condition + metric), admitted |
+| `warn` | flagged + a Warning event, admitted |
+| `requireOverride` | **rejected** unless it carries the override annotation |
+| `autoResize` | **automatically raised** to the recommendation at admission (capped at fleet max) |
+
+So the platform moves from *"observe → recommend → user decides"* to *"observe →
+recommend → **safely auto-correct the next request**"* — the under-sized 16 GiB job
+above is admitted **as 24.7 GiB**, before the slice is even created, with an audit
+trail (`original-vram-bytes` / `autoresized-vram-bytes` annotations + an `AutoResized`
+condition + event). Safety is built in and **validated**: it acts only at `Medium`+
+confidence, never shrinks an over-provisioned request, caps at a single card's
+capacity (distinct `AutoResizeCapped` signal), honors an explicit override, and is
+**fail-open** (a webhook outage never blocks submission). Proven on kind:
+`validate-recommendation-3.7-kind.sh` (enforcement, 5/5) and
+`validate-recommendation-3.7b-kind.sh` (autoResize raise/override/Low/capped + audit,
+11/11), plus unit tests of the full decision matrix.
+
 ---
 
 ## Result 4 — Correctness & resilience (14-test adversarial battery)
