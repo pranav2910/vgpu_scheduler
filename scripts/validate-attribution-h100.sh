@@ -39,7 +39,7 @@ command -v nvidia-smi >/dev/null 2>&1 || { echo "nvidia-smi not found — run on
 kubectl -n "$SYS_NS" get deploy vgpu-controller >/dev/null 2>&1 \
     || { echo "control plane not deployed — run scripts/h100-control-plane.sh first"; exit 2; }
 
-JOBS="attrib1 attribA attribB"
+JOBS="attrib1 attrib-a attrib-b"
 cleanup() {
     hdr "cleanup"
     for j in $JOBS; do kubectl delete vgpujob "$j" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1; done
@@ -63,7 +63,9 @@ workload_cmd() { # target_gib
 
 submit_job() { # name target_gib request_gi
     scripts/vgpu submit --name "$1" --vram "$3" -n "$NS" --image "$IMAGE" \
-        --command "$(workload_cmd "$2")" --runtime-class "$RUNTIME_CLASS" --wait 240 >/dev/null 2>&1
+        --command "$(workload_cmd "$2")" --runtime-class "$RUNTIME_CLASS" --wait 240 >"/tmp/submit-$1.log" 2>&1
+    kubectl get vgpujob "$1" -n "$NS" >/dev/null 2>&1 \
+        || { bad "submit of $1 FAILED (job not created): $(tail -1 "/tmp/submit-$1.log" 2>/dev/null)"; return 1; }
 }
 
 wait_running() { # name -> sets PODPHASE
@@ -151,11 +153,11 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 hdr "B. two jobs on ONE GPU — do you give each its OWN number (not swapped/merged)?"
 note "submitting A≈10 GiB and B≈30 GiB on the same card…"
-submit_job attribA 10 14Gi
-submit_job attribB 30 34Gi
-wait_running attribA; wait_running attribB
-PA=$(wait_for_profile_peak attribA); PB=$(wait_for_profile_peak attribB)
-RA=$(gt_reserved_mib attribA);       RB=$(gt_reserved_mib attribB)
+submit_job attrib-a 10 14Gi
+submit_job attrib-b 30 34Gi
+wait_running attrib-a; wait_running attrib-b
+PA=$(wait_for_profile_peak attrib-a); PB=$(wait_for_profile_peak attrib-b)
+RA=$(gt_reserved_mib attrib-a);       RB=$(gt_reserved_mib attrib-b)
 
 echo
 note "job A: PyTorch reserved ${RA:-?} MiB   ·   YOUR tool ${PA:-?} MiB"
