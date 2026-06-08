@@ -14,6 +14,7 @@ On top of scheduling sits a hardware-validated **runtime-intelligence stack**:
 detect VRAM over-use → attribute it to the exact workload → warn → opt-in evict →
 **learn each workload's real footprint and recommend a right-sized grant**.
 
+**→ [docs/one-pager.md](docs/one-pager.md)** is the 2-minute business brief (problem · proof · who it's for).
 **→ [DEMO.md](DEMO.md)** walks the whole thing end to end (kind, then one real GPU).
 **→ [docs/architecture.md](docs/architecture.md)** is the one-page system map.
 
