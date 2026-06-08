@@ -32,3 +32,24 @@ webhooks:
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values: ["kube-system", "vgpu-system"]
+  # Phase 3.7b — autoResize. Raises an under-provisioned VGPUJob's requested VRAM
+  # to its learned recommendation at CREATE, but ONLY in autoResize mode (a no-op
+  # otherwise). failurePolicy: Ignore — like 3.7a's validator, this is policy, not
+  # data integrity: a webhook outage must never block job submission, it just
+  # skips the resize (the job runs at the user's size).
+  - name: mvgpujob.vgpu.pranav2910.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    reinvocationPolicy: Never
+    clientConfig:
+      service:
+        name: vgpu-controller-webhook
+        namespace: vgpu-system
+        path: /mutate-infrastructure-pranav2910-com-v1alpha1-vgpujob
+      caBundle: ""  # cert-manager fills this in
+    rules:
+      - apiGroups: ["infrastructure.pranav2910.com"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["vgpujobs"]

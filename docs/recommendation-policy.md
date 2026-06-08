@@ -16,11 +16,12 @@ explicit override.
 Set `VGPU_RECOMMENDATION_MODE` on the **controller** deployment. Default is
 `recommendOnly` (nothing is ever blocked).
 
-| mode | condition + annotation + metric | Warning event | admission |
+| mode | condition + annotation + metric | event | admission |
 |---|---|---|---|
 | `recommendOnly` *(default)* | ✓ | — | always allowed |
-| `warn` | ✓ | ✓ | always allowed |
-| `requireOverride` | ✓ | ✓ | **rejected unless the job has the override annotation** |
+| `warn` | ✓ | Warning | always allowed |
+| `requireOverride` | ✓ | Warning | **rejected unless the job has the override annotation** |
+| `autoResize` | `AutoResized` condition | Normal | allowed; **request raised to the recommendation** (capped at fleet max) |
 
 ```sh
 # enable requireOverride (e.g. for a cost-sensitive shared cluster)
@@ -47,6 +48,35 @@ kubectl set env deployment/vgpu-controller -n vgpu-system VGPU_RECOMMENDATION_MO
   **not** built.
 
 ---
+
+### `autoResize` (3.7b) — automatic right-sizing
+
+`autoResize` goes one step past advising: a **mutating webhook raises** an
+under-provisioned request up to the recommendation **at CREATE**, before the claim
+and slice are made — so the whole scheduling chain sees one consistent, right-sized
+request. It is the most automated mode, so it is built to never surprise:
+
+- **Never silent.** Every resize stamps the job and surfaces an `AutoResized`
+  condition + a Normal event. You can read both numbers straight off the object:
+  ```yaml
+  metadata:
+    annotations:
+      infrastructure.pranav2910.com/original-vram-bytes:   "17179869184"  # what you asked for
+      infrastructure.pranav2910.com/autoresized-vram-bytes: "24000000000" # what it became
+      infrastructure.pranav2910.com/autoresized: "true"
+  ```
+- **Never shrinks.** It only raises. An over-provisioned request is left alone
+  (shrinking could starve a workload that legitimately spikes above its observed peak).
+- **Capped at fleet max.** If the recommendation exceeds a single card, the request
+  is clamped to fleet max and a distinct `AutoResizeCapped` condition + event fire
+  (*"Profile recommended 96Gi, capped to fleet max 80Gi — workload may need a larger
+  GPU class or model parallelism"*).
+- **Override and safety still apply.** `--override` (the annotation) opts out; only
+  `Medium`+ confidence; fail-open; CREATE-only.
+
+```sh
+kubectl set env deployment/vgpu-controller -n vgpu-system VGPU_RECOMMENDATION_MODE=autoResize
+```
 
 ## For ML engineers — what you see and how to override
 

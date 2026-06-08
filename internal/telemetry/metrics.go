@@ -340,6 +340,20 @@ var (
 		Help: "Under-provisioned VGPUJob CREATE requests admitted via the override annotation.",
 	}, []string{"namespace"})
 
+	// RecommendationAutoResizesTotal counts VGPUJob CREATE requests whose VRAM was
+	// raised to the recommendation by autoResize (3.7b).
+	RecommendationAutoResizesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_recommendation_autoresizes_total",
+		Help: "VGPUJob CREATE requests auto-resized up to the profile recommendation.",
+	}, []string{"namespace"})
+
+	// RecommendationAutoResizeCappedTotal counts autoResize events that were clamped
+	// at fleet max (recommendation exceeded a single card).
+	RecommendationAutoResizeCappedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "vgpu_recommendation_autoresize_capped_total",
+		Help: "Auto-resizes clamped at fleet max (recommendation exceeded a single GPU).",
+	}, []string{"namespace"})
+
 	// ── Data plane (node agent) ───────────────────────────────────────────
 
 	HardwareAllocations = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -382,8 +396,9 @@ func init() {
 		// runtime feedback / behavior profiles (3.5) + soft advisory (3.6)
 		WorkloadPeakObservedVRAMBytes, WorkloadRecommendedVRAMBytes, WorkloadProfileConfidence,
 		WorkloadUnderprovisioned,
-		// recommendation enforcement (3.7)
+		// recommendation enforcement (3.7) + autoResize (3.7b)
 		RecommendationMode, RecommendationRejectionsTotal, RecommendationOverridesTotal,
+		RecommendationAutoResizesTotal, RecommendationAutoResizeCappedTotal,
 		// data plane
 		HardwareAllocations, DriftEvents,
 	)

@@ -115,11 +115,12 @@ run workload → NVML sees real peak → slice stats → profile recommends →
 3.6 only *advises*. 3.7 lets an operator make the recommendation a **future-request
 policy**, selected by `VGPU_RECOMMENDATION_MODE` on the controller:
 
-| mode | condition + annotation + metric | Warning event | admission |
+| mode | condition + annotation + metric | event | admission |
 |---|---|---|---|
 | `recommendOnly` *(default)* | ✓ | — | allow |
-| `warn` | ✓ | ✓ | allow |
-| `requireOverride` | ✓ | ✓ | **reject CREATE unless overridden** |
+| `warn` | ✓ | Warning | allow |
+| `requireOverride` | ✓ | Warning | **reject CREATE unless overridden** |
+| `autoResize` (3.7b) | `AutoResized` cond | Normal | allow; **request raised to the recommendation** (capped at fleet max) |
 
 `requireOverride` is enforced by a **VGPUJob validating webhook**: it rejects the
 CREATE of a job whose `requestedVramBytes` is below its profile's
@@ -147,10 +148,18 @@ The controller then stamps the `Underprovisioned` condition with reason
 explicit choice). `autoResize` (mutate the request up) and a hard `block` (no
 override path) are intentionally **not** built yet.
 
+`autoResize` (3.7b) goes further: a **mutating** VGPUJob webhook raises an
+under-provisioned request to the recommendation at CREATE (capped at fleet max),
+stamping audit annotations (`original-vram-bytes`, `autoresized-vram-bytes`) that
+the controller turns into an `AutoResized` / `AutoResizeCapped` condition + event.
+It never shrinks, never overrides an override, and is fail-open. See
+[recommendation-policy.md](recommendation-policy.md).
+
 Validate on kind (no GPU — this is admission logic):
-`scripts/validate-recommendation-3.7-kind.sh` exercises all three modes incl. the
-reject, the override, and the Low-confidence safety gate (5/5). The decision matrix
-and fail-open are also unit-tested (`internal/recommendation`, `internal/webhook`).
+`scripts/validate-recommendation-3.7-kind.sh` exercises the reject/override/
+Low-confidence gate (5/5); `scripts/validate-recommendation-3.7b-kind.sh` exercises
+autoResize raise/override/Low/capped + audit (11/11). The decision matrices and
+fail-open are also unit-tested (`internal/recommendation`, `internal/webhook`).
 
 ## Deployment & validation
 

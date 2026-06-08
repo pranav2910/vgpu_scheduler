@@ -67,18 +67,17 @@ EOF
         -p "{\"status\":{\"recommendedVramBytes\":${REC},\"peakObservedVramBytes\":${REC},\"confidence\":\"$2\",\"observations\":150}}" >/dev/null 2>&1
 }
 
-# apply a VGPUJob; echo "ADMITTED" or "REJECTED".
+# apply a VGPUJob; echo "ADMITTED" / "REJECTED" / "ERROR:<msg>".
 apply_job() { # name override(true/false)
-    local ann=""
-    [[ "$2" == "true" ]] && ann=$'\n'"    ${GROUP}/override-recommendation: \"true\""
+    local meta_ann=""
+    [[ "$2" == "true" ]] && meta_ann=$'\n'"  annotations:"$'\n'"    ${GROUP}/override-recommendation: \"true\""
     local out
     out=$(cat <<EOF | kubectl apply -f - 2>&1
 apiVersion: ${GROUP}/v1alpha1
 kind: VGPUJob
 metadata:
   name: $1
-  namespace: $NS
-  annotations: {}${ann}
+  namespace: $NS${meta_ann}
 spec:
   priority: 50
   claimTemplate:
@@ -87,7 +86,10 @@ spec:
       serviceTier: Guaranteed
 EOF
 )
-    if echo "$out" | grep -q "denied"; then echo "REJECTED"; else echo "ADMITTED"; fi
+    if echo "$out" | grep -qi "denied"; then echo "REJECTED"; return; fi
+    # Robust: confirm the object actually exists rather than assuming "not denied" = admitted
+    # (a malformed apply must not masquerade as ADMITTED).
+    if kubectl get vgpujob "$1" -n "$NS" >/dev/null 2>&1; then echo "ADMITTED"; else echo "ERROR:$(echo "$out" | tail -1)"; fi
 }
 
 set_mode() { # mode

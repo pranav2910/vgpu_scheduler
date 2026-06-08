@@ -148,12 +148,15 @@ under-provisioned request can be required to carry an explicit override (3.7a).
 All hardware-validated on an A10 **and a 1× H100**; defaults stay non-destructive
 (`softwarn`, `recommendOnly`).
 
-**Recommendation enforcement (3.7a)** is done: `VGPU_RECOMMENDATION_MODE` =
-`recommendOnly` (default) · `warn` · `requireOverride`. Only `requireOverride`
-rejects, only at **Medium+** confidence, only without the
-`…/override-recommendation` annotation, and its webhook is **fail-open**
-(see [docs/runtime-feedback.md](docs/runtime-feedback.md)). Next frontier:
-**3.7b `autoResize` / `block`** modes. True per-process VRAM isolation today is
+**Recommendation enforcement (3.7a/b)** is done: `VGPU_RECOMMENDATION_MODE` =
+`recommendOnly` (default) · `warn` · `requireOverride` · **`autoResize`**.
+`requireOverride` rejects an under-provisioned request unless overridden;
+`autoResize` instead **raises** it to the recommendation at CREATE (mutating
+webhook, capped at fleet max, fully audited via `AutoResized` condition + event,
+never shrinks). Both act only at **Medium+** confidence, honor the
+`…/override-recommendation` annotation, and are **fail-open**
+(see [docs/recommendation-policy.md](docs/recommendation-policy.md)). Next frontier:
+a hard `block` mode and **auto-shrink** of over-provisioned requests. True per-process VRAM isolation today is
 soft (record + evict); **MIG-backed hard partitioning** (3.4e), multi-GPU-per-node, federation,
 and a managed SaaS layer are deferred.
 

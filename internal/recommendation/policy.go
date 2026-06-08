@@ -23,27 +23,47 @@ const (
 	// under-provisioned Job unless it carries the override annotation. Only ever
 	// blocks at Medium+ confidence — never on a thin (Low) profile.
 	RequireOverride Mode = "requireOverride"
+	// AutoResize (3.7b): instead of warning/blocking, a mutating webhook RAISES an
+	// under-provisioned request up to the recommendation (capped at fleet max) at
+	// CREATE — transparently (audit annotations + condition + event). Only at
+	// Medium+ confidence, never when overridden, and it NEVER lowers a request.
+	AutoResize Mode = "autoResize"
 )
 
-// OverrideAnnotation, set to "true" on a VGPUJob, admits an under-provisioned
-// request even in requireOverride mode (an explicit "I know, run it anyway").
-const OverrideAnnotation = "infrastructure.pranav2910.com/override-recommendation"
+const (
+	// OverrideAnnotation, set to "true" on a VGPUJob, opts out of enforcement — it
+	// admits an under-provisioned request in requireOverride mode AND suppresses
+	// autoResize (an explicit "I know, run it at my size").
+	OverrideAnnotation = "infrastructure.pranav2910.com/override-recommendation"
+	// Audit annotations stamped by the autoResize mutating webhook (3.7b) so a
+	// resize is never silent — the user can read both numbers off the object.
+	OriginalVRAMAnnotation    = "infrastructure.pranav2910.com/original-vram-bytes"
+	AutoResizedVRAMAnnotation = "infrastructure.pranav2910.com/autoresized-vram-bytes"
+	AutoResizedAnnotation     = "infrastructure.pranav2910.com/autoresized"      // "true" marker for the controller
+	AutoResizeCappedAnnotation = "infrastructure.pranav2910.com/autoresize-capped" // value = the uncapped recommendation
+)
 
 // TolerancePercent: a request within this percentage of the recommendation is
 // treated as adequately sized (no advisory, no block) — avoids nagging on rounding.
 const TolerancePercent = 10
 
+// FleetMaxBytes caps an autoResize: a recommendation above a single card's
+// capacity is clamped here (matches the VGPUClaim validator's bound). A capped
+// resize is flagged so the user learns the workload may need a larger GPU class
+// or model parallelism.
+const FleetMaxBytes int64 = 85_899_345_920 // 80 GiB
+
 // ParseMode maps an env value to a Mode, defaulting to RecommendOnly (the least
 // intrusive mode) and warning on an unrecognized value — fail-safe by construction.
 func ParseMode(s string) Mode {
 	switch Mode(s) {
-	case RecommendOnly, Warn, RequireOverride:
+	case RecommendOnly, Warn, RequireOverride, AutoResize:
 		return Mode(s)
 	case "":
 		return RecommendOnly
 	default:
 		log.Printf("[recommendation] %q is not a valid VGPU_RECOMMENDATION_MODE "+
-			"(want recommendOnly|warn|requireOverride) — using recommendOnly", s)
+			"(want recommendOnly|warn|requireOverride|autoResize) — using recommendOnly", s)
 		return RecommendOnly
 	}
 }
@@ -80,4 +100,27 @@ func Blocks(mode Mode, requested, recommended int64, conf vgpuv1alpha1.ProfileCo
 		ConfidentEnough(conf) &&
 		Undersized(requested, recommended) &&
 		!hasOverride
+}
+
+// ResizeTarget decides whether autoResize should RAISE `requested`, and to what.
+// It returns the new request, whether a resize happens, and whether the
+// recommendation was capped at `fleetMax`. Invariants:
+//   - never resizes when overridden, on a Low-confidence profile, or when the
+//     request is already adequate (within tolerance);
+//   - NEVER lowers a request — if the (possibly capped) target is ≤ requested it
+//     is a no-op (e.g. an over-provisioned request, or one already at fleet max);
+//   - clamps to fleetMax and reports capped=true when the recommendation exceeds it.
+func ResizeTarget(requested, recommended, fleetMax int64, conf vgpuv1alpha1.ProfileConfidence, hasOverride bool) (newReq int64, resized, capped bool) {
+	if hasOverride || !ConfidentEnough(conf) || !Undersized(requested, recommended) {
+		return requested, false, false
+	}
+	target := recommended
+	if fleetMax > 0 && target > fleetMax {
+		target = fleetMax
+		capped = true
+	}
+	if target <= requested {
+		return requested, false, false // never lower; capping pulled it to/below the request
+	}
+	return target, true, capped
 }

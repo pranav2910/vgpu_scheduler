@@ -81,3 +81,41 @@ func TestBlocks(t *testing.T) {
 		t.Error("an adequately-sized request must never be blocked")
 	}
 }
+
+func TestResizeTarget(t *testing.T) {
+	const fleet = int64(85_899_345_920) // 80 GiB
+	hi := vgpuv1alpha1.ProfileConfidenceHigh
+	lo := vgpuv1alpha1.ProfileConfidenceLow
+
+	cases := []struct {
+		name        string
+		requested   int64
+		recommended int64
+		conf        vgpuv1alpha1.ProfileConfidence
+		hasOverride bool
+		wantNew     int64
+		wantResized bool
+		wantCapped  bool
+	}{
+		{"undersized + High → raise to recommended", 16e9, 24e9, hi, false, 24e9, true, false},
+		{"Low confidence → no resize (safety gate)", 16e9, 24e9, lo, false, 16e9, false, false},
+		{"override → no resize", 16e9, 24e9, hi, true, 16e9, false, false},
+		{"adequate (within tolerance) → no resize", 23e9, 24e9, hi, false, 23e9, false, false},
+		{"over-provisioned → NEVER shrink", 40e9, 24e9, hi, false, 40e9, false, false},
+		{"recommended > fleet max → cap + flag", 16e9, 96e9, hi, false, fleet, true, true},
+		{"already at fleet max → no resize even if rec higher", fleet, 96e9, hi, false, fleet, false, false},
+	}
+	for _, c := range cases {
+		gotNew, gotResized, gotCapped := ResizeTarget(c.requested, c.recommended, fleet, c.conf, c.hasOverride)
+		if gotNew != c.wantNew || gotResized != c.wantResized || gotCapped != c.wantCapped {
+			t.Errorf("%s: got (new=%d resized=%v capped=%v), want (new=%d resized=%v capped=%v)",
+				c.name, gotNew, gotResized, gotCapped, c.wantNew, c.wantResized, c.wantCapped)
+		}
+	}
+}
+
+func TestParseMode_AutoResize(t *testing.T) {
+	if ParseMode("autoResize") != AutoResize {
+		t.Error("ParseMode should recognize autoResize")
+	}
+}

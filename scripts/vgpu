@@ -16,6 +16,9 @@ APIVERSION="${GROUP}/v1alpha1"
 CLAIM_ANNOTATION="${GROUP}/claim-ref"
 RECOMMENDED_ANNOTATION="${GROUP}/recommended-vram-bytes"
 OVERRIDE_ANNOTATION="${GROUP}/override-recommendation"
+AUTORESIZED_ANNOTATION="${GROUP}/autoresized"
+ORIGINAL_VRAM_ANNOTATION="${GROUP}/original-vram-bytes"
+AUTORESIZED_VRAM_ANNOTATION="${GROUP}/autoresized-vram-bytes"
 CLAIM_LABEL="vgpu-claim"
 NS_DEFAULT="default"
 VGPU_VERSION="dev"   # replaced with the git tag at release time (see .github/workflows/release.yaml)
@@ -285,6 +288,20 @@ cmd_status() {
         rec="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${RECOMMENDED_ANNOTATION//./\\.}}")"
         printf '  ! underprovisioned — recommended %s  (run: vgpu profile %s)\n' \
             "$(human "${rec:-0}")" "$name"
+    fi
+
+    # 3.7b: surface an autoResize if the mutating webhook raised this job's request.
+    local ar
+    ar="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${AUTORESIZED_ANNOTATION//./\\.}}")"
+    if [[ "$ar" == "true" ]]; then
+        local orig newv capd
+        orig="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${ORIGINAL_VRAM_ANNOTATION//./\\.}}")"
+        newv="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${AUTORESIZED_VRAM_ANNOTATION//./\\.}}")"
+        printf '  ^ auto-resized %s -> %s  (policy raised your request to the recommendation)\n' \
+            "$(human "${orig:-0}")" "$(human "${newv:-0}")"
+        capd="$(kget vgpujob "$name" "$ns" '{.status.conditions[?(@.type=="AutoResizeCapped")].status}')"
+        [[ "$capd" == "True" ]] && \
+            printf '    (capped at fleet max — workload may need a larger GPU class or model parallelism)\n'
     fi
 }
 

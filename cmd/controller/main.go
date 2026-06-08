@@ -135,6 +135,10 @@ func main() {
 		// job submission cluster-wide.
 		mgr.GetWebhookServer().Register("/validate-infrastructure-pranav2910-com-v1alpha1-vgpujob",
 			&webhookserver.Admission{Handler: webhook.NewJobRecommendationValidator(mgr.GetClient(), decoder, recMode)})
+		// Phase 3.7b: autoResize — a mutating webhook raises an under-provisioned
+		// request to the recommendation at CREATE (autoResize mode only). Fail-open.
+		mgr.GetWebhookServer().Register("/mutate-infrastructure-pranav2910-com-v1alpha1-vgpujob",
+			&webhookserver.Admission{Handler: webhook.NewJobAutoResizer(mgr.GetClient(), decoder, recMode)})
 		log.Println("Webhook server registered on :9443")
 	} else {
 		log.Println("Webhooks DISABLED (VGPU_DISABLE_WEBHOOKS=true) — reconcilers-only mode, no cert-manager required")

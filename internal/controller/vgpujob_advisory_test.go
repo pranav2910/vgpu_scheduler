@@ -153,6 +153,47 @@ func TestAdvisory_OverrideNoted(t *testing.T) {
 	}
 }
 
+// 3.7b: the controller turns the autoResize webhook's annotations into an
+// AutoResized condition + a Normal event.
+func TestAutoResizeAudit_SetsConditionAndEvent(t *testing.T) {
+	job := mkJob("job1", 24*giB, vgpuv1alpha1.JobPhaseScheduled)
+	job.Annotations = map[string]string{
+		recommendation.AutoResizedAnnotation:     "true",
+		recommendation.OriginalVRAMAnnotation:    "17179869184",
+		recommendation.AutoResizedVRAMAnnotation: "25769803776",
+	}
+	r, c, rec := advisoryReconcilerMode(t, recommendation.AutoResize, job)
+	runAdvisory(t, r, c, "job1")
+
+	if !apimeta.IsStatusConditionTrue(getJob(t, c, "job1").Status.Conditions, "AutoResized") {
+		t.Fatal("expected AutoResized condition")
+	}
+	select {
+	case e := <-rec.Events:
+		if !strings.Contains(e, "VRAMAutoResized") {
+			t.Fatalf("unexpected event: %q", e)
+		}
+	default:
+		t.Fatal("expected a VRAMAutoResized event")
+	}
+}
+
+// 3.7b: a capped resize also sets the distinct AutoResizeCapped condition.
+func TestAutoResizeAudit_Capped(t *testing.T) {
+	job := mkJob("job1", 80*giB, vgpuv1alpha1.JobPhaseScheduled)
+	job.Annotations = map[string]string{
+		recommendation.AutoResizedAnnotation:      "true",
+		recommendation.OriginalVRAMAnnotation:     "17179869184",
+		recommendation.AutoResizedVRAMAnnotation:  "85899345920",
+		recommendation.AutoResizeCappedAnnotation: "96000000000",
+	}
+	r, c, _ := advisoryReconcilerMode(t, recommendation.AutoResize, job)
+	runAdvisory(t, r, c, "job1")
+	if !apimeta.IsStatusConditionTrue(getJob(t, c, "job1").Status.Conditions, "AutoResizeCapped") {
+		t.Fatal("expected AutoResizeCapped condition")
+	}
+}
+
 func TestAdvisory_QuietWhenAdequate(t *testing.T) {
 	r, c, _ := advisoryReconciler(t,
 		mkJob("job1", 12*giB, vgpuv1alpha1.JobPhaseScheduled),

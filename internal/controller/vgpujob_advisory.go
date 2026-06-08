@@ -31,6 +31,12 @@ const (
 // the (non-blocking) advisory surfaces. Errors are returned so the cycle retries;
 // a missing profile is not an error.
 func (r *VGPUJobReconciler) reconcileAdvisory(ctx context.Context, job *vgpuv1alpha1.VGPUJob) error {
+	// 3.7b: if the autoResize webhook raised this job's request, surface the audit
+	// (condition + event) so the mutation is never silent.
+	if err := r.reconcileAutoResizeAudit(ctx, job); err != nil {
+		return err
+	}
+
 	requested := job.Spec.ClaimTemplate.Spec.RequestedVRAMBytes
 
 	var prof vgpuv1alpha1.VGPUWorkloadProfile
@@ -143,6 +149,76 @@ func (r *VGPUJobReconciler) setAdvisoryCondition(ctx context.Context, key types.
 		r.Recorder.Eventf(ref, corev1.EventTypeWarning, "UnderprovisionedRequest",
 			"Requested %d MiB is below the profile's recommended %d MiB (confidence %s) — admitted anyway (advisory only).",
 			requested>>20, recommended>>20, conf)
+	}
+	return nil
+}
+
+// reconcileAutoResizeAudit (3.7b) turns the audit annotations stamped by the
+// autoResize mutating webhook into user-visible status — an AutoResized condition
+// (+ a Normal event on transition) and, when the recommendation was clamped at
+// fleet max, a distinct AutoResizeCapped condition (+ event). It only REFLECTS what
+// the webhook already did; it never mutates the request.
+func (r *VGPUJobReconciler) reconcileAutoResizeAudit(ctx context.Context, job *vgpuv1alpha1.VGPUJob) error {
+	if job.Annotations[recommendation.AutoResizedAnnotation] != "true" {
+		return nil
+	}
+	origMiB := miB(job.Annotations[recommendation.OriginalVRAMAnnotation])
+	newMiB := miB(job.Annotations[recommendation.AutoResizedVRAMAnnotation])
+	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
+
+	resizedMsg := fmt.Sprintf("Auto-resized VRAM request %d MiB -> %d MiB to match the workload's learned recommendation.", origMiB, newMiB)
+	if err := r.setBoolCondition(ctx, key, "AutoResized", "RaisedToRecommendation", resizedMsg,
+		corev1.EventTypeNormal, "VRAMAutoResized"); err != nil {
+		return err
+	}
+
+	if cappedRaw := job.Annotations[recommendation.AutoResizeCappedAnnotation]; cappedRaw != "" {
+		cappedMsg := fmt.Sprintf("Profile recommended %d MiB, capped to fleet max %d MiB — this workload may need a larger GPU class or model parallelism.",
+			miB(cappedRaw), newMiB)
+		if err := r.setBoolCondition(ctx, key, "AutoResizeCapped", "ExceedsFleetMax", cappedMsg,
+			corev1.EventTypeWarning, "AutoResizeCapped"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// miB parses a byte-count annotation to MiB for display (0 on parse failure).
+func miB(s string) int64 {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n >> 20
+}
+
+// setBoolCondition sets a True condition (idempotent, no status churn) and emits an
+// event ONCE, on the absent/False -> True transition.
+func (r *VGPUJobReconciler) setBoolCondition(ctx context.Context, key types.NamespacedName, condType, reason, message, eventType, eventReason string) error {
+	emit := false
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var j vgpuv1alpha1.VGPUJob
+		if err := r.Client.Get(ctx, key, &j); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		was := apimeta.IsStatusConditionTrue(j.Status.Conditions, condType)
+		cond := metav1.Condition{Type: condType, Status: metav1.ConditionTrue, Reason: reason, Message: message}
+		if existing := apimeta.FindStatusCondition(j.Status.Conditions, condType); existing != nil &&
+			existing.Status == cond.Status && existing.Reason == cond.Reason && existing.Message == cond.Message {
+			return nil
+		}
+		apimeta.SetStatusCondition(&j.Status.Conditions, cond)
+		if err := r.Client.Status().Update(ctx, &j); err != nil {
+			return err
+		}
+		emit = !was
+		return nil
+	}); err != nil {
+		return err
+	}
+	if emit && r.Recorder != nil {
+		ref := &vgpuv1alpha1.VGPUJob{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
+		r.Recorder.Eventf(ref, eventType, eventReason, "%s", message)
 	}
 	return nil
 }
