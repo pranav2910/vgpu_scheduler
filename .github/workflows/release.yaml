@@ -43,11 +43,13 @@ jobs:
           installed once by your platform team. See
           [docs/USER-GUIDE.md](https://github.com/pranav2910/vgpu_scheduler/blob/main/docs/USER-GUIDE.md).
 
-  docker-push:
+  docker-build:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Build and Push Scheduler Image
+    - name: Build images (validate they build on a tagged release; push is opt-in)
       run: |
-        docker build -t pranav2910/vgpu-scheduler:${{ github.ref_name }} -f build/scheduler/Dockerfile .
+        docker build --provenance=false -t vgpu-scheduler:${{ github.ref_name }}  -f Dockerfile.scheduler  .
+        docker build --provenance=false -t vgpu-controller:${{ github.ref_name }} -f Dockerfile.controller .
+        # Publishing to a registry is intentionally not wired yet (no creds in CI):
         # docker push pranav2910/vgpu-scheduler:${{ github.ref_name }}

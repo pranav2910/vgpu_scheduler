@@ -26,7 +26,10 @@ VGPU_VERSION="dev"   # replaced with the git tag at release time (see .github/wo
 die()  { printf 'vgpu: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-have kubectl || die "kubectl not found on PATH"
+# kubectl is required only by the cluster commands (submit/status/profile), NOT by
+# `version`/`help` — so the published CLI can be downloaded and inspected without a
+# cluster (and CI can run `vgpu version` on a runner that has no kubectl).
+need_kubectl() { have kubectl || die "kubectl not found on PATH"; }
 
 # ── byte parsing: "16Gi" / "512Mi" / "8G" / "1073741824" -> integer bytes ─────
 # Ki/Mi/Gi/Ti are 1024-based, K/M/G/T are 1000-based (Kubernetes quantity rules),
@@ -107,6 +110,7 @@ EOF
 # wait-then-apply dance — that all moved into the controller.
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_submit() {
+    need_kubectl
     local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
     local ns="$NS_DEFAULT" command_override="" node="" runtime_class="" dry_run=0 wait_secs=120 override=0
     while [[ $# -gt 0 ]]; do
@@ -243,6 +247,7 @@ EOF
 # engineer can see exactly where a workload is in the pipeline and on which node.
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_status() {
+    need_kubectl
     local name="" ns="$NS_DEFAULT"
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -312,6 +317,7 @@ cmd_status() {
 # after the job.
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_profile() {
+    need_kubectl
     local name="" ns="$NS_DEFAULT"
     while [[ $# -gt 0 ]]; do
         case "$1" in
