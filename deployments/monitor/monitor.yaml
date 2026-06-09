@@ -74,7 +74,9 @@ spec:
       containers:
         - name: monitor
           image: vgpu-nodeagent:nvml   # real-GPU image (a10-bootstrap/h100-control-plane build this tag); on kind use vgpu-nodeagent:latest
-          imagePullPolicy: IfNotPresent
+          # Never: the image is built + imported locally (k3s ctr import / kind load),
+          # never published to a registry — so don't attempt a (doomed) pull.
+          imagePullPolicy: Never
           env:
             - name: NODE_NAME
               valueFrom:
