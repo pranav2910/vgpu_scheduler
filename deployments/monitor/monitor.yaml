@@ -73,7 +73,7 @@ spec:
         - operator: Exists   # run on tainted GPU nodes too
       containers:
         - name: monitor
-          image: vgpu-nodeagent:latest   # build with -tags nvml for real GPUs
+          image: vgpu-nodeagent:nvml   # real-GPU image (a10-bootstrap/h100-control-plane build this tag); on kind use vgpu-nodeagent:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_NAME
