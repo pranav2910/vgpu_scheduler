@@ -73,7 +73,14 @@ spec:
         - operator: Exists   # run on tainted GPU nodes too
       containers:
         - name: monitor
-          image: vgpu-nodeagent:nvml   # real-GPU image (a10-bootstrap/h100-control-plane build this tag); on kind use vgpu-nodeagent:latest
+          # Fully-qualified on purpose: the image is built + `k3s ctr images import`'d
+          # locally (a10-bootstrap/h100-control-plane build this tag). With
+          # imagePullPolicy: Never the kubelet matches by EXACT ref, and the short
+          # name `vgpu-nodeagent:nvml` does NOT reliably resolve to a ctr-imported
+          # image (you get ErrImageNeverPull even though `crictl images` lists it).
+          # The canonical `docker.io/library/…` form matches. On kind, load + use
+          # docker.io/library/vgpu-nodeagent:latest (the fake-provider tag).
+          image: docker.io/library/vgpu-nodeagent:nvml
           # Never: the image is built + imported locally (k3s ctr import / kind load),
           # never published to a registry — so don't attempt a (doomed) pull.
           imagePullPolicy: Never
