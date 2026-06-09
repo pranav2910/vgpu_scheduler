@@ -1,6 +1,6 @@
 # vGPU Scheduler — Benchmarks & Validation Report
 
-*Last run: 2026-06-07 · single NVIDIA H100 80GB (k3s v1.35.5) + a kind control-plane battery.*
+*Last run: 2026-06-09 · single NVIDIA H100 80GB (k3s v1.35.5) + a kind control-plane battery.*
 
 This report is **reproducible, not rhetorical**: every number below comes from a
 script in this repo, and the "Reproduce it yourself" section runs the whole thing
@@ -214,6 +214,54 @@ containerd CDI + the Kubernetes Eviction API (NVIDIA A10 and H100):
 | `validate-runtime-3.4-a10.sh` | 13/13 | over-use detection → per-slice attribution → soft enforcement |
 | `validate-runtime-3.4d-a10.sh` | 5/5 | opt-in eviction via PDB-respecting Eviction API; exemptions honored |
 | `validate-runtime-3.5-a10.sh` | 8/8 | profile learns peak → recommends right-size → non-blocking advisory |
+
+---
+
+## Result 6 — Read-only monitor mode (the zero-risk waste report)
+
+Before any scheduling, packing, or CRDs, vGPU can run as a **read-only** DaemonSet
+(`VGPU_MODE=monitor`) that drops in *beside* any scheduler — vanilla Kubernetes, KAI,
+Volcano, Run:ai, Slurm-on-K8s — and answers one question: how much GPU memory does each
+workload **ask for** vs. **actually use**? It reads NVML, attributes usage to the owning
+pod (`PID → cgroup → pod`), reads each pod's requested VRAM, and emits per-pod
+requested-vs-used metrics; `vgpu report` turns them into a table + a $ estimate. It has
+exactly one RBAC verb — `list/watch pods` — and creates, evicts, and mutates nothing.
+
+**Live on the H100** (`demo/monitor-demo.sh` — two plain GPU pods, no scheduler involved):
+
+```
+  WORKLOAD (ns/pod)        REQUESTED      USED       WASTE   UTIL  SOURCE
+  default/waste-a           39.1 GiB    16.5 GiB    22.6 GiB   42%  annotation
+  default/waste-b           23.4 GiB     8.5 GiB    14.9 GiB   36%  annotation
+  Estimated waste/month: $1031   (at $3.00/GPU-hr, ~0.47 cards idle)
+```
+
+The `16.5`/`8.5` (not `16`/`8`) is the CUDA context the framework doesn't report — i.e.
+the *true* NVML process footprint, the same per-tenant attribution proven exact in 3c.
+
+**The number is honest by construction — proven adversarially.** A read-only waste report
+is only worth anything if it never *invents* waste, so the phase logic was bug-hunted
+before shipping. The first finder caught a real one: the report counted *every* pod on
+the node, so a finished (`Succeeded`) or not-yet-started (`Pending`) pod — which still
+carries a request but holds no live GPU process — surfaced as **100% phantom waste**.
+Caught by inspection, fixed (count only `Running` pods), and proven live before/after on
+the H100 (`validate-monitor-phase-h100.sh`, 3/3 — a Running under-user kept, a Succeeded
+and a Pending pod correctly dropped):
+
+| | requested | reported waste | $/month |
+|---|---|---|---|
+| **before fix** (Running + Succeeded + Pending all counted) | 78.1 GiB | **71.6 GiB** | **$1,969** |
+| **after fix** (only the Running under-user) | 15.6 GiB | 9.1 GiB | $251 |
+
+The bug would have over-reported waste **7.8×** — exactly the kind of wrong number that
+kills trust in a waste report on first read. The report join + waste/price math is also
+unit-tested off-hardware (`validate-monitor-report.sh`, 9/9) and the phase filter has a
+Go regression test (`TestObserveSkipsNonRunningPods`).
+
+*Honest scope:* attribution needs `hostPID` + real NVML; on a node where nvidia isn't the
+default runtime the monitor must request `runtimeClassName: nvidia` so NVML's libraries
+are injected (else it degrades to requested-only). The $ figure is an estimate (a flat
+`--price-per-gpu-hour`), not guaranteed savings.
 
 ---
 
