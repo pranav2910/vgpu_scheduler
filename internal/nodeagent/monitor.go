@@ -110,6 +110,14 @@ func (m *MonitorObserver) observe(ctx context.Context) {
 	byUID := make(map[string]*corev1.Pod, len(pods.Items))
 	for i := range pods.Items {
 		p := &pods.Items[i]
+		// Only a RUNNING pod can be wasting GPU memory right now. A Succeeded/Failed
+		// pod (a job that already finished) or a Pending one (not yet started) still
+		// carries its request in spec but holds no live GPU process — so counting it
+		// would report 100% phantom waste for completed or queued workloads, which is
+		// exactly the kind of wrong number that destroys trust in the report. Skip it.
+		if p.Status.Phase != corev1.PodRunning {
+			continue
+		}
 		byUID[string(p.UID)] = p
 		if req, src := requestedVRAM(p, cardTotal, m.annKeys); req > 0 {
 			telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues(p.Namespace, p.Name, m.nodeName, src).Set(float64(req))

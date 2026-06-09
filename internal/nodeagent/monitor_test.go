@@ -1,11 +1,19 @@
 package nodeagent
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/gpu"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestParseRequestedMem(t *testing.T) {
@@ -91,5 +99,60 @@ func TestRequestedVRAM(t *testing.T) {
 	})
 	if b, src := requestedVRAM(custom, card, []string{"my.org/vram"}); b != 8*GiB || src != "annotation" {
 		t.Errorf("custom key: got (%d,%s), want (%d,annotation)", b, src, 8*GiB)
+	}
+}
+
+// fakePodReader is a minimal client.Reader: the observer only ever List()s pods
+// by node, so a canned list is enough (the field selector is irrelevant here).
+type fakePodReader struct{ pods []corev1.Pod }
+
+func (f *fakePodReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	pl, ok := list.(*corev1.PodList)
+	if !ok {
+		return fmt.Errorf("fakePodReader: unexpected list type %T", list)
+	}
+	pl.Items = append([]corev1.Pod(nil), f.pods...)
+	return nil
+}
+
+func (f *fakePodReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return fmt.Errorf("fakePodReader: Get not implemented")
+}
+
+// TestObserveSkipsNonRunningPods is the regression test for the missing pod-phase
+// filter in observe(): a finished (Succeeded/Failed) or not-yet-started (Pending)
+// pod still carries its request in spec but holds no live GPU process, so without
+// the filter it shows up as 100% phantom waste. The report must count only RUNNING
+// pods. (No GPU needed: requested-side runs on the degraded provider; the phase
+// filter lives there.)
+func TestObserveSkipsNonRunningPods(t *testing.T) {
+	const GiB = int64(1024 * 1024 * 1024)
+	mkpod := func(name string, phase corev1.PodPhase) corev1.Pod {
+		return corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Name:        name,
+				Annotations: map[string]string{"gpu-memory": "16384"}, // 16 GiB (MiB convention)
+			},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+	}
+	reader := &fakePodReader{pods: []corev1.Pod{
+		mkpod("running-pod", corev1.PodRunning),
+		mkpod("succeeded-pod", corev1.PodSucceeded),
+		mkpod("failed-pod", corev1.PodFailed),
+		mkpod("pending-pod", corev1.PodPending),
+	}}
+	m := NewMonitorObserver(reader, "node1", gpu.NewDegradedProvider(errors.New("no gpu in test")), time.Second, nil)
+
+	m.observe(context.Background())
+
+	// Exactly one requested series — the Running pod. The three non-running pods
+	// must NOT appear (else they read as 100% waste).
+	if n := testutil.CollectAndCount(telemetry.MonitorPodRequestedVRAMBytes); n != 1 {
+		t.Fatalf("requested series = %d, want 1 (only the Running pod; finished/pending pods must not be reported as waste)", n)
+	}
+	if got := testutil.ToFloat64(telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues("default", "running-pod", "node1", "annotation")); got != float64(16*GiB) {
+		t.Errorf("running-pod requested = %v, want %d", got, 16*GiB)
 	}
 }
