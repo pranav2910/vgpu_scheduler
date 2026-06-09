@@ -69,6 +69,13 @@ spec:
       # hostPID lets the agent resolve a GPU process (host PID, from NVML) to its
       # owning pod via /proc/<pid>/cgroup. Read-only.
       hostPID: true
+      # Real NVML needs the NVIDIA driver libraries (libnvidia-ml.so.1) injected into
+      # the container. On nodes where the nvidia runtime is NOT the default (e.g. k3s +
+      # nvidia-container-toolkit), request it explicitly or NVML init fails and the
+      # agent degrades to observe-nothing (requested shows, used stays 0). If your
+      # node's RuntimeClass has a different name — or nvidia is already the default
+      # runtime — adjust or remove this line.
+      runtimeClassName: nvidia
       tolerations:
         - operator: Exists   # run on tainted GPU nodes too
       containers:
@@ -89,6 +96,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Ask the NVIDIA container toolkit to inject the driver + NVML — read-only.
+            # "utility" exposes NVML/nvidia-smi only (no compute, no device-plugin GPU
+            # reservation): the monitor OBSERVES the card, it doesn't consume one.
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility"
             - name: VGPU_MODE
               value: "monitor"            # ← read-only observe/attribute/report; no control plane
             - name: VGPU_OBSERVE_INTERVAL
