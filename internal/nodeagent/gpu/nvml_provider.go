@@ -79,6 +79,14 @@ func (p *nvmlProvider) ListProcesses(_ context.Context) ([]GPUProcess, error) {
 		if ret != nvml.SUCCESS || uuid == "" {
 			uuid = fmt.Sprintf("GPU-INDEX-%d", i)
 		}
+		// Dedupe by PID per device: a process holding BOTH a compute and a
+		// graphics context (nvidia-smi type "C+G" — CUDA/GL interop) is reported
+		// in both lists, each entry carrying its FB usage. Consumers sum our
+		// entries per pod/slice, so emitting both would double-count such a
+		// process — inflated usage that can cross the violation threshold and,
+		// in evict mode, evict a compliant pod. Keep the max of the two figures
+		// (they are normally identical).
+		perPID := make(map[int]int64)
 		for _, getter := range []func() ([]nvml.ProcessInfo, nvml.Return){
 			handle.GetComputeRunningProcesses,
 			handle.GetGraphicsRunningProcesses,
@@ -92,12 +100,18 @@ func (p *nvmlProvider) ListProcesses(_ context.Context) ([]GPUProcess, error) {
 				if used < 0 {
 					used = 0 // NVML_VALUE_NOT_AVAILABLE sentinel → unknown
 				}
-				procs = append(procs, GPUProcess{
-					PID:             int(pi.Pid),
-					DeviceUUID:      uuid,
-					UsedMemoryBytes: used,
-				})
+				pid := int(pi.Pid)
+				if cur, seen := perPID[pid]; !seen || used > cur {
+					perPID[pid] = used
+				}
 			}
+		}
+		for pid, used := range perPID {
+			procs = append(procs, GPUProcess{
+				PID:             pid,
+				DeviceUUID:      uuid,
+				UsedMemoryBytes: used,
+			})
 		}
 	}
 	return procs, nil

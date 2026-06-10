@@ -373,7 +373,11 @@ func (d *SliceViolationDetector) maybeEvict(ctx context.Context, u *sliceUsage, 
 			continue // already evicted or exempted — terminal, do not reprocess
 		}
 		if d.isExempt(ctx, nn) {
-			d.evictHandled[podK] = "exempt"
+			// Deliberately NOT recorded in evictHandled: exemption is a live,
+			// user-editable label, not a terminal outcome. Caching it meant
+			// removing the label had no effect while the violation persisted —
+			// eviction never re-engaged until an agent restart. Re-check every
+			// cycle instead (notifyBlocked dedups the event by pod+reason).
 			d.notifyBlocked(u, nn, "exempt",
 				fmt.Sprintf("Pod is exempt from eviction (%s=true); over-use stays marked + soft-warned but the pod is NOT evicted", enforcementExemptLabel))
 			continue

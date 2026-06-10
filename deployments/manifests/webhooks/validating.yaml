@@ -21,6 +21,27 @@ webhooks:
         apiVersions: ["v1alpha1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["vgpuclaims"]
+  # Gang-job invariants: minAvailable == gangSize (strict gangs — not expressible
+  # in OpenAPI validation) and immutability of gangSize/minAvailable/
+  # requestedVramBytes after creation. The reconciler ASSUMES these properties;
+  # without this entry the handler was served but never invoked, so a mutated
+  # gangSize could diverge children from the reservation mid-flight.
+  # failurePolicy: Fail — like vgpuclaims, this IS data integrity.
+  - name: vvgpugangjob.vgpu.pranav2910.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: vgpu-controller-webhook
+        namespace: vgpu-system
+        path: /validate-infrastructure-pranav2910-com-v1alpha1-vgpugangjob
+      caBundle: ""
+    rules:
+      - apiGroups: ["infrastructure.pranav2910.com"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["vgpugangjobs"]
   # Phase 3.7 — recommendation enforcement. Rejects CREATE of an under-provisioned
   # VGPUJob (vs its learned profile) only in requireOverride mode, only at Medium+
   # confidence, and only without the override annotation. failurePolicy: Ignore —
