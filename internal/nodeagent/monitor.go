@@ -75,29 +75,31 @@ func (m *MonitorObserver) Start(ctx context.Context) error {
 }
 
 // observe takes one snapshot: per-GPU truth, per-pod requested, per-pod used.
+//
+// It gathers EVERYTHING first and only then Resets + republishes the gauges.
+// Resetting up front opened two wrong-number windows: a scrape landing between
+// the Reset and the (NVML + API-server) fetches saw half a snapshot — requested
+// without used renders as 100% phantom waste — and any fetch error after the
+// Reset blanked the whole report for a full interval. A cycle is now atomic:
+// on any fetch error the previous complete snapshot stays published (the error
+// is logged), and a persistently failing provider publishes nothing rather
+// than requested-only phantom waste.
 func (m *MonitorObserver) observe(ctx context.Context) {
-	// Reset each cycle so pods/processes that vanished don't linger as stale series.
-	telemetry.MonitorPodRequestedVRAMBytes.Reset()
-	telemetry.MonitorPodUsedVRAMBytes.Reset()
-	telemetry.MonitorGPUTotalVRAMBytes.Reset()
-	telemetry.MonitorGPUUsedVRAMBytes.Reset()
-	telemetry.MonitorGPUFreeVRAMBytes.Reset()
-
 	// 1. Per-GPU truth, and the per-card total (for whole-GPU request conversion).
-	var cardTotal int64
-	if devices, err := m.provider.ListDevices(ctx); err != nil {
+	devices, err := m.provider.ListDevices(ctx)
+	if err != nil {
 		log.Printf("[monitor] ListDevices: %v", err)
-	} else {
-		for _, d := range devices {
-			if !d.Healthy {
-				continue
-			}
-			telemetry.MonitorGPUTotalVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.TotalMemoryBytes))
-			telemetry.MonitorGPUUsedVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.UsedMemoryBytes))
-			telemetry.MonitorGPUFreeVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.FreeMemoryBytes))
-			if d.TotalMemoryBytes > cardTotal {
-				cardTotal = d.TotalMemoryBytes
-			}
+		return
+	}
+	var healthy []gpu.GPUDevice
+	var cardTotal int64
+	for _, d := range devices {
+		if !d.Healthy {
+			continue
+		}
+		healthy = append(healthy, d)
+		if d.TotalMemoryBytes > cardTotal {
+			cardTotal = d.TotalMemoryBytes
 		}
 	}
 
@@ -107,6 +109,11 @@ func (m *MonitorObserver) observe(ctx context.Context) {
 		log.Printf("[monitor] list pods: %v", err)
 		return
 	}
+	type reqEntry struct {
+		ns, name, src string
+		bytes         int64
+	}
+	var reqs []reqEntry
 	byUID := make(map[string]*corev1.Pod, len(pods.Items))
 	for i := range pods.Items {
 		p := &pods.Items[i]
@@ -120,7 +127,7 @@ func (m *MonitorObserver) observe(ctx context.Context) {
 		}
 		byUID[string(p.UID)] = p
 		if req, src := requestedVRAM(p, cardTotal, m.annKeys); req > 0 {
-			telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues(p.Namespace, p.Name, m.nodeName, src).Set(float64(req))
+			reqs = append(reqs, reqEntry{p.Namespace, p.Name, src, req})
 		}
 	}
 
@@ -139,6 +146,24 @@ func (m *MonitorObserver) observe(ctx context.Context) {
 			continue // not a pod's process (or /proc unreadable without hostPID)
 		}
 		used[key{uid, pr.DeviceUUID}] += pr.UsedMemoryBytes
+	}
+
+	// 4. Every fetch succeeded — swap the snapshot in. Reset clears series for
+	// pods/GPUs that vanished since last cycle; the Reset→Set window is now pure
+	// in-memory loops (no I/O), so a concurrent scrape can no longer catch a
+	// seconds-wide half-populated report.
+	telemetry.MonitorPodRequestedVRAMBytes.Reset()
+	telemetry.MonitorPodUsedVRAMBytes.Reset()
+	telemetry.MonitorGPUTotalVRAMBytes.Reset()
+	telemetry.MonitorGPUUsedVRAMBytes.Reset()
+	telemetry.MonitorGPUFreeVRAMBytes.Reset()
+	for _, d := range healthy {
+		telemetry.MonitorGPUTotalVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.TotalMemoryBytes))
+		telemetry.MonitorGPUUsedVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.UsedMemoryBytes))
+		telemetry.MonitorGPUFreeVRAMBytes.WithLabelValues(m.nodeName, d.UUID).Set(float64(d.FreeMemoryBytes))
+	}
+	for _, r := range reqs {
+		telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues(r.ns, r.name, m.nodeName, r.src).Set(float64(r.bytes))
 	}
 	for k, b := range used {
 		if p, ok := byUID[k.uid]; ok {

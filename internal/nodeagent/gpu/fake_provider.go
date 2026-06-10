@@ -38,7 +38,13 @@ type fakeProvider struct {
 // errors.
 func NewProvider() (GPUProvider, error) {
 	count := envInt("VGPU_FAKE_GPU_COUNT", 1)
+	if count < 0 {
+		count = 0 // a typo'd negative must degrade to "no GPUs", not panic the agent (makeslice: cap out of range)
+	}
 	mem := envInt64("VGPU_FAKE_GPU_MEM_BYTES", fakeDefaultGPUMemBytes)
+	if mem < 0 {
+		mem = 0
+	}
 	used := envInt64("VGPU_FAKE_GPU_USED_BYTES", 0)
 	reserved := envInt64("VGPU_FAKE_GPU_RESERVED_BYTES", 0)
 	if used+reserved > mem {

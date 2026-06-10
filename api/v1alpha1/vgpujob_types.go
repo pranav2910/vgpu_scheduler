@@ -172,6 +172,10 @@ func (j *VGPUJob) DeepCopyInto(out *VGPUJob) {
 	j.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
 	out.Spec = j.Spec
 	out.Spec.ClaimTemplate.Spec = j.Spec.ClaimTemplate.Spec
+	if j.Spec.PreemptionGraceSeconds != nil {
+		v := *j.Spec.PreemptionGraceSeconds
+		out.Spec.PreemptionGraceSeconds = &v
+	}
 	if j.Spec.PodTemplate != nil {
 		out.Spec.PodTemplate = j.Spec.PodTemplate.DeepCopy()
 	}

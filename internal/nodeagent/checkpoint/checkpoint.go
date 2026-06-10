@@ -93,7 +93,37 @@ func (s *Store) Save(record CheckpointRecord) error {
 	if err != nil {
 		return fmt.Errorf("checkpoint serialisation failed: %w", err)
 	}
-	return os.WriteFile(s.path(), out, 0640)
+	return writeAtomic(s.path(), out, 0640)
+}
+
+// writeAtomic writes via a same-directory temp file + rename. The Bug #4 guard
+// above turns a corrupt checkpoint into a permanent allocation outage (every
+// Save refuses, no repair path), so the write path must make torn writes
+// impossible — a truncate-in-place WriteFile interrupted by a crash/power loss
+// is exactly how the file gets corrupted in the first place.
+func writeAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("checkpoint temp file creation failed: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once renamed
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("checkpoint temp write failed: %w", err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("checkpoint temp chmod failed: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("checkpoint temp sync failed: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("checkpoint temp close failed: %w", err)
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (s *Store) Delete(allocationID string) error {

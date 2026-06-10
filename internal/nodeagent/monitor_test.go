@@ -119,13 +119,23 @@ func (f *fakePodReader) Get(context.Context, client.ObjectKey, client.Object, ..
 	return fmt.Errorf("fakePodReader: Get not implemented")
 }
 
+// resetMonitorGauges isolates observe() tests from each other (the telemetry
+// registry is package-global).
+func resetMonitorGauges() {
+	telemetry.MonitorPodRequestedVRAMBytes.Reset()
+	telemetry.MonitorPodUsedVRAMBytes.Reset()
+	telemetry.MonitorGPUTotalVRAMBytes.Reset()
+	telemetry.MonitorGPUUsedVRAMBytes.Reset()
+	telemetry.MonitorGPUFreeVRAMBytes.Reset()
+}
+
 // TestObserveSkipsNonRunningPods is the regression test for the missing pod-phase
 // filter in observe(): a finished (Succeeded/Failed) or not-yet-started (Pending)
 // pod still carries its request in spec but holds no live GPU process, so without
 // the filter it shows up as 100% phantom waste. The report must count only RUNNING
-// pods. (No GPU needed: requested-side runs on the degraded provider; the phase
-// filter lives there.)
+// pods. (No GPU needed: an empty-but-working fake provider drives the loop.)
 func TestObserveSkipsNonRunningPods(t *testing.T) {
+	resetMonitorGauges()
 	const GiB = int64(1024 * 1024 * 1024)
 	mkpod := func(name string, phase corev1.PodPhase) corev1.Pod {
 		return corev1.Pod{
@@ -143,7 +153,7 @@ func TestObserveSkipsNonRunningPods(t *testing.T) {
 		mkpod("failed-pod", corev1.PodFailed),
 		mkpod("pending-pod", corev1.PodPending),
 	}}
-	m := NewMonitorObserver(reader, "node1", gpu.NewDegradedProvider(errors.New("no gpu in test")), time.Second, nil)
+	m := NewMonitorObserver(reader, "node1", gpu.NewFakeProvider(nil, nil), time.Second, nil)
 
 	m.observe(context.Background())
 
@@ -154,5 +164,55 @@ func TestObserveSkipsNonRunningPods(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues("default", "running-pod", "node1", "annotation")); got != float64(16*GiB) {
 		t.Errorf("running-pod requested = %v, want %d", got, 16*GiB)
+	}
+}
+
+// TestObserveAtomicSnapshot is the regression test for the reset-before-fetch
+// window: observe() used to Reset all gauges and then do NVML + API-server I/O
+// before re-populating, so (a) a failing cycle blanked the whole report for an
+// interval and (b) a degraded provider published requested-only series, which
+// the report renders as 100% phantom waste. Now a cycle is atomic: a failing
+// fetch must leave the previous complete snapshot untouched, and a provider
+// that never worked must publish nothing at all.
+func TestObserveAtomicSnapshot(t *testing.T) {
+	resetMonitorGauges()
+	const GiB = int64(1024 * 1024 * 1024)
+	running := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "keeper",
+			Annotations: map[string]string{"gpu-memory": "8192"}, // 8 GiB
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	reader := &fakePodReader{pods: []corev1.Pod{running}}
+	dev := gpu.GPUDevice{UUID: "GPU-T", TotalMemoryBytes: 80 * GiB, FreeMemoryBytes: 80 * GiB, Healthy: true}
+
+	// Cycle 1: working provider → snapshot published.
+	good := NewMonitorObserver(reader, "node1", gpu.NewFakeProvider([]gpu.GPUDevice{dev}, nil), time.Second, nil)
+	good.observe(context.Background())
+	if n := testutil.CollectAndCount(telemetry.MonitorPodRequestedVRAMBytes); n != 1 {
+		t.Fatalf("setup: requested series = %d, want 1", n)
+	}
+
+	// Cycle 2: provider fails → the previous snapshot must survive, not blank.
+	bad := NewMonitorObserver(reader, "node1", gpu.NewFakeProvider([]gpu.GPUDevice{dev}, errors.New("nvml flake")), time.Second, nil)
+	bad.observe(context.Background())
+	if n := testutil.CollectAndCount(telemetry.MonitorPodRequestedVRAMBytes); n != 1 {
+		t.Fatalf("after failing cycle: requested series = %d, want 1 (previous snapshot must survive a transient fetch error)", n)
+	}
+	if got := testutil.ToFloat64(telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues("default", "keeper", "node1", "annotation")); got != float64(8*GiB) {
+		t.Errorf("after failing cycle: requested = %v, want %d", got, 8*GiB)
+	}
+	if n := testutil.CollectAndCount(telemetry.MonitorGPUTotalVRAMBytes); n != 1 {
+		t.Errorf("after failing cycle: gpu total series = %d, want 1", n)
+	}
+
+	// A provider that NEVER worked publishes nothing (no requested-only phantom).
+	resetMonitorGauges()
+	degraded := NewMonitorObserver(reader, "node1", gpu.NewDegradedProvider(errors.New("no driver")), time.Second, nil)
+	degraded.observe(context.Background())
+	if n := testutil.CollectAndCount(telemetry.MonitorPodRequestedVRAMBytes); n != 0 {
+		t.Errorf("degraded provider: requested series = %d, want 0 (requested-only output renders as 100%% phantom waste)", n)
 	}
 }

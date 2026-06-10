@@ -73,12 +73,24 @@ func main() {
 		}
 	}
 
+	// Mode dispatch. Monitor mode is sold as "read-only, safe beside any
+	// scheduler", so an unrecognized VGPU_MODE must fail LOUDLY: a typo like
+	// "Monitor" or "montior" silently falling through to the full read-write
+	// agent (drift healing, CDI allocation, slice reconciliation) on a cluster
+	// that was promised observe-only is the worst possible failure mode.
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("VGPU_MODE")))
+	switch mode {
+	case "", "full", "monitor":
+	default:
+		log.Fatalf("CRITICAL: unrecognized VGPU_MODE %q — use \"monitor\" (read-only) or \"full\"/unset (full agent)", os.Getenv("VGPU_MODE"))
+	}
+
 	// ── Monitor mode (read-only wedge) ───────────────────────────────────────
 	// The "GPU waste report" entry product: observe → attribute → export per-pod
 	// requested-vs-used VRAM beside ANY scheduler (KAI/Volcano/vanilla). NO
 	// allocation, CDI, webhook, eviction, or CRDs — it only emits metrics. Returns
 	// without wiring any of the scheduling/enforcement machinery below.
-	if os.Getenv("VGPU_MODE") == "monitor" {
+	if mode == "monitor" {
 		var annKeys []string
 		if v := os.Getenv("VGPU_REQUEST_ANNOTATION_KEY"); v != "" {
 			for _, k := range strings.Split(v, ",") {
