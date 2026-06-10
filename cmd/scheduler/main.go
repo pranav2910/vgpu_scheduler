@@ -165,8 +165,28 @@ func (s *seedRunnable) Start(ctx context.Context) error {
 	// a fair proxy for "actively scheduling".
 	telemetry.LeaderActive.Set(1)
 	start := time.Now()
-	if err := seedCacheFromNodes(ctx, s.client, s.cache); err != nil {
-		log.Printf("WARNING: seed from nodes failed: %v (cache will populate on reconcile)", err)
+	// Retry until seeding succeeds: an unseeded cache keeps the warm-up gate
+	// closed (slices requeue on CacheNotReadyError), which is strictly safer
+	// than opening the gate blind — that re-creates the restart over-admission
+	// window the gate was built to close. Backoff is capped; leadership loss /
+	// shutdown cancels ctx and exits the loop.
+	for attempt := 1; ; attempt++ {
+		err := seedCacheFromNodes(ctx, s.client, s.cache)
+		if err == nil {
+			break
+		}
+		wait := time.Duration(attempt) * time.Second
+		if wait > 10*time.Second {
+			wait = 10 * time.Second
+		}
+		log.Printf("WARNING: cache seeding attempt %d failed: %v — retrying in %v (scheduling stays gated until seeded)",
+			attempt, err, wait)
+		select {
+		case <-ctx.Done():
+			telemetry.LeaderActive.Set(0)
+			return nil
+		case <-time.After(wait):
+		}
 	}
 	telemetry.CacheWarmupDuration.Set(time.Since(start).Seconds())
 	telemetry.CacheWarmupComplete.Set(1)
@@ -285,12 +305,22 @@ func (r *sliceSchedulingReconciler) recordSlice(nn types.NamespacedName, uid, no
 	if r.tracked == nil {
 		r.tracked = make(map[types.NamespacedName]trackedSlice)
 	}
-	if prev, ok := r.tracked[nn]; ok && prev.phase != phase {
-		switch phase {
-		case "Ready":
-			telemetry.SliceReady.Inc()
-		case "Failed":
-			telemetry.SliceFailed.WithLabelValues("scheduling").Inc()
+	if prev, ok := r.tracked[nn]; ok {
+		if prev.uid != "" && prev.uid != uid {
+			// Same name, NEW UID: the slice was deleted and recreated before the
+			// delete's reconcile ran (the workqueue coalesces both events into one
+			// key, and Get now sees the new object — NotFound never fires for the
+			// old one, so releaseOnDelete never would). Release the old UID's
+			// footprint here or it stays in the cache as ghost allocated capacity
+			// until a scheduler restart.
+			r.sched.Cache.ForgetSlice(prev.uid, prev.node)
+		} else if prev.phase != phase {
+			switch phase {
+			case "Ready":
+				telemetry.SliceReady.Inc()
+			case "Failed":
+				telemetry.SliceFailed.WithLabelValues("scheduling").Inc()
+			}
 		}
 	}
 	r.tracked[nn] = trackedSlice{uid: uid, node: node, phase: phase}
@@ -426,7 +456,16 @@ type nodeCapacityReconciler struct {
 func (r *nodeCapacityReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	var node corev1.Node
 	if err := r.client.Get(ctx, req.NamespacedName, &node); err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+		if client.IgnoreNotFound(err) == nil {
+			// Node deleted — drop it from the candidate set NOW. Leaving it in
+			// the cache makes a ghost node with full free capacity that wins
+			// placement once real nodes fill up; slices bound to it hang in
+			// Scheduled forever (no kubelet, no node agent).
+			r.cache.RemoveNode(req.Name)
+			log.Printf("Cache updated: node %s deleted — removed from candidate set", req.Name)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
 	}
 
 	totalVRAM, ok := node.Status.Capacity[vramResourceName]
@@ -436,13 +475,28 @@ func (r *nodeCapacityReconciler) Reconcile(ctx context.Context, req reconcile.Re
 
 	consumed := consumedVRAMOnNode(&node)
 	r.cache.UpdateNode(node.Name, totalVRAM.Value(), consumed)
+	// Gate NEW placements on node readiness: a NotReady node keeps its existing
+	// accounting (workloads may still be running) but stops being a candidate
+	// (CanFit/AssumeSlice refuse unhealthy nodes). Without this, the Healthy
+	// flag was never set by anything and the unhealthy-rejection path was dead.
+	r.cache.SetNodeHealth(node.Name, nodeIsReady(&node))
 	// Phase 2.5a: record the node's topology zone from its label, if any.
 	if zone := node.Labels[scheduler.TopologyZoneLabel]; zone != "" {
 		r.cache.SetNodeZone(node.Name, zone)
 	}
-	log.Printf("Cache updated: node %s total=%d consumed=%d zone=%q",
-		node.Name, totalVRAM.Value(), consumed, node.Labels[scheduler.TopologyZoneLabel])
+	log.Printf("Cache updated: node %s total=%d consumed=%d ready=%t zone=%q",
+		node.Name, totalVRAM.Value(), consumed, nodeIsReady(&node), node.Labels[scheduler.TopologyZoneLabel])
 	return reconcile.Result{}, nil
+}
+
+// nodeIsReady reports whether the node's Ready condition is True.
+func nodeIsReady(node *corev1.Node) bool {
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // consumedVRAMOnNode returns the VRAM already consumed by scheduled workloads
@@ -461,17 +515,19 @@ func consumedVRAMOnNode(node *corev1.Node) int64 {
 
 // seedCacheFromNodes pre-populates the VRAM cache at startup: first node
 // capacity, then the consumption of every already-bound slice. It marks the
-// cache seeded at the end (always — even if the slice list degrades — so a
-// transient API hiccup can't permanently wedge scheduling; the lazy reconcile
-// path + TTL reaper still converge). Until seeded, Schedule() defers placement,
-// which is what prevents over-admission on a scheduler restart.
+// cache seeded ONLY when the node list (and so the slice re-accounting pass)
+// actually ran: a node-List failure returns WITHOUT seeding, because opening
+// the warm-up gate with zero known consumption is exactly the restart
+// over-admission the gate exists to prevent — the caller retries. The slice
+// list degrading stays fail-open (logged; the lazy reconcile path + TTL reaper
+// converge), since by then capacity is at least populated.
+// Until seeded, Schedule() defers placement.
 func seedCacheFromNodes(ctx context.Context, k8sClient client.Client, cache *scheduler.VRAMCache) error {
-	defer cache.MarkSeeded()
-
 	var nodeList corev1.NodeList
 	if err := k8sClient.List(ctx, &nodeList); err != nil {
 		return fmt.Errorf("listing nodes: %w", err)
 	}
+	defer cache.MarkSeeded()
 
 	for i := range nodeList.Items {
 		node := &nodeList.Items[i]

@@ -209,29 +209,27 @@ func (c *VRAMCache) ConfirmSlice(sliceUID string) {
 	}
 }
 
-// PromoteSliceToAllocatedOnce applies PromoteConfirmedToAllocated exactly once
-// per sliceUID. Subsequent calls for the same slice are no-ops. Round-3 fix.
+// PromoteSliceToAllocatedOnce applies the confirmed→allocated promotion exactly
+// once per sliceUID. Subsequent calls for the same slice are no-ops. Round-3 fix.
+//
+// The check and the promotion happen in ONE critical section: the previous
+// check-unlock-promote shape let two concurrent callers (the startup seed pass
+// and the slice reconciler's initial informer flood both walk all Ready slices
+// at leader failover) both pass the "already synced?" check and both take the
+// restart-fallback direct-add path — double-counting the slice's bytes as
+// allocated until the next restart.
 func (c *VRAMCache) PromoteSliceToAllocatedOnce(sliceUID, nodeName string, actualBytes int64) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.syncedPhaseBySlice[sliceUID] == "Ready" {
-		c.mu.Unlock()
 		return nil
 	}
-	c.mu.Unlock()
-
-	if err := c.PromoteConfirmedToAllocated(sliceUID, nodeName, actualBytes); err != nil {
-		// Fallback path is an error today; we still mark as synced to prevent retry loops.
-		c.mu.Lock()
-		c.syncedPhaseBySlice[sliceUID] = "Ready"
-		c.allocatedBytesBySlice[sliceUID] = actualBytes
-		c.mu.Unlock()
-		return err
-	}
-	c.mu.Lock()
+	err := c.promoteConfirmedToAllocatedLocked(sliceUID, nodeName, actualBytes)
+	// Mark synced even on the fallback-error path (the allocation was still
+	// applied) to prevent retry loops.
 	c.syncedPhaseBySlice[sliceUID] = "Ready"
 	c.allocatedBytesBySlice[sliceUID] = actualBytes
-	c.mu.Unlock()
-	return nil
+	return err
 }
 
 // ReleaseSliceOnce applies ReleaseAllocated exactly once per sliceUID.
@@ -251,7 +249,11 @@ func (c *VRAMCache) ReleaseSliceOnce(sliceUID, nodeName string) {
 func (c *VRAMCache) PromoteConfirmedToAllocated(sliceUID, nodeName string, actualBytes int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.promoteConfirmedToAllocatedLocked(sliceUID, nodeName, actualBytes)
+}
 
+// promoteConfirmedToAllocatedLocked is the promotion body; c.mu must be held.
+func (c *VRAMCache) promoteConfirmedToAllocatedLocked(sliceUID, nodeName string, actualBytes int64) error {
 	node, exists := c.nodes[nodeName]
 	if !exists {
 		return fmt.Errorf("node %s not found for promotion", nodeName)
@@ -368,6 +370,36 @@ func (c *VRAMCache) UpdateNode(nodeName string, totalBytes, allocatedBytes int64
 
 func (c *VRAMCache) UpdateNodeCapacity(nodeName string, totalGiB int64) {
 	c.UpdateNode(nodeName, totalGiB*1024*1024*1024, 0)
+}
+
+// RemoveNode drops a deleted node from the cache entirely. Without this, a
+// deleted/drained node lives in the candidate set forever with its full free
+// capacity — once the live nodes fill up, the ghost node looks like the best
+// fit, wins Filter/Score, and slices bind to a spec.nodeName with no kubelet
+// or node agent behind it, hanging in Scheduled until a human notices.
+// Reservations held against the node are dropped with it (the TTL reaper would
+// only have skipped their node-side bookkeeping anyway); per-slice sync state
+// is kept so a node that re-registers doesn't double-count re-observed slices.
+func (c *VRAMCache) RemoveNode(nodeName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.nodes[nodeName]; !exists {
+		return
+	}
+	for uid, a := range c.assumedBySlice {
+		if a.NodeName == nodeName {
+			delete(c.assumedBySlice, uid)
+		}
+	}
+	for uid, a := range c.confirmedBySlice {
+		if a.NodeName == nodeName {
+			delete(c.confirmedBySlice, uid)
+		}
+	}
+	delete(c.nodes, nodeName)
+	// Zero the node's capacity gauges so dashboards don't show a ghost.
+	telemetry.RecordNodeVRAM(nodeName, 0, 0, 0, 0)
+	c.emitReservationGauge()
 }
 
 // SetNodeHealth toggles a node's Healthy flag without disturbing VRAM accounting.
