@@ -59,8 +59,15 @@ func GenerateFirewall(deviceName string, uuid string) error {
 		return fmt.Errorf("CDI spec serialisation failed: %w", err)
 	}
 
-	// Named by UUID so TeardownFirewall can find the file without extra lookup.
-	filePath := filepath.Join(cdiDirectory, fmt.Sprintf("%s-%s.json", vendorName, uuid))
+	// Named by ALLOCATION (deviceName), not by GPU UUID. On real hardware every
+	// slice on a node shares the same physical GPU UUID, so a uuid-named file
+	// meant: the second slice's spec OVERWROTE the first's (its CDI device
+	// vanished — any container restart of the first pod then failed CDI
+	// resolution), and releasing any one slice deleted the shared file,
+	// revoking every other slice on the GPU. One file per allocation keeps
+	// specs independent; containerd merges all spec files for the vendor/class.
+	// (The mock allocator's unique fake UUIDs masked this in kind testing.)
+	filePath := filepath.Join(cdiDirectory, fmt.Sprintf("%s-%s.json", vendorName, deviceName))
 	// Round-3 fix: atomic write. A crash mid-write would otherwise leave a
 	// partial JSON file that containerd fails to parse.
 	tmpPath := filePath + ".tmp"
@@ -70,11 +77,13 @@ func GenerateFirewall(deviceName string, uuid string) error {
 	return os.Rename(tmpPath, filePath)
 }
 
-// TeardownFirewall removes the CDI spec file, revoking the container's hardware access.
-func TeardownFirewall(uuid string) error {
-	filePath := filepath.Join(cdiDirectory, fmt.Sprintf("%s-%s.json", vendorName, uuid))
+// TeardownFirewall removes one allocation's CDI spec file, revoking that
+// container's hardware access — and ONLY that container's. Takes the
+// AllocationID (the same name GenerateFirewall keyed the file by).
+func TeardownFirewall(allocationID string) error {
+	filePath := filepath.Join(cdiDirectory, fmt.Sprintf("%s-%s.json", vendorName, allocationID))
 	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to teardown CDI firewall for %s: %w", uuid, err)
+		return fmt.Errorf("failed to teardown CDI firewall for %s: %w", allocationID, err)
 	}
 	return nil
 }

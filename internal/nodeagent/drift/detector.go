@@ -30,14 +30,41 @@ func (d *Detector) DetectAndHeal(ctx context.Context) error {
 		return fmt.Errorf("loading checkpoint: %w", err)
 	}
 
-	hardwareAllocations := d.allocator.InspectAllHardware()
+	hardwareAllocations, inspectable := d.allocator.InspectAllHardware()
 
 	// Bug #13 fix: accumulate errors rather than dropping them.
 	var errs []error
 
 	for allocID, record := range diskRecords {
-		if hardwareAllocations[allocID] {
+		if inspectable && hardwareAllocations[allocID] {
 			delete(hardwareAllocations, allocID)
+			continue
+		}
+
+		// When the hardware CANNOT enumerate allocations (no MIG partitioning
+		// yet — InspectAllHardware returns supported=false), absence from the
+		// empty map is NOT evidence of loss. Treating it as loss mass-failed
+		// every Ready slice with a persisted checkpoint on agent restart.
+		// We still reconcile against the API: a checkpoint whose slice no
+		// longer exists is dead weight and is pruned; a live slice is left
+		// strictly alone.
+		if !inspectable {
+			if d.k8sClient == nil {
+				continue
+			}
+			var slice vgpuv1alpha1.VGPUSlice
+			key := client.ObjectKey{Namespace: record.Namespace, Name: record.SliceName}
+			if err := d.k8sClient.Get(ctx, key, &slice); err != nil {
+				if client.IgnoreNotFound(err) == nil {
+					log.Printf("Recovery: checkpoint %s has no slice in the API — pruning", allocID)
+					if err := d.store.Delete(allocID); err != nil {
+						errs = append(errs, fmt.Errorf("pruning dead checkpoint %s: %w", allocID, err))
+					}
+				} else {
+					// Transient API error — keep the checkpoint; do not guess.
+					errs = append(errs, fmt.Errorf("checking slice for checkpoint %s: %w", allocID, err))
+				}
+			}
 			continue
 		}
 

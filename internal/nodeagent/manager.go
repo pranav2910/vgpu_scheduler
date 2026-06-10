@@ -95,12 +95,14 @@ func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSl
 
 		// Guard: a slice deleted before ever reaching Allocating has no
 		// DeviceUUID / AllocationID. Bug C + Bug #8 co-fix.
-		if slice.Status.DeviceUUID != "" {
-			if err := cdi.TeardownFirewall(slice.Status.DeviceUUID); err != nil {
+		//
+		// CDI teardown is keyed by AllocationID (the spec file is per-allocation;
+		// keying by DeviceUUID deleted the file SHARED by every slice on the GPU,
+		// revoking innocent neighbors — see cdi.GenerateFirewall).
+		if slice.Status.AllocationID != "" {
+			if err := cdi.TeardownFirewall(slice.Status.AllocationID); err != nil {
 				return fmt.Errorf("tearing down CDI firewall: %w", err)
 			}
-		}
-		if slice.Status.AllocationID != "" {
 			if err := m.Allocator.Release(ctx, slice.Status.AllocationID); err != nil {
 				return fmt.Errorf("NVML release: %w", err)
 			}

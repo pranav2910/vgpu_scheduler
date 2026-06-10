@@ -80,9 +80,16 @@ func (a *Allocator) Release(ctx context.Context, allocationID string) error {
 	return nil
 }
 
-func (a *Allocator) InspectAllHardware() map[string]bool {
-	if !a.initialized || a.mockMode {
-		return make(map[string]bool)
-	}
-	return make(map[string]bool)
+// InspectAllHardware enumerates live hardware allocations, returning
+// (allocations, true) when an authoritative inventory was actually taken.
+//
+// Today it returns (nil, false) in BOTH modes: allocations are bookkeeping on
+// a shared GPU (no MIG partitioning yet), so the hardware cannot enumerate
+// them. The supported flag exists because the drift detector must not confuse
+// "I cannot inspect" with "the hardware is empty" — treating an empty map as
+// authoritative would mass-fail every Ready slice with a persisted checkpoint
+// on agent restart ("Device missing from PCIe bus" for 100% of records).
+// Real enumeration arrives with MIG-backed partitioning (3.4e).
+func (a *Allocator) InspectAllHardware() (map[string]bool, bool) {
+	return nil, false
 }
