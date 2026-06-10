@@ -91,8 +91,13 @@ else
 fi
 
 # ── 3. CDI spec on the node (read via the agent, which mounts /var/run/cdi) ───
+# The spec file is keyed by ALLOCATION ID (one independent file per slice), not
+# by GPU UUID — every slice on a node shares the physical GPU's UUID, and a
+# uuid-named file meant slice B's spec overwrote slice A's (and releasing one
+# slice revoked them all). The device name inside still matches what the
+# mutating webhook requests.
 hdr "CDI spec on the node"
-CDI_FILE="/var/run/cdi/infrastructure.pranav2910.com-${uuid}.json"
+CDI_FILE="/var/run/cdi/infrastructure.pranav2910.com-${alloc}.json"
 cdi_json="$(agent_exec cat "$CDI_FILE")"
 if [[ -n "$cdi_json" ]]; then
     ok "CDI spec written: $CDI_FILE"
