@@ -112,6 +112,19 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, nil
 	}
 
+	// A terminal Job stays terminal. Without this guard, deleting a finished
+	// job's claim (a natural way to free its slice) hit the claim-recreate path
+	// below, which overwrote Succeeded/Failed back to ClaimCreated — defeating
+	// reconcileWorkloadPod's no-resurrect guard (it keys on the terminal phase).
+	// The recreated claim then got a fresh slice bound (capacity consumed by a
+	// finished job at minimum), and if the completed pod had been GC'd, the
+	// workload was recreated and re-ran.
+	if job.Status.Phase == vgpuv1alpha1.JobPhaseSucceeded ||
+		job.Status.Phase == vgpuv1alpha1.JobPhaseFailed ||
+		job.Status.Phase == vgpuv1alpha1.JobPhaseCompleted {
+		return reconcile.Result{}, nil
+	}
+
 	// 1. Ensure a Claim exists for this Job.
 	claimName := claimNameForJob(job.Name)
 	var claim vgpuv1alpha1.VGPUClaim
@@ -190,6 +203,11 @@ func derivePhaseFromClaim(claim *vgpuv1alpha1.VGPUClaim) (vgpuv1alpha1.VGPUJobPh
 		// Claim is Bound but Slice could still be in any state.
 		// Treat Bound as "Scheduled" — the actual workload running is Phase 2.1b.
 		return vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled and ready"
+	case "Scheduled":
+		// The claim reconciler reports "Scheduled" while the slice is placed but
+		// not yet allocated; mapping it to the default (ClaimCreated) regressed
+		// an already-scheduled job's phase.
+		return vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled; awaiting allocation"
 	case "Pending", "":
 		return vgpuv1alpha1.JobPhaseClaimCreated, "Awaiting scheduler"
 	case "Failed":

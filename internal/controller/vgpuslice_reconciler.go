@@ -69,8 +69,17 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 			log.Printf("[preempting] %s/%s grace remaining %v", slice.Namespace, slice.Name, remaining.Round(time.Second))
 			return reconcile.Result{RequeueAfter: remaining}, nil
 		}
-		log.Printf("[preempting] %s/%s grace expired -> Released", slice.Namespace, slice.Name)
-		slice.Status.Phase = state.SlicePhaseReleased
+		// Releasing, NOT Released: stamping Released directly skipped the node
+		// agent entirely (its release path triggers on Releasing/deletion only),
+		// so the victim's CDI file, NVML allocation, and checkpoint were never
+		// torn down — while the scheduler, seeing "Released", freed the bytes
+		// and re-sold capacity the hardware still held. Routing through
+		// Releasing runs the same teardown as deletion; the agent confirms
+		// Released (and zeroes the allocation fields, honoring the Released
+		// invariant) only after the hardware is actually free.
+		log.Printf("[preempting] %s/%s grace expired -> Releasing (node agent tears down, then confirms Released)",
+			slice.Namespace, slice.Name)
+		slice.Status.Phase = state.SlicePhaseReleasing
 		if err := r.Client.Status().Update(ctx, &slice); err != nil {
 			return reconcile.Result{}, err
 		}

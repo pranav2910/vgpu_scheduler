@@ -187,10 +187,14 @@ func (r *VGPUGangReservationReconciler) continueTeardown(
 			allGone = false
 			break
 		}
-		// Also check the slice in case the claim is gone but the slice lingers
+		// Also check the slice in case the claim is gone but the slice lingers.
+		// A transient Get error must NOT count as "gone" (symmetric with the
+		// claim check above): treating it as absence let a network blip flip
+		// the reservation Failed→Released — terminal — while an orphan slice
+		// still held its finalizer and capacity, with teardown retries stopped.
 		var slice vgpuv1alpha1.VGPUSlice
 		err = r.Client.Get(ctx, types.NamespacedName{Namespace: rsv.Namespace, Name: claimName + "-slice"}, &slice)
-		if err == nil {
+		if err == nil || !errors.IsNotFound(err) {
 			allGone = false
 			break
 		}
