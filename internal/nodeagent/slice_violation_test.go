@@ -80,7 +80,10 @@ func fixture(t *testing.T, procUsed int64) (*SliceViolationDetector, client.Clie
 
 func TestAttribute_ProcessToSliceViaClaimRef(t *testing.T) {
 	d, _ := fixture(t, 12*giB)
-	usage, err := d.attribute(context.Background(), []gpu.GPUProcess{{PID: 4242, UsedMemoryBytes: 12 * giB}})
+	// The snapshot passed in must carry the device: attribute() confirms each
+	// (PID, device) pair against a second provider snapshot (the PID-reuse
+	// sandwich), and the fixture's stub reports this process on "g0".
+	usage, err := d.attribute(context.Background(), []gpu.GPUProcess{{PID: 4242, DeviceUUID: "g0", UsedMemoryBytes: 12 * giB}})
 	if err != nil {
 		t.Fatalf("attribute: %v", err)
 	}
