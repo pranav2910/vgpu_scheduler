@@ -1,6 +1,6 @@
 # vGPU Scheduler — Benchmarks & Validation Report
 
-*Last run: 2026-06-09 · single NVIDIA H100 80GB (k3s v1.35.5) + a kind control-plane battery.*
+*Last run: 2026-06-11 · single NVIDIA H100 80GB (k3s v1.35.5) + a kind control-plane battery.*
 
 This report is **reproducible, not rhetorical**: every number below comes from a
 script in this repo, and the "Reproduce it yourself" section runs the whole thing
@@ -168,11 +168,11 @@ process-used tracks the reserved pool by construction.
 
 ---
 
-## Result 4 — Correctness & resilience (14-test adversarial battery)
+## Result 4 — Correctness & resilience (15-test adversarial battery)
 
 `real_world_test.sh` goes well beyond happy-path: it over-subscribes capacity, crashes
 the controller and scheduler under load, kills the leader mid-bind, and runs sustained
-submit/delete soak — asserting the core invariants hold throughout. **Latest: 14/14.**
+submit/delete soak — asserting the core invariants hold throughout. **Latest: 15/15.**
 
 | # | Test | Asserts |
 |---|---|---|
@@ -185,6 +185,7 @@ submit/delete soak — asserting the core invariants hold throughout. **Latest: 
 | 2.6 | Delete during in-flight scheduling | no orphaned reservation |
 | 2.7 | Gang vs preemption (atomicity) | gang intact; high-prio correctly unscheduled |
 | 2.8 | Scheduler leader failover (HA) | clean `leader_active` transfer, warm-up before Ready |
+| 2.9 | Child deleted after commit | committed gang fails LOUD (child lost) → teardown → capacity reclaimed, no orphans |
 | 3.1 | Heterogeneous gangs | safety + liveness |
 | 3.2 | Impossible gang (anti-starvation) | un-assemblable gang backs off, never blocks |
 | 3.3 | Sustained soak | no capacity leak over many cycles |
@@ -277,10 +278,10 @@ bash scripts/validate-submit-flow-h100.sh          # → PASS=14 FAIL=0
 bash demo/h100-before-after.sh                      # → 4 packed on one GPU, ~80%, 5th held
 ```
 
-The 14-test adversarial battery runs on a laptop with no GPU:
+The 15-test adversarial battery runs on a laptop with no GPU:
 
 ```sh
-bash scripts/setup-kind-cluster.sh && bash real_world_test.sh   # → 14/14
+bash scripts/setup-kind-cluster.sh && bash real_world_test.sh   # → 15/15
 ```
 
 Full runbook: [INSTALL-H100.md](INSTALL-H100.md).

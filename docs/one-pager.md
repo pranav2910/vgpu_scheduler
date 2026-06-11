@@ -32,7 +32,7 @@ waste before adopting anything.
 - **4 workloads on one 80 GB H100** where vanilla Kubernetes runs **1** → **~25% → ~80%** memory utilization.
 - The **5th is safely held** — the scheduler refuses to over-commit the card (no OOM roulette).
 - **Right-sizing works**: a job that asked for 16 GiB but used 21.5 GiB was recommended 24.7 GiB; in `autoResize` mode the request is corrected **before scheduling**, audited.
-- **Hardened**: a 14-test adversarial battery (over-subscription, leader-kill-mid-bind, gang atomicity, soak) passes **14/14**; data-plane + runtime suites pass on real A10 + H100.
+- **Hardened**: a 15-test adversarial battery (over-subscription, leader-kill-mid-bind, gang atomicity, child-loss, soak) passes **15/15**; data-plane + runtime suites pass on real A10 + H100.
 - **Zero-risk entry point works**: the read-only monitor, live on an H100, flagged two jobs over-asking by ~37 GiB (~$1,000/mo) beside the stock scheduler — and its waste math was adversarially bug-hunted, catching a 7.8× over-report (finished/pending pods counted as waste) and fixing it *before* shipping.
 
   *Evidence + methodology: [benchmarks.md](benchmarks.md).*
@@ -62,4 +62,4 @@ cards. Sweet spot: teams with their own GPU clusters who want better utilization
 
 ---
 
-*Apache-2.0 · github.com/pranav2910/vgpu_scheduler · latest: v0.12 (read-only monitor) · runbook: [INSTALL-H100.md](INSTALL-H100.md) · try it: `docs/USER-GUIDE.md`*
+*Apache-2.0 · github.com/pranav2910/vgpu_scheduler · latest: v0.13 (correctness hardening, 24 fixes) · runbook: [INSTALL-H100.md](INSTALL-H100.md) · try it: `docs/USER-GUIDE.md`*

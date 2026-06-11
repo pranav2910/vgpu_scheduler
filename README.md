@@ -28,7 +28,7 @@ detect VRAM over-use → attribute it to the exact workload → warn → opt-in 
 
 ## Validated guarantees
 
-The scheduler is exercised by a **14-test battery** (`real_world_test.sh`) that
+The scheduler is exercised by a **15-test battery** (`real_world_test.sh`) that
 goes well beyond happy-path unit tests — it crashes processes, kills the leader
 under load, over-subscribes capacity, and runs sustained submit/delete cycles,
 asserting the core invariants hold throughout.
@@ -45,7 +45,7 @@ Coverage:
 - **No capacity leak** across sustained scheduling cycles
 - **Topology** soft zone preference, with an auditable placement condition
 
-**Latest result: 14/14 green** (Wave 1 correctness, Wave 2 chaos, Wave 3
+**Latest result: 15/15 green** (Wave 1 correctness, Wave 2 chaos, Wave 3
 adversarial). The Wave 3 adversarial suite found and closed a real
 gang-vs-quota composition bug — the kind of cross-subsystem defect that only
 surfaces under combined load.
@@ -125,7 +125,7 @@ See [docs/metrics.md](docs/metrics.md).
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — **for ML engineers, in 5 minutes**: install the CLI, run a workload on a shared GPU, right-size it (copy-paste)
 - [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: the full manual — `vgpu submit / status / profile`, right-sizing, gang jobs, troubleshooting
 - [docs/INSTALL-H100.md](docs/INSTALL-H100.md) — **for platform/admins**: from-scratch control-plane install on a real GPU node (clone → `h100-control-plane.sh` → validate), with the before/after packing proof
-- [docs/benchmarks.md](docs/benchmarks.md) — **the numbers**: 4× packing / ~80% utilization / no over-commit / right-sizing on a 1× H100, the 14-test battery, and how to reproduce it all
+- [docs/benchmarks.md](docs/benchmarks.md) — **the numbers**: 4× packing / ~80% utilization / no over-commit / right-sizing on a 1× H100, the 15-test battery, and how to reproduce it all
 - [docs/one-pager.md](docs/one-pager.md) — **the 2-minute brief**: problem → solution → proof → differentiator → honest limits → who it's for (also linked at the top)
 - [docs/customer-discovery.md](docs/customer-discovery.md) — **for founders**: a Mom-Test call guide for talking to GPU/ML platform teams (problem-first, no pitching)
 - [DEMO.md](DEMO.md) — end-to-end walkthrough: control plane on kind, then runtime intelligence on a real GPU
