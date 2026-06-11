@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -164,6 +168,74 @@ func TestObserveSkipsNonRunningPods(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(telemetry.MonitorPodRequestedVRAMBytes.WithLabelValues("default", "running-pod", "node1", "annotation")); got != float64(16*GiB) {
 		t.Errorf("running-pod requested = %v, want %d", got, 16*GiB)
+	}
+}
+
+// TestObservePIDReuseSandwich is the regression test for PID-reuse
+// misattribution: a GPU process that exits between the NVML snapshot and the
+// /proc cgroup read can have its PID recycled into ANOTHER pod's cgroup,
+// charging the dead process's VRAM to the wrong pod. observe() now takes two
+// NVML snapshots around the cgroup resolution and attributes only (PID,
+// device) pairs present in both, with snapshot-2 bytes.
+func TestObservePIDReuseSandwich(t *testing.T) {
+	resetMonitorGauges()
+	const GiB = int64(1024 * 1024 * 1024)
+
+	// Synthetic host /proc: two pods' GPU processes.
+	procRoot := t.TempDir()
+	writeCgroup := func(pid int, uid string) {
+		t.Helper()
+		dir := procRoot + "/" + strconv.Itoa(pid)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// systemd-driver cgroup v2 form; the parser normalizes _ back to -.
+		line := "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" +
+			strings.ReplaceAll(uid, "-", "_") + ".slice/cri-containerd-abc.scope\n"
+		if err := os.WriteFile(dir+"/cgroup", []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const uidA = "11111111-1111-1111-1111-111111111111"
+	const uidB = "22222222-2222-2222-2222-222222222222"
+	writeCgroup(101, uidA)
+	writeCgroup(202, uidB)
+
+	mkpod := func(name, uid string) corev1.Pod {
+		return corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default", Name: name, UID: types.UID(uid),
+				Annotations: map[string]string{"gpu-memory": "8192"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+	reader := &fakePodReader{pods: []corev1.Pod{mkpod("pod-a", uidA), mkpod("pod-b", uidB)}}
+
+	dev := gpu.GPUDevice{UUID: "GPU-T", TotalMemoryBytes: 80 * GiB, FreeMemoryBytes: 80 * GiB, Healthy: true}
+	// Snapshot #1: both processes on the GPU. Snapshot #2: pod-b's process
+	// (202) exited — its PID may already belong to someone else — and pod-a's
+	// usage moved 4 → 5 GiB (the fresher figure must win).
+	provider := gpu.NewFakeProviderWithProcessSequence([]gpu.GPUDevice{dev},
+		[]gpu.GPUProcess{
+			{PID: 101, DeviceUUID: "GPU-T", UsedMemoryBytes: 4 * GiB},
+			{PID: 202, DeviceUUID: "GPU-T", UsedMemoryBytes: 6 * GiB},
+		},
+		[]gpu.GPUProcess{
+			{PID: 101, DeviceUUID: "GPU-T", UsedMemoryBytes: 5 * GiB},
+		},
+	)
+
+	m := NewMonitorObserver(reader, "node1", provider, time.Second, nil)
+	m.procRoot = procRoot
+	m.observe(context.Background())
+
+	// pod-a attributed with snapshot-2 bytes; pod-b (vanished PID) NOT charged.
+	if got := testutil.ToFloat64(telemetry.MonitorPodUsedVRAMBytes.WithLabelValues("default", "pod-a", "node1", "GPU-T")); got != float64(5*GiB) {
+		t.Errorf("pod-a used = %v, want %d (snapshot-2 bytes)", got, 5*GiB)
+	}
+	if n := testutil.CollectAndCount(telemetry.MonitorPodUsedVRAMBytes); n != 1 {
+		t.Errorf("used series = %d, want 1 — a PID that vanished between snapshots must not be attributed (PID-reuse hazard)", n)
 	}
 }
 

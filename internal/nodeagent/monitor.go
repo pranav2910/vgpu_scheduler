@@ -133,17 +133,42 @@ func (m *MonitorObserver) observe(ctx context.Context) {
 
 	// 3. Actual usage: NVML processes → owning pod (PID → cgroup → pod UID),
 	//    summed per (pod, gpu).
+	//
+	// Snapshot SANDWICH against PID reuse: the kernel can recycle a PID between
+	// the NVML snapshot and the /proc/<pid>/cgroup read, charging a dead GPU
+	// process's VRAM to whichever pod inherited the PID. So: snapshot #1 →
+	// resolve cgroups (the slow part) → snapshot #2, and attribute only
+	// (PID, device) pairs present in BOTH, with #2's (fresher) bytes. A reused
+	// PID is not on the GPU in snapshot #2, so the stale row drops for the
+	// cycle; a process that started between snapshots is picked up next cycle.
 	procs, err := m.provider.ListProcesses(ctx)
 	if err != nil {
 		log.Printf("[monitor] ListProcesses: %v", err)
 		return
 	}
-	type key struct{ uid, gpu string }
-	used := map[key]int64{}
+	type pidDev struct {
+		pid int
+		dev string
+	}
+	resolved := make(map[pidDev]string, len(procs)) // → owning pod UID
 	for _, pr := range procs {
 		uid, err := podUIDForPID(m.procRoot, pr.PID)
 		if err != nil || uid == "" {
 			continue // not a pod's process (or /proc unreadable without hostPID)
+		}
+		resolved[pidDev{pr.PID, pr.DeviceUUID}] = uid
+	}
+	procs2, err := m.provider.ListProcesses(ctx)
+	if err != nil {
+		log.Printf("[monitor] ListProcesses (confirm): %v", err)
+		return // failed cycle: previous complete snapshot stays published
+	}
+	type key struct{ uid, gpu string }
+	used := map[key]int64{}
+	for _, pr := range procs2 {
+		uid, ok := resolved[pidDev{pr.PID, pr.DeviceUUID}]
+		if !ok {
+			continue // new since #1 (next cycle) or unresolvable
 		}
 		used[key{uid, pr.DeviceUUID}] += pr.UsedMemoryBytes
 	}

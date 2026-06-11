@@ -276,10 +276,36 @@ func (d *SliceViolationDetector) attribute(ctx context.Context, procs []gpu.GPUP
 	}
 
 	// 3. Attribute each process to its slice via cgroup → pod → claim → slice.
+	//
+	// Snapshot SANDWICH against PID reuse: the kernel can recycle a PID between
+	// the NVML snapshot and the /proc/<pid>/cgroup read, charging a dead GPU
+	// process's VRAM to whichever pod inherited the PID — and here that feeds
+	// ENFORCEMENT (a misattributed multi-GiB charge repeated across the streak
+	// window can soft-warn or, in evict mode, evict an innocent pod). Resolve
+	// cgroups for snapshot #1, take snapshot #2, and attribute only
+	// (PID, device) pairs present in BOTH, with #2's bytes. If snapshot #2
+	// fails the cycle is skipped cleanly — streaks untouched — rather than
+	// risking a wrong charge.
+	type pidDev struct {
+		pid int
+		dev string
+	}
+	resolved := make(map[pidDev]string, len(procs)) // → owning pod UID
 	for _, proc := range procs {
 		uid, err := podUIDForPID(d.procRoot, proc.PID)
 		if err != nil || uid == "" {
 			continue // not a pod process, or unreadable
+		}
+		resolved[pidDev{proc.PID, proc.DeviceUUID}] = uid
+	}
+	procs2, err := d.provider.ListProcesses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("confirming process snapshot: %w", err)
+	}
+	for _, proc := range procs2 {
+		uid, ok := resolved[pidDev{proc.PID, proc.DeviceUUID}]
+		if !ok {
+			continue // new since #1 (next cycle catches it) or unresolvable
 		}
 		ref, ok := byPodUID[uid]
 		if !ok {

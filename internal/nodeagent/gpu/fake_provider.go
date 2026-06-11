@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // This is the DEFAULT provider (no `nvml` build tag). It synthesises a
@@ -30,6 +31,13 @@ type fakeProvider struct {
 	devices   []GPUDevice
 	processes []GPUProcess
 	failErr   error // when set, list calls return this (degraded simulation)
+
+	// procSeq, when non-nil, makes successive ListProcesses calls return each
+	// list in order (repeating the last) — for tests exercising the
+	// two-snapshot PID-reuse sandwich in attribution.
+	procSeq [][]GPUProcess
+	procIdx int
+	mu      sync.Mutex
 }
 
 // NewProvider is the build-tag-selected constructor. The fake build never fails
@@ -88,6 +96,14 @@ func NewFakeProvider(devices []GPUDevice, failErr error) GPUProvider {
 	return &fakeProvider{devices: devices, failErr: failErr}
 }
 
+// NewFakeProviderWithProcessSequence constructs a fake whose successive
+// ListProcesses calls return each given list in order, repeating the last.
+// Lets tests drive the two-snapshot PID-reuse sandwich (a PID present in
+// snapshot #1 but gone in #2 must not be attributed).
+func NewFakeProviderWithProcessSequence(devices []GPUDevice, seq ...[]GPUProcess) GPUProvider {
+	return &fakeProvider{devices: devices, procSeq: seq}
+}
+
 func (f *fakeProvider) Name() string { return "fake" }
 
 func (f *fakeProvider) ListDevices(context.Context) ([]GPUDevice, error) {
@@ -115,6 +131,19 @@ func (f *fakeProvider) GetDevice(_ context.Context, uuid string) (*GPUDevice, er
 func (f *fakeProvider) ListProcesses(context.Context) ([]GPUProcess, error) {
 	if f.failErr != nil {
 		return nil, f.failErr
+	}
+	if f.procSeq != nil {
+		f.mu.Lock()
+		i := f.procIdx
+		if i >= len(f.procSeq) {
+			i = len(f.procSeq) - 1
+		} else {
+			f.procIdx++
+		}
+		f.mu.Unlock()
+		out := make([]GPUProcess, len(f.procSeq[i]))
+		copy(out, f.procSeq[i])
+		return out, nil
 	}
 	out := make([]GPUProcess, len(f.processes))
 	copy(out, f.processes)
