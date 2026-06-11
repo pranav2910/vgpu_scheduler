@@ -71,7 +71,7 @@ sp=$(kubectl get vgpuslice "$SLICE" -n "$NS" -o jsonpath='{.status.phase}' 2>/de
 uuid=$(kubectl get vgpuslice "$SLICE" -n "$NS" -o jsonpath='{.status.deviceUuid}' 2>/dev/null)
 [[ -n "$node" ]] && ok "scheduler placed the slice on $node" || bad "slice has no nodeName — scheduler didn't place it (node capacity advertised?)"
 [[ "$sp" == "Ready" ]] && ok "slice Ready (node agent allocated)" || bad "slice not Ready (got '${sp:-<none>}')"
-[[ "$uuid" == GPU-* && "$uuid" != GPU-MOCK* ]] && ok "slice bound a REAL GPU ($uuid)" || bad "slice deviceUuid not a real GPU (got '${uuid:-<none>}')"
+[[ "$uuid" == GPU-* && "$uuid" != GPU-MOCK* && "$uuid" != GPU-FAKE* ]] && ok "slice bound a REAL GPU ($uuid)" || bad "slice deviceUuid not a real GPU (got '${uuid:-<none>}')"
 
 # ── the pod auto-ran on the shared GPU (the webhook injected it) ─────────────
 hdr "pod auto-runs on the shared GPU (webhook injected it)"
@@ -119,7 +119,7 @@ dcp=$(kubectl get vgpuclaim "$DCLAIM" -n "$NS" -o jsonpath='{.status.phase}' 2>/
 downer=$(kubectl get pod "$DPOD" -n "$NS" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
 [[ "$downer" == "VGPUJob" ]] && ok "Pod is OWNED by the VGPUJob (the CONTROLLER created it, not us)" || bad "pod not owned by VGPUJob (got '${downer:-<none>}')"
 duuid=$(kubectl get vgpuslice "$DSLICE" -n "$NS" -o jsonpath='{.status.deviceUuid}' 2>/dev/null)
-[[ "$duuid" == GPU-* && "$duuid" != GPU-MOCK* ]] && ok "declarative slice bound a REAL GPU ($duuid)" || bad "slice deviceUuid not a real GPU (got '${duuid:-<none>}')"
+[[ "$duuid" == GPU-* && "$duuid" != GPU-MOCK* && "$duuid" != GPU-FAKE* ]] && ok "declarative slice bound a REAL GPU ($duuid)" || bad "slice deviceUuid not a real GPU (got '${duuid:-<none>}')"
 [[ "$dpodphase" == "Running" || "$dpodphase" == "Succeeded" ]] && ok "pod auto-ran from a raw kubectl apply ($dpodphase)" || bad "declarative pod did not start (got '${dpodphase:-<none>}')"
 dpoduuid=$(kubectl exec "$DPOD" -n "$NS" -- nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d '\r' | head -1)
 [[ -n "$dpoduuid" && "$dpoduuid" == "$duuid" ]] \

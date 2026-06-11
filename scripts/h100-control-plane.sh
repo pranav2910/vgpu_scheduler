@@ -56,8 +56,12 @@ ok "CRDs + RBAC applied"
 
 # ── 1. advertise the node's vGPU capacity (the scheduler schedules against this) ─
 say "advertise node vGPU capacity"
-total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
-[[ -n "$total_mib" ]] || die "could not read GPU memory from nvidia-smi"
+# SUM across all GPUs (M-GPU: a node advertises the total of its healthy
+# cards — `head -1` advertised only device 0, stranding every other card on a
+# multi-GPU box). Card-level fit is enforced by the allocator's best-fit +
+# fragmentation fail-loud; this figure is the node-pooled scheduler's view.
+total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END {printf "%d", s}')
+[[ -n "$total_mib" && "$total_mib" -gt 0 ]] || die "could not read GPU memory from nvidia-smi"
 CAP="${VGPU_CAPACITY:-$(( total_mib * 1024 * 1024 ))}"
 kubectl patch node "$NODE" --subresource=status --type=merge \
     -p "{\"status\":{\"capacity\":{\"${VGPU_RESOURCE}\":\"${CAP}\"},\"allocatable\":{\"${VGPU_RESOURCE}\":\"${CAP}\"}}}" >/dev/null \

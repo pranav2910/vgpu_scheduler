@@ -2,6 +2,7 @@ package nodeagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -31,6 +32,19 @@ type Manager struct {
 func NewManager(nodeName string, k8sClient client.Client, mock bool) *Manager {
 	store := checkpoint.NewStore()
 	allocator := nvml.NewAllocator(mock)
+	// Re-seed the allocator's per-card ledger from persisted checkpoints, so an
+	// agent restart doesn't forget which cards already host slices — a blank
+	// ledger would let best-fit over-promise cards that are actually committed.
+	if records, err := store.LoadAll(); err != nil {
+		log.Printf("[allocator] WARNING: could not load checkpoints to seed the per-card ledger (%v) — proceeding with an empty ledger", err)
+	} else {
+		for id, rec := range records {
+			allocator.RestoreAllocation(id, rec.DeviceUUID, rec.AllocatedBytes)
+		}
+		if len(records) > 0 {
+			log.Printf("[allocator] per-card ledger re-seeded from %d checkpoint record(s)", len(records))
+		}
+	}
 	return &Manager{
 		NodeName:  nodeName,
 		Store:     store,
@@ -58,6 +72,15 @@ func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSl
 		result, err := m.Allocator.Allocate(ctx, req)
 		if err != nil {
 			telemetry.RecordHardwareAllocation(m.NodeName, false)
+			// Fragmentation is IMPOSSIBLE, not transient: the node-pooled
+			// scheduler admitted a slice no single GPU can host. Fail the slice
+			// loud (terminal, reason on status, mirrored to the job) instead of
+			// retry-looping against the same arithmetic forever.
+			var frag *nvml.FragmentationError
+			if errors.As(err, &frag) {
+				log.Printf("[allocator] slice %s/%s FAILED LOUD: %s", slice.Namespace, slice.Name, frag.Error())
+				return m.Reporter.ReportAllocationFailed(ctx, slice, frag.Error())
+			}
 			return fmt.Errorf("NVML allocate: %w", err)
 		}
 		telemetry.RecordHardwareAllocation(m.NodeName, true)

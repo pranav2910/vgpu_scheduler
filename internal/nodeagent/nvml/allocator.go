@@ -3,6 +3,9 @@ package nvml
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -18,13 +21,71 @@ type AllocationResult struct {
 	AllocatedBytes int64
 }
 
+// allocDevice is one physical GPU as the allocator sees it: identity plus the
+// memory figures that matter for placement.
+type allocDevice struct {
+	uuid     string
+	total    int64
+	reserved int64 // driver-reserved — allocatable to nobody
+}
+
+// Allocator places slices onto physical GPUs (M-GPU: multiple cards per node).
+//
+// Placement is BEST-FIT: the healthy card with the smallest free space that
+// still fits, which preserves large holes for large future slices. "Free" is
+//
+//	available = card total − driver reserved − committed ledger
+//
+// NOT raw NVML free: a slice can be granted before its workload starts using
+// VRAM, and raw free would let that promised-but-idle capacity be sold twice.
+// The ledger is the allocator's own per-card bookkeeping; it survives agent
+// restarts by being re-seeded from the checkpoint store (RestoreAllocation).
+//
+// One slice maps to exactly ONE card — never split across cards. If no single
+// card fits, Allocate fails LOUD with FragmentationError (the node-pooled
+// scheduler may admit a slice the cards cannot host; the allocator is the last
+// line of defense and must say so, not retry silently).
 type Allocator struct {
 	mockMode    bool
 	initialized bool
+
+	mu        sync.Mutex
+	committed map[string]int64       // device UUID → bytes promised to slices
+	byAlloc   map[string]ledgerEntry // allocationID → entry (Release returns the right card's bytes)
+}
+
+type ledgerEntry struct {
+	deviceUUID string
+	bytes      int64
 }
 
 func NewAllocator(mock bool) *Allocator {
-	return &Allocator{mockMode: mock, initialized: true}
+	return &Allocator{
+		mockMode:    mock,
+		initialized: true,
+		committed:   make(map[string]int64),
+		byAlloc:     make(map[string]ledgerEntry),
+	}
+}
+
+// FragmentationError: the node has enough free VRAM in total, but no single
+// GPU can host the request. The message format is part of the fail-loud
+// contract surfaced on the slice/job — keep it stable.
+type FragmentationError struct {
+	RequestedBytes int64
+	NodeFreeBytes  int64
+}
+
+func (e *FragmentationError) Error() string {
+	return fmt.Sprintf("No single GPU has %s free; node has %s free across GPUs. Fragmented capacity.",
+		humanGi(e.RequestedBytes), humanGi(e.NodeFreeBytes))
+}
+
+func humanGi(b int64) string {
+	if b%(1<<30) == 0 {
+		return fmt.Sprintf("%dGi", b>>30)
+	}
+	return fmt.Sprintf("%.1fGi", float64(b)/(1<<30))
 }
 
 func (a *Allocator) Allocate(ctx context.Context, req AllocationRequest) (*AllocationResult, error) {
@@ -34,41 +95,63 @@ func (a *Allocator) Allocate(ctx context.Context, req AllocationRequest) (*Alloc
 	if req.SliceUID == "" {
 		return nil, fmt.Errorf("allocation request missing SliceUID")
 	}
+	if req.RequestedVRAMBytes <= 0 {
+		return nil, fmt.Errorf("allocation request for %q has non-positive RequestedVRAMBytes (%d)",
+			req.SliceUID, req.RequestedVRAMBytes)
+	}
+
+	devices, err := a.devices()
+	if err != nil {
+		return nil, fmt.Errorf("enumerating GPUs: %w", err)
+	}
 
 	// Bug #11 fix: don't assume 8+ characters.
 	short := req.SliceUID
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	now := time.Now().UnixNano()
-	allocID := fmt.Sprintf("alloc-%s-%d", short, now)
-	// Bug #21: unique UUID per allocation so CDI files don't collide.
-	devUUID := fmt.Sprintf("GPU-MOCK-%s-%d", short, now)
+	allocID := fmt.Sprintf("alloc-%s-%d", short, time.Now().UnixNano())
 
-	if !a.mockMode {
-		// Real build: bind the slice to a physical GPU and record its TRUE UUID
-		// (physicalGPUUUID is build-tagged — real NVML under -tags nvml, a no-op
-		// stub otherwise). This product models one GPU per node, so the slice
-		// maps to that GPU; per-process VRAM isolation is the runtime-enforcement
-		// layer (Phase 3.4), not a hardware partition. NOTE: the device-node /
-		// driver-library injection that lets the container actually open the GPU
-		// is finalized + validated on real hardware — see docs/runtime-enforcement.md.
-		uuid, err := physicalGPUUUID()
-		if err != nil {
-			return nil, fmt.Errorf("binding physical GPU: %w", err)
-		}
-		if uuid != "" {
-			devUUID = uuid
-		}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	uuid, err := a.pickBestFitLocked(devices, req.RequestedVRAMBytes)
+	if err != nil {
+		return nil, err
 	}
+	a.committed[uuid] += req.RequestedVRAMBytes
+	a.byAlloc[allocID] = ledgerEntry{deviceUUID: uuid, bytes: req.RequestedVRAMBytes}
 
 	return &AllocationResult{
 		AllocationID:   allocID,
-		DeviceUUID:     devUUID,
+		DeviceUUID:     uuid,
 		AllocatedBytes: req.RequestedVRAMBytes,
 	}, nil
 }
 
+// pickBestFitLocked returns the card with the smallest available space that
+// still fits the request. Caller must hold a.mu.
+func (a *Allocator) pickBestFitLocked(devices []allocDevice, req int64) (string, error) {
+	best := ""
+	var bestAvail int64 = -1
+	var nodeFree int64
+	for _, d := range devices {
+		avail := d.total - d.reserved - a.committed[d.uuid]
+		if avail < 0 {
+			avail = 0
+		}
+		nodeFree += avail
+		if avail >= req && (bestAvail < 0 || avail < bestAvail) {
+			best, bestAvail = d.uuid, avail
+		}
+	}
+	if best == "" {
+		return "", &FragmentationError{RequestedBytes: req, NodeFreeBytes: nodeFree}
+	}
+	return best, nil
+}
+
+// Release returns the allocation's bytes to its card in the ledger. Idempotent:
+// an unknown allocationID (already released, or never restored) is a no-op.
 func (a *Allocator) Release(ctx context.Context, allocationID string) error {
 	if !a.initialized {
 		return fmt.Errorf("allocator not initialised")
@@ -76,15 +159,89 @@ func (a *Allocator) Release(ctx context.Context, allocationID string) error {
 	if allocationID == "" {
 		return nil
 	}
-	// TODO: teardown CDI firewall and free NVML memory partition.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if e, ok := a.byAlloc[allocationID]; ok {
+		a.committed[e.deviceUUID] -= e.bytes
+		if a.committed[e.deviceUUID] <= 0 {
+			delete(a.committed, e.deviceUUID)
+		}
+		delete(a.byAlloc, allocationID)
+	}
 	return nil
+}
+
+// RestoreAllocation re-seeds the per-card ledger from a persisted checkpoint
+// record at agent startup, so commitments survive restarts — without this, a
+// restarted agent would see every card as empty and could over-promise cards
+// that already host slices. Duplicate allocationIDs are ignored (idempotent).
+func (a *Allocator) RestoreAllocation(allocationID, deviceUUID string, bytes int64) {
+	if allocationID == "" || deviceUUID == "" || bytes <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, dup := a.byAlloc[allocationID]; dup {
+		return
+	}
+	a.committed[deviceUUID] += bytes
+	a.byAlloc[allocationID] = ledgerEntry{deviceUUID: deviceUUID, bytes: bytes}
+}
+
+// CommittedBytes reports the ledger for one card (tests + observability).
+func (a *Allocator) CommittedBytes(deviceUUID string) int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.committed[deviceUUID]
+}
+
+// devices returns the cards the allocator may place on. Mock mode synthesizes
+// them from the same env knobs as the fake GPU provider — and with the SAME
+// stable UUIDs (GPU-FAKE-%08d) — so on kind the allocator's cards and the
+// observer's cards are the same cards. The real path is build-tagged
+// (enumerateDevices in allocator_nvml.go).
+func (a *Allocator) devices() ([]allocDevice, error) {
+	if a.mockMode {
+		count := envIntDefault("VGPU_FAKE_GPU_COUNT", 1)
+		if count < 0 {
+			count = 0
+		}
+		mem := envInt64Default("VGPU_FAKE_GPU_MEM_BYTES", 80<<30)
+		if mem < 0 {
+			mem = 0
+		}
+		out := make([]allocDevice, 0, count)
+		for i := 0; i < count; i++ {
+			out = append(out, allocDevice{uuid: fmt.Sprintf("GPU-FAKE-%08d", i), total: mem})
+		}
+		return out, nil
+	}
+	return enumerateDevices()
+}
+
+func envIntDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64Default(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 // InspectAllHardware enumerates live hardware allocations, returning
 // (allocations, true) when an authoritative inventory was actually taken.
 //
 // Today it returns (nil, false) in BOTH modes: allocations are bookkeeping on
-// a shared GPU (no MIG partitioning yet), so the hardware cannot enumerate
+// shared GPUs (no MIG partitioning yet), so the hardware cannot enumerate
 // them. The supported flag exists because the drift detector must not confuse
 // "I cannot inspect" with "the hardware is empty" — treating an empty map as
 // authoritative would mass-fail every Ready slice with a persisted checkpoint

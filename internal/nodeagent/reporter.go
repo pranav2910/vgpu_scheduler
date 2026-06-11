@@ -43,6 +43,21 @@ func (r *Reporter) ReportAllocationReady(ctx context.Context, slice *vgpuv1alpha
 	return r.client.Status().Update(ctx, slice)
 }
 
+// ReportAllocationFailed fails the slice LOUD with the given reason — used
+// when allocation is impossible (e.g. fragmentation: the node-pooled scheduler
+// admitted a slice no single GPU can host). Failed is terminal for the slice;
+// the claim/job mirror surfaces the reason to the user. Deliberately NOT a
+// retry: silent retry loops are exactly what the fail-loud contract forbids.
+func (r *Reporter) ReportAllocationFailed(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice, reason string) error {
+	if err := state.TransitionSlicePhase(slice, state.SlicePhaseFailed, "AllocationImpossible", reason); err != nil {
+		return fmt.Errorf("state transition to Failed: %w", err)
+	}
+	if r.client == nil {
+		return nil
+	}
+	return r.client.Status().Update(ctx, slice)
+}
+
 func (r *Reporter) ReportReleaseComplete(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
 	if err := state.TransitionSlicePhase(slice, state.SlicePhaseReleased, "CleanupComplete", "Hardware freed"); err != nil {
 		return fmt.Errorf("state transition to Released: %w", err)

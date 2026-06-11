@@ -83,7 +83,7 @@ alloc_ok=1
 [[ -n "$alloc" ]] && ok "allocationId present ($alloc)" || { bad "no allocationId"; alloc_ok=0; }
 [[ -n "$uuid"  ]] && ok "deviceUuid present ($uuid)"   || { bad "no deviceUuid"; alloc_ok=0; }
 [[ "$uuid" == GPU-* ]] && ok "deviceUuid is a GPU- UUID" || { bad "deviceUuid not GPU-* ('$uuid')"; alloc_ok=0; }
-if [[ "$uuid" == GPU-MOCK* ]]; then
+if [[ "$uuid" == GPU-MOCK* || "$uuid" == GPU-FAKE* ]]; then
     bad "deviceUuid is GPU-MOCK — the nvml allocator is NOT active. Re-run a10-bootstrap so the node agent is built -tags nvml."
     alloc_ok=0
 else
