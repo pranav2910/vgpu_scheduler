@@ -1088,6 +1088,80 @@ EOF
     return 0
 }
 
+# Test 2.9 — Child deleted after commit (fail-loud)
+# A committed gang is all-or-nothing. Deleting ONE child VGPUJob out from under
+# a Committed gang must NOT leave the gang advertised Committed forever while
+# the survivors hold VRAM (the pre-fix machine had no exit from Committed: the
+# tally showed 1 missing + no transition + a 5s requeue, for the life of the
+# object). Expected: reservation → Failed (reason "child lost after commit",
+# confirmed by a direct API read) → teardown of survivors → Released; committed
+# capacity returns to zero; no orphan slices.
+# ─────────────────────────────────────────────────────────────────────────────
+test_2_9_child_loss_after_commit() {
+    require_clean_baseline
+    local ns="${NS_PREFIX}-2-9-$(date +%s)"
+    kubectl create namespace "$ns" >/dev/null
+
+    log_to_report "**Setup:** Commit a 2 × 20 GiB gang, then \`kubectl delete\` one child VGPUJob. Assert the reservation fails loud (child lost after commit), survivors are torn down, committed capacity returns to zero."
+    log_to_report ""
+
+    # 1. Commit a 2-member gang (40 GiB total — fits comfortably).
+    submit_gang "$ns" "victim" 2 21474836480
+    if ! wait_for_pred 60 "victim gang Committed" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' victim-rsv -o jsonpath="{.status.phase}" 2>/dev/null);
+        [[ "$ph" == "Committed" ]]
+    '; then
+        fail "gang did not commit within 60s"
+        kubectl get vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "gang Committed (2/2); deleting child job victim-0 out from under it..."
+
+    # 2. Delete one child VGPUJob (cascades to its claim + slice).
+    kubectl delete vgpujob victim-0 -n "$ns" --wait=false >/dev/null 2>&1
+
+    # 3. The reservation must fail LOUD with the child-lost reason — not sit
+    #    Committed. (Failed may race straight through to Released; accept both
+    #    but require the reason.)
+    if ! wait_for_pred 60 "reservation fails loud (child lost after commit)" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' victim-rsv -o jsonpath="{.status.phase}" 2>/dev/null);
+        rsn=$(kubectl get vgpugangreservation -n '"$ns"' victim-rsv -o jsonpath="{.status.failureReason}" 2>/dev/null);
+        [[ ( "$ph" == "Failed" || "$ph" == "Released" ) && "$rsn" == *"child lost after commit"* ]]
+    '; then
+        fail "reservation did not fail loud after child deletion (stuck Committed = the bug)"
+        kubectl get vgpugangreservation,vgpuslice,vgpujob -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+    dim "reservation failed loud (child lost); awaiting teardown → Released + capacity return..."
+
+    # 4. Teardown completes: Released, committed capacity back to zero.
+    if ! wait_for_pred 90 "teardown completes (Released, committed capacity 0)" '
+        ph=$(kubectl get vgpugangreservation -n '"$ns"' victim-rsv -o jsonpath="{.status.phase}" 2>/dev/null || echo "Released");
+        cb=$(committed_bytes);
+        [[ "$ph" == "Released" && "$cb" == "0" ]]
+    '; then
+        fail "teardown incomplete after child-loss failure (survivors still holding capacity)"
+        kubectl get vgpugangreservation,vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    # 5. No orphan slices may remain holding VRAM.
+    local leftover
+    leftover=$(kubectl get vgpuslice -n "$ns" --no-headers 2>/dev/null | grep -cv '^$' || true)
+    if [[ "${leftover:-0}" != "0" ]]; then
+        fail "orphan slices remain after child-loss teardown ($leftover)"
+        kubectl get vgpuslice -n "$ns" 2>/dev/null
+        ns_cleanup "$ns"; return 1
+    fi
+
+    ok "child loss after commit fails LOUD: Failed (child lost) → teardown → Released; capacity reclaimed; no orphans"
+    log_to_report "- Reservation: \`Failed → Released\` with reason \`child lost after commit\`"
+    log_to_report "- Survivor torn down; committed capacity returned to 0; no orphan slices"
+    log_to_report "**Path:** ✅ A committed gang that loses a child fails loud and releases its capacity — it can no longer sit Committed forever holding VRAM."
+    ns_cleanup "$ns"
+    return 0
+}
+
 # Test 2.8 — Scheduler leader failover (HA, Phase 3.3)
 # Fill the cluster with 2 gangs (80 GiB) + a 3rd gang that cannot fit. Kill the
 # active scheduler leader. The hot standby must take over and, crucially,
@@ -1549,6 +1623,7 @@ run_test "2.1" "Capacity returns after Running"    test_2_1_capacity_returns_aft
 run_test "2.2" "Failed gang teardown"              test_2_2_failed_gang_teardown
 run_test "2.6" "Delete during in-flight scheduling" test_2_6_delete_during_inflight
 run_test "2.7" "Gang vs preemption (atomicity)"    test_2_7_gang_vs_preemption
+run_test "2.9" "Child deleted after commit (fail-loud)" test_2_9_child_loss_after_commit
 # Wave 3 — complex / adversarial (non-destructive ones here; chaos with the rest)
 run_test "3.1" "Heterogeneous gangs (safety+liveness)" test_3_1_heterogeneous_packing
 run_test "3.2" "Impossible gang (anti-starvation)"     test_3_2_impossible_gang_no_starvation

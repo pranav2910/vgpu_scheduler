@@ -9,10 +9,12 @@ import (
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -59,6 +61,13 @@ import (
 type VGPUGangReservationReconciler struct {
 	Client client.Client
 	Scheme *runtime.Scheme
+	// APIReader is the direct (uncached) reader, used ONLY to confirm a
+	// destructive decision: declaring a committed gang's child lost tears down
+	// the survivors, so the informer's view of an ABSENCE must be re-confirmed
+	// against the API server before acting. nil (tests) ⇒ trust the tally.
+	APIReader client.Reader
+	// Recorder emits the ChildLostAfterCommit warning event. nil-safe.
+	Recorder record.EventRecorder
 }
 
 // SetupWithManager registers the reconciler with a custom Watches() handler
@@ -133,6 +142,33 @@ func (r *VGPUGangReservationReconciler) Reconcile(ctx context.Context, req recon
 
 	// 3. Decide next phase based on current phase + tally.
 	nextPhase, reason, requeue := r.decideNextPhase(&rsv, tally)
+
+	// Destructive-decision discipline: a Committed→Failed transition driven by
+	// child LOSS tears down the surviving children, so the loss must be
+	// confirmed against the API server directly — the informer can lag, and an
+	// absence it alone reports must never trigger teardown. (A Failed driven
+	// by a slice's Failed PHASE is a positive observation; no absence
+	// confirmation needed.)
+	if nextPhase == vgpuv1alpha1.ReservationPhaseFailed &&
+		rsv.Status.Phase == vgpuv1alpha1.ReservationPhaseCommitted &&
+		strings.HasPrefix(reason, "child lost after commit") {
+		confirmed, cerr := r.childLossConfirmedDirect(ctx, &rsv)
+		if cerr != nil {
+			log.Printf("[gang-rsv] %s/%s: child loss suspected but direct confirmation errored (%v) — holding Committed, will re-check",
+				rsv.Namespace, rsv.Name, cerr)
+			return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		if !confirmed {
+			log.Printf("[gang-rsv] %s/%s: child loss suspected by the informer but NOT confirmed by direct read (stale cache) — holding Committed",
+				rsv.Namespace, rsv.Name)
+			return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		log.Printf("[gang-rsv] %s/%s: %s (confirmed by direct read) — failing loud", rsv.Namespace, rsv.Name, reason)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(&rsv, corev1.EventTypeWarning, "ChildLostAfterCommit",
+				"%s — tearing down surviving children and releasing the gang's capacity", reason)
+		}
+	}
 
 	// 4. Bug 4 fix: if we're transitioning to Failed, run teardown FIRST
 	// (so children get deleted), THEN re-tally (so status reflects reality),
@@ -354,8 +390,12 @@ func (r *VGPUGangReservationReconciler) decideNextPhase(
 		return vgpuv1alpha1.ReservationPhaseCommitted, "all slots committed", 30 * time.Second
 	}
 
-	// All reserved? Move to Reserved.
-	if t.reservedSlots >= gangSize {
+	// All reserved? Move to Reserved — but NEVER as a demotion from Committed:
+	// a committed gang whose deleted slice was recreated and re-scheduled would
+	// otherwise silently slip back to Reserved and "recover" on its own — the
+	// self-heal path this state machine deliberately does not implement (a
+	// post-commit child loss must fail loud; see the Committed case below).
+	if t.reservedSlots >= gangSize && cur != vgpuv1alpha1.ReservationPhaseCommitted {
 		return vgpuv1alpha1.ReservationPhaseReserved, "all slots reserved", 5 * time.Second
 	}
 
@@ -388,9 +428,78 @@ func (r *VGPUGangReservationReconciler) decideNextPhase(
 		// Reserved but committed dropped — slice torn down externally.
 		return vgpuv1alpha1.ReservationPhaseFailed,
 			"slice regression after Reserved (external teardown?)", 0
+
+	case vgpuv1alpha1.ReservationPhaseCommitted:
+		// Post-commit child loss — fail LOUD. A committed gang is all-or-
+		// nothing: a child claim/slice that is deleted (missing), deleted-and-
+		// regenerated (pending again), or mid-deletion means the gang no longer
+		// holds its committed allocation. This state previously had no case at
+		// all, so it fell through to "no transition" and sat there FOREVER —
+		// the gang advertised Running/healthy, the surviving slices holding
+		// VRAM indefinitely, the reconciler requeueing every 5s for the life
+		// of the object. Transitioning to Failed routes through the existing
+		// teardown machinery (continueTeardown → Released), which reclaims the
+		// survivors' capacity and surfaces the reason. Self-heal is
+		// deliberately NOT attempted: recreating a deleted child would
+		// override operator intent and needs policy (who deleted it? preserve
+		// priority/quota? is the workload idempotent?) — resubmission is the
+		// recovery path.
+		if lost := t.missingSlots + t.pendingSlots + t.tearingDownSlots; lost > 0 {
+			return vgpuv1alpha1.ReservationPhaseFailed,
+				fmt.Sprintf("child lost after commit: %d/%d slot(s) no longer hold their committed allocation (%d missing, %d regenerated, %d deleting)",
+					lost, gangSize, t.missingSlots, t.pendingSlots, t.tearingDownSlots),
+				0
+		}
+		// Every child exists and none is lost, but fewer than gangSize are
+		// Ready (a regenerated slice mid-reschedule, or a status flap). Hold
+		// Committed — never silently demote — and re-check shortly.
+		return cur, fmt.Sprintf("committed, degraded: %d/%d slots Ready", t.committedSlots, gangSize), 5 * time.Second
 	}
 
 	return cur, "no transition", 5 * time.Second
+}
+
+// childLossConfirmedDirect re-checks a suspected post-commit child loss
+// against the API server DIRECTLY (no informer). The informer can lag a burst
+// of writes; an absence it reports must not, on its own, trigger teardown of
+// the surviving children. Returns true only when some child claim/slice is
+// confirmed missing, mid-deletion, or no longer holding its allocation.
+func (r *VGPUGangReservationReconciler) childLossConfirmedDirect(ctx context.Context, rsv *vgpuv1alpha1.VGPUGangReservation) (bool, error) {
+	if r.APIReader == nil {
+		return true, nil // no direct reader wired (tests): trust the tally
+	}
+	for _, claimName := range rsv.Spec.ChildClaims {
+		var claim vgpuv1alpha1.VGPUClaim
+		err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: rsv.Namespace, Name: claimName}, &claim)
+		if errors.IsNotFound(err) {
+			return true, nil // claim confirmed gone
+		}
+		if err != nil {
+			return false, err
+		}
+		if !claim.DeletionTimestamp.IsZero() {
+			return true, nil
+		}
+		var slice vgpuv1alpha1.VGPUSlice
+		err = r.APIReader.Get(ctx, types.NamespacedName{Namespace: rsv.Namespace, Name: claimName + "-slice"}, &slice)
+		if errors.IsNotFound(err) {
+			return true, nil // slice confirmed gone
+		}
+		if err != nil {
+			return false, err
+		}
+		if !slice.DeletionTimestamp.IsZero() {
+			return true, nil
+		}
+		switch slice.Status.Phase {
+		case "Scheduled", "Allocating", "Ready":
+			// holding (or actively re-acquiring) an allocation — not lost
+		default:
+			// Pending/empty/Failed/Releasing… — not the committed allocation
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // applyPhase writes the next reservation phase + tally to status. Idempotent.
@@ -459,6 +568,8 @@ func rollbackReasonLabel(reason string) string {
 	switch {
 	case strings.Contains(reason, "deadline"):
 		return "deadline"
+	case strings.Contains(reason, "child lost"):
+		return "child_lost"
 	case strings.Contains(reason, "capacity"), strings.Contains(reason, "insufficient"):
 		return "insufficient_capacity"
 	default:

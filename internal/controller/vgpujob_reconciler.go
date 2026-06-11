@@ -141,7 +141,7 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	// 2. Mirror Claim/Slice phase into Job phase (the resource-request view).
-	desired, msg := derivePhaseFromClaim(&claim)
+	desired, msg := derivePhaseFromClaim(&claim, job.Status.Phase)
 
 	// 3. If the Job OWNS a Pod (podTemplate set), the Pod lifecycle drives the
 	//    phase once the slice is allocated; the claim-derived phase only applies
@@ -197,26 +197,68 @@ func (r *VGPUJobReconciler) createClaim(ctx context.Context, job *vgpuv1alpha1.V
 }
 
 // derivePhaseFromClaim collapses claim+slice state into the Job's phase.
-func derivePhaseFromClaim(claim *vgpuv1alpha1.VGPUClaim) (vgpuv1alpha1.VGPUJobPhase, string) {
+// current is the job's existing phase, and the mapping is MONOTONIC: a derived
+// phase never moves the job backwards. Claim-side teardown blips and informer
+// flaps must not regress an already-Scheduled (or Running) job's phase in
+// `vgpu status` — phases report furthest progress; conditions carry detail.
+// Explicit phase writes elsewhere (terminal transitions, pod-derived phases)
+// do not route through here and are unaffected.
+//
+// The old "Released" → Completed arm was dead code: no claim writer ever sets
+// phase Released (Bound/Failed/Deleting/Scheduled/Pending only). Completed is
+// owned by the pod watch for pod-owning jobs; a pure-resource grant has no
+// completion event by design.
+func derivePhaseFromClaim(claim *vgpuv1alpha1.VGPUClaim, current vgpuv1alpha1.VGPUJobPhase) (vgpuv1alpha1.VGPUJobPhase, string) {
+	var desired vgpuv1alpha1.VGPUJobPhase
+	var msg string
 	switch claim.Status.Phase {
 	case "Bound":
 		// Claim is Bound but Slice could still be in any state.
 		// Treat Bound as "Scheduled" — the actual workload running is Phase 2.1b.
-		return vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled and ready"
+		desired, msg = vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled and ready"
 	case "Scheduled":
 		// The claim reconciler reports "Scheduled" while the slice is placed but
 		// not yet allocated; mapping it to the default (ClaimCreated) regressed
 		// an already-scheduled job's phase.
-		return vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled; awaiting allocation"
+		desired, msg = vgpuv1alpha1.JobPhaseScheduled, "Slice scheduled; awaiting allocation"
 	case "Pending", "":
-		return vgpuv1alpha1.JobPhaseClaimCreated, "Awaiting scheduler"
+		desired, msg = vgpuv1alpha1.JobPhaseClaimCreated, "Awaiting scheduler"
 	case "Failed":
-		return vgpuv1alpha1.JobPhaseFailed, "Claim entered Failed phase"
-	case "Released":
-		return vgpuv1alpha1.JobPhaseCompleted, "Claim released"
+		desired, msg = vgpuv1alpha1.JobPhaseFailed, "Claim entered Failed phase"
+	case "Deleting":
+		// Teardown in progress is neither job progress nor failure — keep the
+		// phase the job already earned (the message still surfaces the state).
+		return current, fmt.Sprintf("Claim in phase %s", claim.Status.Phase)
 	default:
-		return vgpuv1alpha1.JobPhaseClaimCreated, fmt.Sprintf("Claim in phase %s", claim.Status.Phase)
+		// Unknown claim phase: never guess BACKWARDS from it.
+		return current, fmt.Sprintf("Claim in phase %s", claim.Status.Phase)
 	}
+	if jobPhaseRank(desired) < jobPhaseRank(current) {
+		return current, msg // monotonic: derived phases never downgrade
+	}
+	return desired, msg
+}
+
+// jobPhaseRank orders job phases for the monotonic guard. Terminal phases rank
+// highest so a claim-level Failed can always surface over any in-flight phase —
+// while terminal currents themselves are already guarded upstream (a terminal
+// job returns before any derivation runs).
+func jobPhaseRank(p vgpuv1alpha1.VGPUJobPhase) int {
+	switch p {
+	case vgpuv1alpha1.JobPhasePending, "":
+		return 0
+	case vgpuv1alpha1.JobPhaseClaimCreated:
+		return 1
+	case vgpuv1alpha1.JobPhaseScheduled:
+		return 2
+	case vgpuv1alpha1.JobPhasePodCreating:
+		return 3
+	case vgpuv1alpha1.JobPhaseRunning:
+		return 4
+	case vgpuv1alpha1.JobPhaseSucceeded, vgpuv1alpha1.JobPhaseFailed, vgpuv1alpha1.JobPhaseCompleted:
+		return 5
+	}
+	return 0
 }
 
 // updatePhase patches Job status with retry-on-conflict so concurrent updates

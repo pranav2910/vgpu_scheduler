@@ -103,6 +103,32 @@ The slot is also freed immediately (no timeout wait) when the admitting gang's
 reservation goes terminal (`forgetCohort`) or its cohort is reaped as stale
 (`gateMaxHoldAge`, 90s).
 
+## Child loss after commit (fail-loud)
+
+A committed gang is all-or-nothing **for its whole lifetime**, not just at
+admission. If a child VGPUJob/claim/slice is deleted out from under a
+`Committed` reservation (operator delete, namespace cleanup of one child), the
+reservation does **not** keep advertising a healthy gang: it transitions to
+`Failed` with reason `child lost after commit`, emits a Warning event
+(`ChildLostAfterCommit`), tears down the surviving children through the normal
+teardown path, and ends `Released` — the survivors' VRAM returns to the pool.
+
+Two deliberate properties:
+
+- **The loss is confirmed before acting.** Declaring a child lost tears down
+  live workloads, so an absence reported by the informer cache is re-confirmed
+  against the API server directly. A stale cache can delay the verdict by a
+  reconcile; it can never trigger a teardown by itself.
+- **No self-heal.** The controller does not recreate the deleted child:
+  silently resurrecting it would override operator intent and needs policy this
+  version doesn't have (was the delete deliberate? should the replacement keep
+  its priority and quota slot? is the workload idempotent?). Resubmitting the
+  gang is the recovery path. A committed gang also never *demotes* back to
+  `Reserved` — recovery-by-accident is the same self-heal in disguise.
+
+Exercised end-to-end by battery test 2.9 (delete one child of a committed
+gang → `Failed (child lost) → Released`, capacity reclaimed, no orphans).
+
 ## Explainability
 
 - **Per-slice, in the gate logs:** `[gang] <slice> waiting: gang <X> admitting

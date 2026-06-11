@@ -110,6 +110,11 @@ func main() {
 	if err := (&controller.VGPUGangReservationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// Direct reader: a Committed→Failed driven by child LOSS tears down the
+		// surviving children, so the informer's absence claim is re-confirmed
+		// against the API server before acting.
+		APIReader: mgr.GetAPIReader(),
+		Recorder:  mgr.GetEventRecorderFor("vgpu-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Fatalf("setting up VGPUGangReservationReconciler: %v", err)
 	}

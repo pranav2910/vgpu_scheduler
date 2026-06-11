@@ -45,9 +45,10 @@ point.
 | `vgpu_gang_attempts_total` | counter | `result` | Gang reservations reaching a terminal outcome: committed, failed. |
 | `vgpu_gang_admission_decisions_total` | counter | `decision` | Gate decisions: admitted, deferred, wait, rejected. |
 | `vgpu_gang_quorum_wait_seconds` | histogram | — | Time from first observing a cohort to it reaching quorum. |
-| `vgpu_gang_rollbacks_total` | counter | `reason` | Gangs torn down: deadline, insufficient_capacity, other. |
+| `vgpu_gang_rollbacks_total` | counter | `reason` | Gangs torn down: deadline, child_lost, insufficient_capacity, other. |
 | `vgpu_gang_admission_backoffs_total` | counter | — | Times a stalled gang yielded the admission slot. |
 | `vgpu_gang_admission_slot_held` | gauge | — | 1 while a gang holds the serialized admission slot, else 0. |
+| `vgpu_scheduler_confirm_rearms_total` | counter | — | Binds that outlived their reservation TTL and had their capacity re-armed at confirm. **Nonzero is an operator warning**: bind latency is outrunning the reservation TTL — investigate API-server latency. |
 
 A rising `decisions_total{decision="wait"}` with a flat `attempts_total` means
 gangs are queued behind the admission slot — expected under contention. A
