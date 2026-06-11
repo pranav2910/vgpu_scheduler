@@ -36,7 +36,7 @@ func TestThunderingHerd_Concurrency(t *testing.T) {
 			sliceUID := fmt.Sprintf("slice-%d", id)
 
 			// Reserve returns (*ReservationTx, error) — fixed: was used as single error return.
-			_, err := reserver.Reserve(sliceUID, nodeName, requestGiB*1024*1024*1024)
+			_, err := reserver.Reserve(sliceUID, "default", nodeName, requestGiB*1024*1024*1024)
 			if err == nil {
 				atomic.AddInt32(&successCount, 1) // fixed: atomic instead of mutex
 			}

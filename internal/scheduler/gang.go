@@ -19,11 +19,12 @@ import (
 type GangCheckResult int
 
 const (
-	GangNotApplicable GangCheckResult = iota // slice has no gang annotation
+	GangNotApplicable GangCheckResult = iota // POSITIVE finding: slice has no gang annotation — may bind solo
 	GangBindAllowed                          // gang quorum reached, this slice may bind
 	GangBindDeferred                         // admitted gang, sub-quorum; reservation HELD
 	GangBindRejected                         // reservation in terminal phase (Failed/Released)
 	GangBindWait                             // another gang holds the admission slot; do NOT hold — release the reservation and retry
+	GangRetry                                // gang state UNDETERMINED (transient read error) — fail closed: do NOT bind, requeue
 )
 
 // gangMember represents a single slice's "I'm here, holding my reservation"
@@ -168,14 +169,26 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	var rsv vgpuv1alpha1.VGPUGangReservation
 	err := g.client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: rsvName}, &rsv)
 	if errors.IsNotFound(err) {
-		return GangBindRejected,
-			fmt.Sprintf("reservation %s not found (gang torn down)", rsvName),
+		// NotFound is AMBIGUOUS: the gang may be torn down — or it may be being
+		// BORN. At gang creation the slice events and the reservation object
+		// arrive on different watch streams, and a slice can reach the
+		// scheduler before its reservation has ever been seen by the informer.
+		// Rejecting here misread a being-born gang as dead (seen live in the
+		// 2.3 crash battery: the first member burned its early attempts on
+		// "gang torn down" while its 3 siblings, milliseconds later, found the
+		// reservation fine). Retry quickly instead: a genuinely torn-down
+		// gang's slices are cascade-deleted moments later, which ends the
+		// retries; a being-born gang's reservation appears within milliseconds.
+		return GangRetry,
+			fmt.Sprintf("reservation %s not yet visible (gang being born, or torn down — retrying)", rsvName),
 			nil
 	}
 	if err != nil {
-		// Cache not synced or transient failure. Don't make a decision; ask
-		// caller to retry without making cohort changes.
-		return GangNotApplicable, "", fmt.Errorf("getting reservation: %w", err)
+		// Cache not synced or transient failure. The gang state is UNDETERMINED
+		// and must fail closed: GangRetry tells the caller to requeue without
+		// binding. (Returning NotApplicable here let a gang member bind SOLO on
+		// a transient error — breaking all-or-nothing admission.)
+		return GangRetry, "", fmt.Errorf("getting reservation: %w", err)
 	}
 
 	switch rsv.Status.Phase {

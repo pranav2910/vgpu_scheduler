@@ -49,6 +49,13 @@ func NewSliceScheduler(cache *VRAMCache, k8sClient client.Client) *SliceSchedule
 // the reservation Failed.
 const gangHoldTTL = 50 * time.Second
 
+// bindPinTTL is how long the pre-bind pin extends a hold. The bind is a pair
+// of API calls (spec patch + status patch) that normally completes in
+// milliseconds; 30s of headroom means only severe API-server distress can
+// outlive the pin — and if it somehow does, Confirm's re-arm path still
+// recovers the accounting.
+const bindPinTTL = 30 * time.Second
+
 // Schedule runs one full scheduling cycle for a Pending VGPUSlice.
 // nn is the NamespacedName of the slice (for the direct Get in bindToKubernetesAPI).
 // sliceUID is the K8s UID (reservation key in the cache).
@@ -89,21 +96,17 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 	}
 
 	// Option B fast-forward: if we already hold a speculative reservation
-	// for this slice (from a prior gang-defer cycle), reuse it.
-	if heldNode, heldBytes, ok := s.Cache.IsAssumed(sliceUID); ok {
-		// Refresh TTL so the reaper doesn't kill us while the gang converges.
-		s.Cache.RefreshAssumption(sliceUID, gangHoldTTL)
-
+	// for this slice (from a prior gang-defer cycle), reuse it. PinAssumption
+	// verifies the hold and extends its TTL in ONE critical section — the old
+	// IsAssumed-then-RefreshAssumption pair let the TTL reaper fire between
+	// the two calls, so we could proceed on a reservation that no longer
+	// existed. If the hold is gone, fall through to a fresh Reserve.
+	if heldNode, heldBytes, ok := s.Cache.PinAssumption(sliceUID, gangHoldTTL); ok {
 		// Construct a Tx wrapping the existing held reservation. We don't
 		// re-Reserve (would fail with "duplicate"); we just thread the
 		// held capacity through the gate-and-bind path.
-		tx := NewReservationTxForHeld(s.Cache, sliceUID, heldNode)
+		tx := NewReservationTxForHeld(s.Cache, sliceUID, nn.Namespace, heldNode, heldBytes)
 		defer tx.RollbackIfNotConfirmed()
-
-		// If reqBytes drifted from heldBytes (shouldn't happen for VGPU
-		// slices since claim bytes are immutable, but defensive), prefer
-		// the held value.
-		_ = heldBytes
 
 		log.Printf("[gang] fast-forward: slice %s has held reservation on %s",
 			nn, heldNode)
@@ -157,7 +160,7 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 
 	winningNode := scores[0].NodeName
 
-	tx, err := s.Reserver.Reserve(sliceUID, winningNode, reqBytes)
+	tx, err := s.Reserver.Reserve(sliceUID, nn.Namespace, winningNode, reqBytes)
 	if err != nil {
 		telemetry.RecordScheduleResult("error", "reserve_failed")
 		return "", fmt.Errorf("speculative reserve failed: %w", err)
@@ -187,42 +190,71 @@ func (s *SliceScheduler) gateAndBind(
 ) (string, error) {
 	if s.GangGate != nil {
 		var slice vgpuv1alpha1.VGPUSlice
-		if err := s.K8sClient.Get(ctx, nn, &slice); err == nil {
-			res, reason, gerr := s.GangGate.CheckSliceWithCohort(ctx, &slice, winningNode, reqBytes)
-			if gerr != nil {
-				log.Printf("[gang] gate error for %s: %v", nn, gerr)
-			}
-			switch res {
-			case GangBindDeferred:
-				telemetry.RecordScheduleResult("deferred", "gang_quorum")
-				// Hold the speculative cache reservation across function
-				// return. Subsequent reconcile cycles will fast-forward
-				// past Reserve and re-enter the gate; eventually the
-				// cohort tips quorum and this slice's next call gets
-				// GangBindAllowed.
-				tx.MarkHeld()
-				log.Printf("[gang] %s deferred: %s (HOLDING reservation)", nn, reason)
-				return "", &GangDeferredError{Reason: reason}
-			case GangBindWait:
-				telemetry.RecordScheduleResult("wait", "gang_admission")
-				// Another gang owns the admission slot. Do NOT MarkHeld — the
-				// deferred RollbackIfNotConfirmed releases this slice's
-				// speculative reservation so non-admitted gangs hold zero
-				// capacity and cannot fragment it. Requeue quickly; once the
-				// admitting gang commits (or stalls and backs off) this slice's
-				// gang gets its turn at the slot.
-				log.Printf("[gang] %s waiting: %s (RELEASING reservation)", nn, reason)
-				return "", &GangDeferredError{Reason: reason}
-			case GangBindRejected:
-				telemetry.RecordScheduleResult("rejected", "gang_terminal")
-				log.Printf("[gang] %s rejected: %s", nn, reason)
-				return "", fmt.Errorf("gang reservation rejected bind: %s", reason)
-			case GangBindAllowed:
-				log.Printf("[gang] %s allowed: %s", nn, reason)
-			case GangNotApplicable:
-				// proceed to bind
-			}
+		if err := s.K8sClient.Get(ctx, nn, &slice); err != nil {
+			// FAIL CLOSED: without the slice we cannot know whether it is a
+			// gang member, and binding on a transient read error could admit a
+			// gang member solo — breaking all-or-nothing. The deferred rollback
+			// releases the hold; the reconciler's error backoff retries.
+			telemetry.RecordScheduleResult("error", "gate_read_failed")
+			return "", fmt.Errorf("gang gate: fetching slice %s (failing closed, will retry): %w", nn, err)
 		}
+		res, reason, gerr := s.GangGate.CheckSliceWithCohort(ctx, &slice, winningNode, reqBytes)
+		if gerr != nil {
+			// Gang state undetermined (transient reservation read error). Same
+			// rule as the slice read above: an unknown gang state never binds.
+			// Error backoff paces the retries.
+			telemetry.RecordScheduleResult("error", "gate_retry")
+			return "", fmt.Errorf("gang gate undetermined for %s (failing closed, will retry): %w", nn, gerr)
+		}
+		switch res {
+		case GangRetry:
+			// Knowably transient (no error): the reservation isn't visible yet —
+			// a gang being BORN (slice events outran the reservation watch) or
+			// one mid-teardown. Release the hold and retry on the fast 500ms
+			// path: a being-born gang's reservation appears within milliseconds,
+			// and a torn-down gang's slices are cascade-deleted moments later,
+			// which ends the retries.
+			telemetry.RecordScheduleResult("wait", "gang_reservation_pending")
+			log.Printf("[gang] %s retrying: %s (RELEASING reservation)", nn, reason)
+			return "", &GangDeferredError{Reason: reason}
+		case GangBindDeferred:
+			telemetry.RecordScheduleResult("deferred", "gang_quorum")
+			// Hold the speculative cache reservation across function
+			// return. Subsequent reconcile cycles will fast-forward
+			// past Reserve and re-enter the gate; eventually the
+			// cohort tips quorum and this slice's next call gets
+			// GangBindAllowed.
+			tx.MarkHeld()
+			log.Printf("[gang] %s deferred: %s (HOLDING reservation)", nn, reason)
+			return "", &GangDeferredError{Reason: reason}
+		case GangBindWait:
+			telemetry.RecordScheduleResult("wait", "gang_admission")
+			// Another gang owns the admission slot. Do NOT MarkHeld — the
+			// deferred RollbackIfNotConfirmed releases this slice's
+			// speculative reservation so non-admitted gangs hold zero
+			// capacity and cannot fragment it. Requeue quickly; once the
+			// admitting gang commits (or stalls and backs off) this slice's
+			// gang gets its turn at the slot.
+			log.Printf("[gang] %s waiting: %s (RELEASING reservation)", nn, reason)
+			return "", &GangDeferredError{Reason: reason}
+		case GangBindRejected:
+			telemetry.RecordScheduleResult("rejected", "gang_terminal")
+			log.Printf("[gang] %s rejected: %s", nn, reason)
+			return "", fmt.Errorf("gang reservation rejected bind: %s", reason)
+		case GangBindAllowed:
+			log.Printf("[gang] %s allowed: %s", nn, reason)
+		case GangNotApplicable:
+			// positive finding (no gang annotations) — proceed to bind solo
+		}
+	}
+
+	// Pin the hold across the bind API call: atomically extend the TTL so the
+	// reaper cannot roll the reservation back mid-bind. A reaped hold plus a
+	// successful bind is a bound slice with zero cache footprint until the
+	// NodeAgent reports Ready — capacity the cache would happily re-sell.
+	if _, _, ok := s.Cache.PinAssumption(sliceUID, bindPinTTL); !ok {
+		telemetry.RecordScheduleResult("error", "hold_lost")
+		return "", fmt.Errorf("reservation for slice %s expired before bind; requeueing for a fresh reserve", nn)
 	}
 
 	if err := s.bindToKubernetesAPI(ctx, nn, winningNode); err != nil {

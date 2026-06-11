@@ -111,7 +111,7 @@ func TestSim1_BindFailRollback(t *testing.T) {
 	initialFree := freeVRAM(t, cache, testNode)
 
 	// Step 1: speculative reservation succeeds.
-	tx, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+	tx, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 	if err != nil {
 		t.Fatalf("Reserve failed unexpectedly: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSim1_BindFailRollback(t *testing.T) {
 	}
 
 	// Step 4: verify the slice can be safely retried.
-	tx2, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+	tx2, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 	if err != nil {
 		t.Errorf("Sim1 FAIL: slice cannot be retried after rollback: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestSim2_AllocationFailAfterBind(t *testing.T) {
 	initialFree := freeVRAM(t, cache, testNode)
 
 	// Step 1: reserve → bind succeeds → confirm.
-	tx, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+	tx, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 	if err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestSim3_PromoteConfirmedToAllocated(t *testing.T) {
 	sliceUID := "slice-sim3"
 
 	// Step 1: full scheduling path — assume → confirm.
-	tx, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+	tx, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 	if err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestSim3_PromoteConfirmedToAllocated(t *testing.T) {
 	// Step 4: simulate promote being skipped (stuck-confirmed scenario).
 	// Set up a second slice that gets confirmed but never promoted.
 	sliceUID2 := "slice-sim3-stuck"
-	tx2, _ := reserver.Reserve(sliceUID2, testNode, eightGiB)
+	tx2, _ := reserver.Reserve(sliceUID2, "default", testNode, eightGiB)
 	tx2.Confirm()
 	// The slice is now stuck in confirmed. Free VRAM is 72 - 8 = 64 GiB.
 	// A third slice requesting 65 GiB should be rejected (64 GiB free).
@@ -454,7 +454,7 @@ func TestSim6_DuplicateSchedulingRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tx, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+			tx, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 			mu.Lock()
 			defer mu.Unlock()
 			if err == nil {
@@ -504,7 +504,7 @@ func TestSim7_LastVRAMContention(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			sliceUID := fmt.Sprintf("slice-contention-%d", id)
-			tx, err := reserver.Reserve(sliceUID, testNode, eightGiB)
+			tx, err := reserver.Reserve(sliceUID, "default", testNode, eightGiB)
 			mu.Lock()
 			defer mu.Unlock()
 			if err == nil {
@@ -640,9 +640,9 @@ func TestSim9_SchedulerRestartReconstruction(t *testing.T) {
 		case state.SlicePhaseScheduled, state.SlicePhaseAllocating:
 			// Was confirmed — block this VRAM speculatively.
 			// Use a long TTL so it isn't evicted before the NodeAgent reports in.
-			_ = cache.AssumeSlice(string(s.UID)+"_restored", s.Spec.NodeName,
+			_ = cache.AssumeSlice(string(s.UID)+"_restored", s.Namespace, s.Spec.NodeName,
 				s.Spec.RequestedVRAMBytes, 10*time.Minute)
-			cache.ConfirmSlice(string(s.UID) + "_restored")
+			cache.ConfirmSliceOrRearm(string(s.UID)+"_restored", s.Namespace, s.Spec.NodeName, s.Spec.RequestedVRAMBytes)
 
 		case state.SlicePhaseReady:
 			// Hardware is confirmed allocated — count it as allocated.
@@ -662,8 +662,8 @@ func TestSim9_SchedulerRestartReconstruction(t *testing.T) {
 	cache.UpdateNode(testNode, eightyGiB, allocatedByReadySlices)
 	// Re-apply the confirmed reservations after UpdateNode (which resets reserved=0).
 	cache.ReleaseConfirmedSlice(string(scheduledSlice.UID) + "_restored")
-	_ = cache.AssumeSlice("restored-scheduled", testNode, scheduledSlice.Spec.RequestedVRAMBytes, 10*time.Minute)
-	cache.ConfirmSlice("restored-scheduled")
+	_ = cache.AssumeSlice("restored-scheduled", "default", testNode, scheduledSlice.Spec.RequestedVRAMBytes, 10*time.Minute)
+	cache.ConfirmSliceOrRearm("restored-scheduled", "default", testNode, scheduledSlice.Spec.RequestedVRAMBytes)
 
 	// Final state: 8 GiB allocated (Ready slice) + 8 GiB reserved (Scheduled slice)
 	// = 16 GiB consumed, 64 GiB free.

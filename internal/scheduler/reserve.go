@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync/atomic"
 	"time"
+
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 )
 
 type ReservationManager struct {
@@ -21,7 +23,9 @@ type ReservationManager struct {
 // reaper will eventually free a hold that doesn't converge into a bind.
 type ReservationTx struct {
 	SliceUID  string
+	Namespace string
 	NodeName  string
+	Bytes     int64
 	cache     *VRAMCache
 	confirmed atomic.Bool
 	held      atomic.Bool
@@ -31,23 +35,28 @@ func NewReservationManager(cache *VRAMCache, ttl time.Duration) *ReservationMana
 	return &ReservationManager{cache: cache, ttl: ttl}
 }
 
-func (rm *ReservationManager) Reserve(sliceUID, nodeName string, bytes int64) (*ReservationTx, error) {
-	if err := rm.cache.AssumeSlice(sliceUID, nodeName, bytes, rm.ttl); err != nil {
+func (rm *ReservationManager) Reserve(sliceUID, namespace, nodeName string, bytes int64) (*ReservationTx, error) {
+	if err := rm.cache.AssumeSlice(sliceUID, namespace, nodeName, bytes, rm.ttl); err != nil {
 		return nil, err
 	}
-	return &ReservationTx{SliceUID: sliceUID, NodeName: nodeName, cache: rm.cache}, nil
+	return &ReservationTx{SliceUID: sliceUID, Namespace: namespace, NodeName: nodeName, Bytes: bytes, cache: rm.cache}, nil
 }
 
 // NewReservationTxForHeld constructs a Tx wrapping an already-existing
 // assumedBySlice entry. Used by Schedule()'s fast-forward path when a
-// gang member's reservation persists across reconcile cycles.
-func NewReservationTxForHeld(cache *VRAMCache, sliceUID, nodeName string) *ReservationTx {
-	return &ReservationTx{SliceUID: sliceUID, NodeName: nodeName, cache: cache}
+// gang member's reservation persists across reconcile cycles. namespace and
+// bytes ride the Tx so Confirm can re-arm if the hold is reaped mid-bind.
+func NewReservationTxForHeld(cache *VRAMCache, sliceUID, namespace, nodeName string, bytes int64) *ReservationTx {
+	return &ReservationTx{SliceUID: sliceUID, Namespace: namespace, NodeName: nodeName, Bytes: bytes, cache: cache}
 }
 
 func (tx *ReservationTx) Confirm() {
 	tx.confirmed.Store(true)
-	tx.cache.ConfirmSlice(tx.SliceUID)
+	if rearmed := tx.cache.ConfirmSliceOrRearm(tx.SliceUID, tx.Namespace, tx.NodeName, tx.Bytes); rearmed {
+		telemetry.ConfirmRearms.Inc()
+		log.Printf("Reservation Confirmed with RE-ARM: slice %s hold was reaped mid-bind; capacity re-charged (bind latency exceeded the reservation TTL)", tx.SliceUID)
+		return
+	}
 	log.Printf("Reservation Confirmed: Slice %s locked in API", tx.SliceUID)
 }
 

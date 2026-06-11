@@ -16,7 +16,7 @@ func FuzzVRAMCache(f *testing.F) {
 		cache.UpdateNode("node-1", totalVRAM, 0) // fixed: UpdateNode added in FIX 8
 
 		// AssumeSlice is the correct cache primitive (Reserve wraps it).
-		err := cache.AssumeSlice("fuzz-slice", "node-1", request, 30*time.Second)
+		err := cache.AssumeSlice("fuzz-slice", "default", "node-1", request, 30*time.Second)
 		if (request <= 0 || request > totalVRAM) && err == nil {
 			t.Errorf("Cache allowed invalid reservation: total=%d, request=%d", totalVRAM, request)
 		}

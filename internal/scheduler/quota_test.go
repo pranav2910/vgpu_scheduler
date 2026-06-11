@@ -40,7 +40,7 @@ func buildChecker(t *testing.T, objs ...client.Object) *QuotaChecker {
 	if len(objs) > 0 {
 		b = b.WithObjects(objs...)
 	}
-	return NewQuotaChecker(b.Build())
+	return NewQuotaChecker(b.Build(), nil)
 }
 
 func TestQuota_NoQuota_AllowsEverything(t *testing.T) {

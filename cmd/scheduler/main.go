@@ -63,8 +63,12 @@ func main() {
 
 	cache := scheduler.NewVRAMCache()
 	sched := scheduler.NewSliceScheduler(cache, mgr.GetClient())
-	// Layer 2 Phase 2.2a: wire VGPUQuota enforcement.
-	sched.SetQuotaChecker(scheduler.NewQuotaChecker(mgr.GetClient()))
+	// Layer 2 Phase 2.2a: wire VGPUQuota enforcement. The checker reads the
+	// informer for committed usage and the scheduler's own cache for in-flight
+	// admissions the informer hasn't reflected yet (just-bound slices, held
+	// gang reservations) — without the cache, a rapid burst can slip past
+	// quota in the watch round-trip window.
+	sched.SetQuotaChecker(scheduler.NewQuotaChecker(mgr.GetClient(), cache))
 
 	// Layer 2 Phase 2.3: wire preemption.
 	sched.SetPreemptor(scheduler.NewPreemptor(mgr.GetClient()))

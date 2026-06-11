@@ -49,7 +49,7 @@ func TestRemoveNodeDropsGhostCandidate(t *testing.T) {
 	c.UpdateNode("live", 80*testGiB, 0)
 
 	// A held reservation against the ghost must die with it.
-	if err := c.AssumeSlice("uid-r", "ghost", 8*testGiB, 30*time.Second); err != nil {
+	if err := c.AssumeSlice("uid-r", "default", "ghost", 8*testGiB, 30*time.Second); err != nil {
 		t.Fatalf("assume: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestSetNodeHealthGatesPlacement(t *testing.T) {
 	if ok, reason, _ := c.CanFit("n1", testGiB); ok || reason != ReasonNodeUnhealthy {
 		t.Fatalf("NotReady node accepted: ok=%t reason=%s", ok, reason)
 	}
-	if err := c.AssumeSlice("uid-h", "n1", testGiB, 30*time.Second); err == nil {
+	if err := c.AssumeSlice("uid-h", "default", "n1", testGiB, 30*time.Second); err == nil {
 		t.Fatalf("AssumeSlice succeeded on an unhealthy node")
 	}
 	c.SetNodeHealth("n1", true)

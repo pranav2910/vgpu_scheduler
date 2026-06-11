@@ -105,6 +105,11 @@ var (
 		Help: "Times a stalled gang was backed off and yielded the admission slot.",
 	})
 
+	ConfirmRearms = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "vgpu_scheduler_confirm_rearms_total",
+		Help: "Times a bind outlived its reservation TTL and the confirmed capacity had to be re-armed. Nonzero means bind latency is outrunning the reservation TTL — investigate API-server latency.",
+	})
+
 	GangAdmissionSlotHeld = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "vgpu_gang_admission_slot_held",
 		Help: "1 while a gang holds the serialized admission slot, 0 when free.",
@@ -404,6 +409,7 @@ func init() {
 		NamespaceAllocatedBytes, NamespaceQuotaBytes,
 		// slice lifecycle
 		SlicesByPhase, SliceScheduleAttempts, SliceScheduleLatency, SliceReady, SliceFailed,
+		ConfirmRearms,
 		// gang
 		GangAttempts, GangAdmissionDecisions, GangQuorumWait, GangRollbacks,
 		GangAdmissionBackoffs, GangAdmissionSlotHeld,

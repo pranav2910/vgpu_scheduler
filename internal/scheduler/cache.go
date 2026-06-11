@@ -66,6 +66,7 @@ type NodeState struct {
 
 type AssumedAllocation struct {
 	SliceUID           string
+	Namespace          string
 	NodeName           string
 	RequestedVRAMBytes int64
 	ExpiresAt          time.Time
@@ -164,7 +165,9 @@ func (c *VRAMCache) CanFit(nodeName string, requestedBytes int64) (bool, string,
 
 // AssumeSlice speculatively reserves VRAM. Re-checks node health and capacity
 // under the write lock to close the TOCTOU window with CanFit. Bug #10 fix.
-func (c *VRAMCache) AssumeSlice(sliceUID, nodeName string, requestedBytes int64, ttl time.Duration) error {
+// namespace rides the entry so the quota checker's in-flight ledger
+// (PendingNamespaceBytes) can attribute holds to the right namespace.
+func (c *VRAMCache) AssumeSlice(sliceUID, namespace, nodeName string, requestedBytes int64, ttl time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -189,6 +192,7 @@ func (c *VRAMCache) AssumeSlice(sliceUID, nodeName string, requestedBytes int64,
 
 	c.assumedBySlice[sliceUID] = &AssumedAllocation{
 		SliceUID:           sliceUID,
+		Namespace:          namespace,
 		NodeName:           nodeName,
 		RequestedVRAMBytes: requestedBytes,
 		ExpiresAt:          time.Now().Add(ttl),
@@ -199,14 +203,43 @@ func (c *VRAMCache) AssumeSlice(sliceUID, nodeName string, requestedBytes int64,
 	return nil
 }
 
-func (c *VRAMCache) ConfirmSlice(sliceUID string) {
+// ConfirmSliceOrRearm moves an assumed hold to confirmed. If the hold is gone —
+// the TTL reaper rolled it back while a slow bind API call was in flight — the
+// bind has nevertheless ALREADY happened, so the capacity is factually
+// consumed: the confirmed entry is reconstructed from the caller's (namespace,
+// node, bytes) and the node re-charged. Without the re-arm, a bound slice
+// holds zero cache footprint until the NodeAgent reports Ready, and another
+// slice can be admitted into the same physical bytes.
+//
+// Returns true when it had to re-arm. Callers surface that via the
+// vgpu_scheduler_confirm_rearms_total counter — nonzero means bind latency is
+// outrunning the reservation TTL (an operator warning, not a normal event).
+func (c *VRAMCache) ConfirmSliceOrRearm(sliceUID, namespace, nodeName string, bytes int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if assumption, exists := c.assumedBySlice[sliceUID]; exists {
 		c.confirmedBySlice[sliceUID] = assumption
 		delete(c.assumedBySlice, sliceUID)
+		return false
 	}
+	// Re-arm. Free may briefly floor at 0 if the reaped capacity was already
+	// re-sold — that is the honest accounting of an over-admission that already
+	// happened at bind time, and it stops further admissions immediately.
+	c.confirmedBySlice[sliceUID] = &AssumedAllocation{
+		SliceUID:           sliceUID,
+		Namespace:          namespace,
+		NodeName:           nodeName,
+		RequestedVRAMBytes: bytes,
+		ExpiresAt:          time.Now(), // informational only; confirmed entries are not TTL-reaped
+	}
+	if node, ok := c.nodes[nodeName]; ok {
+		node.ReservedVRAMBytes += bytes
+		c.recalculateFreeVRAM(node)
+	} else {
+		log.Printf("ConfirmSliceOrRearm: node %s missing for re-armed slice %s — entry recorded, node accounting skipped", nodeName, sliceUID)
+	}
+	return true
 }
 
 // PromoteSliceToAllocatedOnce applies the confirmed→allocated promotion exactly
@@ -494,15 +527,52 @@ func (c *VRAMCache) IsAssumed(sliceUID string) (string, int64, bool) {
 	return "", 0, false
 }
 
-// RefreshAssumption extends ExpiresAt for an existing held reservation.
-// Returns true if the slice was actually held (and refreshed), false if no
-// held reservation exists. Option B (hold-the-reservation gang gate).
-func (c *VRAMCache) RefreshAssumption(sliceUID string, ttl time.Duration) bool {
+// PinAssumption atomically verifies a held reservation still exists and
+// extends its TTL, returning the held node and bytes. This replaces the
+// IsAssumed-then-RefreshAssumption pair: two lock acquisitions let the TTL
+// reaper fire between them, so a caller could proceed to bind on a
+// reservation that no longer existed. Callers pin (a) when re-entering the
+// fast-forward gang path and (b) immediately before every bind API call, so
+// the reaper can never roll a hold back mid-bind.
+func (c *VRAMCache) PinAssumption(sliceUID string, ttl time.Duration) (string, int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if a, ok := c.assumedBySlice[sliceUID]; ok {
 		a.ExpiresAt = time.Now().Add(ttl)
-		return true
+		return a.NodeName, a.RequestedVRAMBytes, true
 	}
-	return false
+	return "", 0, false
+}
+
+// PendingNamespaceBytes sums this scheduler's in-flight admissions (assumed +
+// confirmed holds) for a namespace, excluding UIDs the caller already counted
+// from its API list. The quota checker reads the informer for committed usage;
+// the informer cannot see a bind this scheduler performed milliseconds ago,
+// nor the held reservations of a still-converging gang — this ledger closes
+// that staleness window. It may briefly include a hold whose slice was just
+// deleted (until ForgetSlice runs); that errs toward rejecting at the quota
+// edge, never admitting past it.
+func (c *VRAMCache) PendingNamespaceBytes(namespace string, countedUIDs map[string]struct{}) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var total int64
+	for uid, a := range c.assumedBySlice {
+		if a.Namespace != namespace {
+			continue
+		}
+		if _, counted := countedUIDs[uid]; counted {
+			continue
+		}
+		total += a.RequestedVRAMBytes
+	}
+	for uid, a := range c.confirmedBySlice {
+		if a.Namespace != namespace {
+			continue
+		}
+		if _, counted := countedUIDs[uid]; counted {
+			continue
+		}
+		total += a.RequestedVRAMBytes
+	}
+	return total
 }
