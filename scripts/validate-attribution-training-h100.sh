@@ -74,9 +74,24 @@ GT_RES=""; for _ in $(seq 1 40); do
 done
 GT_ALLOC=$(kubectl logs "$NAME-workload" -n "$NS" 2>/dev/null | grep -oE 'GT_ALLOC_MIB=[0-9]+' | tail -1 | cut -d= -f2)
 
-# sample host nvidia-smi a few times, take the max process memory (the peak footprint)
+# Sample host nvidia-smi a few times, taking the max — but ONLY this pod's
+# process, matched PID → /proc/<pid>/cgroup → pod UID (the same attribution
+# the product does, measured independently). The old max-across-the-card form
+# grabbed any other GPU process as "the truth" — e.g. a CUDA process from a
+# previously-run validator still dying off — and flunked a correct
+# measurement against the wrong baseline.
+POD_UID=$(kubectl get pod "$NAME-workload" -n "$NS" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+others=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+[[ "${others:-0}" -gt 1 ]] && note "(${others} compute processes on the card — matching by pod PID, others ignored)"
 SMI=0; for _ in $(seq 1 6); do
-    m=$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null | tr -dc '0-9\n' | sort -n | tail -1)
+    m=0
+    while IFS=, read -r pid mem; do
+        pid=${pid//[^0-9]/}; mem=${mem//[^0-9]/}
+        [[ -z "$pid" || -z "$mem" ]] && continue
+        if grep -qE "pod(${POD_UID}|${POD_UID//-/_})" "/proc/$pid/cgroup" 2>/dev/null; then
+            (( mem > m )) && m=$mem
+        fi
+    done < <(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null)
     [[ -n "$m" && "$m" -gt "$SMI" ]] && SMI="$m"; sleep 2
 done
 

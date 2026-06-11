@@ -97,11 +97,24 @@ wait_for_profile_peak() { # name -> echoes peak MiB (or empty)
     echo ""
 }
 
-# host-side nvidia-smi: the largest per-process used_memory currently on the card
-# (the node agent reads this same NVML number — so it's the external "truth").
-smi_max_proc_mib() {
-    nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null \
-        | tr -dc '0-9\n' | sort -n | tail -1
+# host-side nvidia-smi truth for ONE pod: match each compute-app PID to the
+# pod via /proc/<pid>/cgroup (the same attribution the node agent does, but
+# measured independently with nvidia-smi + /proc). The old form took the max
+# across ALL processes on the card, so any other GPU process — e.g. a CUDA
+# process from a previous validator still dying off — became the "truth" and
+# failed the comparison against a correct per-pod measurement.
+smi_pod_proc_mib() { # ns pod -> echoes the pod's largest process used_memory (MiB)
+    local ns=$1 pod=$2 uid line pid mem out=0
+    uid=$(kubectl get pod "$pod" -n "$ns" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+    [[ -z "$uid" ]] && return
+    while IFS=, read -r pid mem; do
+        pid=${pid//[^0-9]/}; mem=${mem//[^0-9]/}
+        [[ -z "$pid" || -z "$mem" ]] && continue
+        if grep -qE "pod(${uid}|${uid//-/_})" "/proc/$pid/cgroup" 2>/dev/null; then
+            (( mem > out )) && out=$mem
+        fi
+    done < <(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null)
+    [[ "$out" -gt 0 ]] && echo "$out"
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -115,7 +128,7 @@ wait_running attrib1
 
 note "workload running; reading its own ground truth + nvidia-smi + your tool…"
 sleep 8
-SMI_PROC=$(smi_max_proc_mib)                         # what the GPU says the process holds
+SMI_PROC=$(smi_pod_proc_mib "$NS" attrib1-workload)  # what the GPU says THIS pod's process holds
 GT_RES=$(gt_reserved_mib attrib1)                    # what PyTorch reserved (real footprint)
 GT_ALLOC=$(gt_alloc_mib attrib1)                     # live tensors only (a lower bound)
 OUR=$(wait_for_profile_peak attrib1)                 # what YOUR tool measured
