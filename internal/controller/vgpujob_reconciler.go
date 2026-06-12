@@ -362,8 +362,9 @@ func (r *VGPUJobReconciler) reconcileWorkloadPod(
 		return reconcile.Result{RequeueAfter: podAllocationRequeue}, nil
 	}
 
-	// Allocated + no pod yet → create it (idempotent on AlreadyExists).
-	newPod := r.buildWorkloadPod(job, claimRef)
+	// Allocated + no pod yet → create it (idempotent on AlreadyExists),
+	// pinned to the node holding the slice's allocation + CDI spec.
+	newPod := r.buildWorkloadPod(job, claimRef, node)
 	if err := controllerutil.SetControllerReference(job, newPod, r.Scheme); err != nil {
 		return reconcile.Result{}, fmt.Errorf("setting pod owner reference: %w", err)
 	}
@@ -408,7 +409,7 @@ func (r *VGPUJobReconciler) resolveAllocatedSlice(ctx context.Context, ns string
 // buildWorkloadPod renders the workload Pod from the Job's podTemplate, always
 // stamping the claim-ref label+annotation the mutating webhook keys on and
 // defaulting restartPolicy to Never (a one-shot workload, not a long service).
-func (r *VGPUJobReconciler) buildWorkloadPod(job *vgpuv1alpha1.VGPUJob, claimRef string) *corev1.Pod {
+func (r *VGPUJobReconciler) buildWorkloadPod(job *vgpuv1alpha1.VGPUJob, claimRef, nodeName string) *corev1.Pod {
 	tmpl := job.Spec.PodTemplate
 	labels := map[string]string{}
 	annotations := map[string]string{}
@@ -432,6 +433,16 @@ func (r *VGPUJobReconciler) buildWorkloadPod(job *vgpuv1alpha1.VGPUJob, claimRef
 		},
 		Spec: *tmpl.Spec.DeepCopy(),
 	}
+	// PIN the pod to the slice's node. OUR scheduler already chose the node —
+	// the GPU allocation, and crucially the CDI spec the runtime resolves the
+	// device from, exist ONLY there. Without this the default kube-scheduler
+	// placed the pod wherever it liked; on a single-node cluster the two could
+	// only coincide, but on two nodes it was a coin flip ending in StartError
+	// (CDI device not found) on the wrong machine — found live when an
+	// enforcement soak passed on one run and silently did nothing on the next.
+	// Setting nodeName bypasses kube-scheduler entirely, which is exactly
+	// right: this placement decision was already made.
+	pod.Spec.NodeName = nodeName
 	if pod.Spec.RestartPolicy == "" {
 		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
 	}

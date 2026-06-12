@@ -44,7 +44,7 @@ func TestBuildWorkloadPod_StampsClaimRefAndDefaults(t *testing.T) {
 		},
 	}
 
-	pod := r.buildWorkloadPod(job, "train-claim")
+	pod := r.buildWorkloadPod(job, "train-claim", "node-9")
 
 	if pod.Name != "train-workload" || pod.Namespace != "ns" {
 		t.Fatalf("name/ns: got %s/%s", pod.Name, pod.Namespace)
@@ -88,7 +88,7 @@ func TestBuildWorkloadPod_OverridesClaimKeysAndKeepsRestartPolicy(t *testing.T) 
 		},
 	}
 
-	pod := r.buildWorkloadPod(job, "svc-claim")
+	pod := r.buildWorkloadPod(job, "svc-claim", "node-9")
 
 	if pod.Labels[vgpuClaimLabel] != "svc-claim" || pod.Annotations[vgpuClaimAnnotation] != "svc-claim" {
 		t.Errorf("controller must override claim keys to its own claim: labels=%v annotations=%v", pod.Labels, pod.Annotations)
@@ -117,5 +117,25 @@ func TestDerivePhaseFromPod(t *testing.T) {
 		if msg == "" {
 			t.Errorf("pod %s: empty message", c.pod)
 		}
+	}
+}
+
+// The pod MUST be pinned to the slice's node: the GPU allocation and the CDI
+// spec the runtime resolves the device from exist only there. Unpinned pods
+// were a coin flip on multi-node clusters — StartError (CDI device not found)
+// whenever kube-scheduler picked the other machine.
+func TestBuildWorkloadPod_PinnedToSliceNode(t *testing.T) {
+	r := &VGPUJobReconciler{}
+	job := &vgpuv1alpha1.VGPUJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "train", Namespace: "ns"},
+		Spec: vgpuv1alpha1.VGPUJobSpec{
+			PodTemplate: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "w", Image: "img:1"}}},
+			},
+		},
+	}
+	pod := r.buildWorkloadPod(job, "train-claim", "gpu-node-7")
+	if pod.Spec.NodeName != "gpu-node-7" {
+		t.Fatalf("pod.Spec.NodeName = %q, want the slice's node (gpu-node-7) — unpinned pods StartError on multi-node clusters", pod.Spec.NodeName)
 	}
 }
