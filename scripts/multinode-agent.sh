@@ -25,6 +25,7 @@ die(){ echo "  ✗ $*"; exit 1; }
 
 command -v nvidia-smi >/dev/null 2>&1 || die "run on a GPU node"
 [[ -n "${K3S_URL:-}" && -n "${K3S_TOKEN:-}" ]] || die "export K3S_URL and K3S_TOKEN from the server's join info first"
+[[ "$K3S_URL$K3S_TOKEN" != *"<"* ]] || die "K3S_URL/K3S_TOKEN still contain a <placeholder> — paste the REAL values the server printed"
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo docker"
 
 MY_IP="${PUBLIC_IP:-$(curl -s --max-time 5 ifconfig.me || true)}"
