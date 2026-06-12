@@ -39,7 +39,7 @@ func NewManager(nodeName string, k8sClient client.Client, mock bool) *Manager {
 		log.Printf("[allocator] WARNING: could not load checkpoints to seed the per-card ledger (%v) — proceeding with an empty ledger", err)
 	} else {
 		for id, rec := range records {
-			allocator.RestoreAllocation(id, rec.DeviceUUID, rec.AllocatedBytes)
+			allocator.RestoreAllocation(id, rec.SliceUID, rec.DeviceUUID, rec.AllocatedBytes)
 		}
 		if len(records) > 0 {
 			log.Printf("[allocator] per-card ledger re-seeded from %d checkpoint record(s)", len(records))
@@ -56,9 +56,18 @@ func NewManager(nodeName string, k8sClient client.Client, mock bool) *Manager {
 
 // ReconcileSlice drives a Slice through allocation or release based on its phase.
 func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
-	// ALLOCATION PATH
-	if slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseScheduled) {
-		// 1. Announce Allocating (observability).
+	// ALLOCATION PATH — Scheduled, and ALSO Allocating: a status write racing
+	// the controller/scheduler can fail with a conflict AFTER the Allocating
+	// phase persisted (seen live in a 32-slice burst). The retry then arrives
+	// at phase=Allocating; handling only Scheduled left it wedged forever,
+	// holding a committed ledger allocation its status never recorded. The
+	// whole sequence below is idempotent (the allocator returns the slice's
+	// existing allocation; CDI + checkpoint writes are same-name atomic), so
+	// re-driving from Allocating is safe.
+	if slice.DeletionTimestamp.IsZero() &&
+		(slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseScheduled) ||
+			slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseAllocating)) {
+		// 1. Announce Allocating (observability; no-op when re-driving).
 		if err := m.Reporter.TransitionToAllocating(ctx, slice); err != nil {
 			return fmt.Errorf("transitioning to Allocating: %w", err)
 		}
@@ -131,6 +140,25 @@ func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSl
 			}
 			if err := m.Store.Delete(slice.Status.AllocationID); err != nil {
 				return fmt.Errorf("deleting checkpoint: %w", err)
+			}
+		} else {
+			// WEDGE RECOVERY: a conflict-wedged slice can hold a committed
+			// allocation its status never recorded (AllocationID empty). The
+			// ledger remembers by slice UID — without this, deleting such a
+			// slice leaked its card bytes permanently (seen live: phantom
+			// commitments starving later allocations into fragmentation
+			// failures), plus an orphan CDI spec and checkpoint record.
+			if allocID, err := m.Allocator.ReleaseBySlice(ctx, string(slice.UID)); err != nil {
+				return fmt.Errorf("NVML release by slice: %w", err)
+			} else if allocID != "" {
+				log.Printf("[allocator] wedge recovery for %s/%s: released untracked allocation %s",
+					slice.Namespace, slice.Name, allocID)
+				if err := cdi.TeardownFirewall(allocID); err != nil {
+					return fmt.Errorf("tearing down CDI firewall (wedge recovery): %w", err)
+				}
+				if err := m.Store.Delete(allocID); err != nil {
+					return fmt.Errorf("deleting checkpoint (wedge recovery): %w", err)
+				}
 			}
 		}
 

@@ -59,6 +59,16 @@ func (r *Reporter) ReportAllocationFailed(ctx context.Context, slice *vgpuv1alph
 }
 
 func (r *Reporter) ReportReleaseComplete(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
+	// A slice can arrive here straight from Ready/Scheduled/Allocating/Failed
+	// (namespace teardown deletes it without anyone stamping Releasing first).
+	// The DAG only permits Releasing → Released, so step through Releasing
+	// in-memory and persist once — jumping directly used to error-storm every
+	// teardown of a Ready slice ("FATAL STATE VIOLATION: Ready -> Released").
+	if string(slice.Status.Phase) != state.SlicePhaseReleasing {
+		if err := state.TransitionSlicePhase(slice, state.SlicePhaseReleasing, "CleanupStarted", "Hardware release in progress"); err != nil {
+			return fmt.Errorf("state transition to Releasing: %w", err)
+		}
+	}
 	if err := state.TransitionSlicePhase(slice, state.SlicePhaseReleased, "CleanupComplete", "Hardware freed"); err != nil {
 		return fmt.Errorf("state transition to Released: %w", err)
 	}

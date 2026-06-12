@@ -7,14 +7,22 @@ import (
 	"path/filepath"
 )
 
+// cdiDirectory is a var (not const) solely so tests can point spec writes at
+// a temp dir via SetDirectoryForTesting; production never changes it.
+var cdiDirectory = "/var/run/cdi"
+
 const (
-	cdiDirectory = "/var/run/cdi"
-	vendorName   = "infrastructure.pranav2910.com"
-	className    = "vgpu"
+	vendorName = "infrastructure.pranav2910.com"
+	className  = "vgpu"
 	// Bug #38: CDI kind must be "<vendor>/<class>".
 	cdiKind    = vendorName + "/" + className
 	cdiVersion = "0.5.0"
 )
+
+// SetDirectoryForTesting overrides where CDI spec files are written. TESTS ONLY
+// — lets manager-level lifecycle tests run on machines where /var/run/cdi is
+// not writable.
+func SetDirectoryForTesting(dir string) { cdiDirectory = dir }
 
 type CDISpec struct {
 	Version string   `json:"cdiVersion"`

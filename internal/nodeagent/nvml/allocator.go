@@ -52,9 +52,11 @@ type Allocator struct {
 	mu        sync.Mutex
 	committed map[string]int64       // device UUID → bytes promised to slices
 	byAlloc   map[string]ledgerEntry // allocationID → entry (Release returns the right card's bytes)
+	bySlice   map[string]string      // slice UID → allocationID (idempotency + wedge-recovery release)
 }
 
 type ledgerEntry struct {
+	sliceUID   string
 	deviceUUID string
 	bytes      int64
 }
@@ -65,6 +67,7 @@ func NewAllocator(mock bool) *Allocator {
 		initialized: true,
 		committed:   make(map[string]int64),
 		byAlloc:     make(map[string]ledgerEntry),
+		bySlice:     make(map[string]string),
 	}
 }
 
@@ -114,12 +117,28 @@ func (a *Allocator) Allocate(ctx context.Context, req AllocationRequest) (*Alloc
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// IDEMPOTENT per slice: a reconcile RETRY for a slice whose previous
+	// Allocate already committed (e.g. the Ready status write hit a conflict
+	// and the slice is being re-driven from Allocating) must return the SAME
+	// allocation — a fresh one would double-commit the ledger and orphan the
+	// original CDI spec + checkpoint.
+	if prior, ok := a.bySlice[req.SliceUID]; ok {
+		e := a.byAlloc[prior]
+		return &AllocationResult{
+			AllocationID:   prior,
+			DeviceUUID:     e.deviceUUID,
+			AllocatedBytes: e.bytes,
+		}, nil
+	}
+
 	uuid, err := a.pickBestFitLocked(devices, req.RequestedVRAMBytes)
 	if err != nil {
 		return nil, err
 	}
 	a.committed[uuid] += req.RequestedVRAMBytes
-	a.byAlloc[allocID] = ledgerEntry{deviceUUID: uuid, bytes: req.RequestedVRAMBytes}
+	a.byAlloc[allocID] = ledgerEntry{sliceUID: req.SliceUID, deviceUUID: uuid, bytes: req.RequestedVRAMBytes}
+	a.bySlice[req.SliceUID] = allocID
 
 	return &AllocationResult{
 		AllocationID:   allocID,
@@ -161,21 +180,55 @@ func (a *Allocator) Release(ctx context.Context, allocationID string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if e, ok := a.byAlloc[allocationID]; ok {
-		a.committed[e.deviceUUID] -= e.bytes
-		if a.committed[e.deviceUUID] <= 0 {
-			delete(a.committed, e.deviceUUID)
-		}
-		delete(a.byAlloc, allocationID)
-	}
+	a.releaseLocked(allocationID)
 	return nil
+}
+
+// ReleaseBySlice releases whatever allocation the ledger holds for a slice,
+// returning its allocationID ("" if none). This is the WEDGE-RECOVERY path:
+// a slice whose Ready status write failed holds a committed allocation that
+// was never recorded on its status (AllocationID empty) — when that slice is
+// deleted, releasing by status alone would leak the ledger entry permanently
+// (and its CDI spec + checkpoint). The ledger remembers what status couldn't.
+func (a *Allocator) ReleaseBySlice(ctx context.Context, sliceUID string) (string, error) {
+	if !a.initialized {
+		return "", fmt.Errorf("allocator not initialised")
+	}
+	if sliceUID == "" {
+		return "", nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	allocID, ok := a.bySlice[sliceUID]
+	if !ok {
+		return "", nil
+	}
+	a.releaseLocked(allocID)
+	return allocID, nil
+}
+
+// releaseLocked removes one allocation from the ledger. Caller holds a.mu.
+func (a *Allocator) releaseLocked(allocationID string) {
+	e, ok := a.byAlloc[allocationID]
+	if !ok {
+		return
+	}
+	a.committed[e.deviceUUID] -= e.bytes
+	if a.committed[e.deviceUUID] <= 0 {
+		delete(a.committed, e.deviceUUID)
+	}
+	delete(a.byAlloc, allocationID)
+	if e.sliceUID != "" {
+		delete(a.bySlice, e.sliceUID)
+	}
 }
 
 // RestoreAllocation re-seeds the per-card ledger from a persisted checkpoint
 // record at agent startup, so commitments survive restarts — without this, a
 // restarted agent would see every card as empty and could over-promise cards
-// that already host slices. Duplicate allocationIDs are ignored (idempotent).
-func (a *Allocator) RestoreAllocation(allocationID, deviceUUID string, bytes int64) {
+// that already host slices. sliceUID restores the idempotency/wedge-recovery
+// index too. Duplicate allocationIDs are ignored (idempotent).
+func (a *Allocator) RestoreAllocation(allocationID, sliceUID, deviceUUID string, bytes int64) {
 	if allocationID == "" || deviceUUID == "" || bytes <= 0 {
 		return
 	}
@@ -185,7 +238,10 @@ func (a *Allocator) RestoreAllocation(allocationID, deviceUUID string, bytes int
 		return
 	}
 	a.committed[deviceUUID] += bytes
-	a.byAlloc[allocationID] = ledgerEntry{deviceUUID: deviceUUID, bytes: bytes}
+	a.byAlloc[allocationID] = ledgerEntry{sliceUID: sliceUID, deviceUUID: deviceUUID, bytes: bytes}
+	if sliceUID != "" {
+		a.bySlice[sliceUID] = allocationID
+	}
 }
 
 // CommittedBytes reports the ledger for one card (tests + observability).

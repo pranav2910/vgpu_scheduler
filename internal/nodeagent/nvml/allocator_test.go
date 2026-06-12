@@ -175,9 +175,9 @@ func TestReleaseRestoresCardCapacity(t *testing.T) {
 func TestRestoreFromCheckpointsPreventsOverPromise(t *testing.T) {
 	a := mockNode(t, 2, 80*tGiB)
 	// Simulate the manager's startup seed: two persisted 60Gi allocations.
-	a.RestoreAllocation("alloc-old-1", "GPU-FAKE-00000000", 60*tGiB)
-	a.RestoreAllocation("alloc-old-2", "GPU-FAKE-00000001", 60*tGiB)
-	a.RestoreAllocation("alloc-old-2", "GPU-FAKE-00000001", 60*tGiB) // duplicate: ignored
+	a.RestoreAllocation("alloc-old-1", "uid-old-1", "GPU-FAKE-00000000", 60*tGiB)
+	a.RestoreAllocation("alloc-old-2", "uid-old-2", "GPU-FAKE-00000001", 60*tGiB)
+	a.RestoreAllocation("alloc-old-2", "uid-old-2", "GPU-FAKE-00000001", 60*tGiB) // duplicate: ignored
 
 	if _, err := a.Allocate(context.Background(), AllocationRequest{SliceUID: "uid-x", RequestedVRAMBytes: 30 * tGiB}); err == nil {
 		t.Fatalf("a re-seeded allocator must not over-promise checkpointed cards")
