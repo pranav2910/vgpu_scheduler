@@ -310,6 +310,19 @@ one child killed: the reservation failed loud with the exact designed reason
 zero slices left, capacity returned — batch B's all-or-nothing-for-life
 guarantee, watched frame by frame on real metal.
 
+**Burst + teardown-storm hardening** (same 8×V100 box): re-running the
+multi-GPU suite — deliberately, to check determinism — caught a cluster of
+five lifecycle bugs that only a 32-slice burst with two controllers racing the
+agent could produce: a status-write conflict wedged a slice in `Allocating`
+forever (dead zone), its committed allocation leaked permanently on deletion
+(phantom ledger entries that starved later allocations into fragmentation
+failures), and namespace teardown of Ready slices error-stormed on illegal
+state transitions (496 errors in one deletion). All fixed — allocation is now
+idempotent per slice, wedged slices re-drive and release by UID, teardown is
+DAG-legal from every phase — and re-verified live: two 32-slice packs Ready in
+5 s each, teardown storms between them, **zero** state violations, **zero**
+leaks, exactly 64 allocations. Determinism re-tests are part of the method.
+
 **Monitor mode on a multi-GPU node** (same 8×V100 box): two pods pinned to two
 different physical cards; the read-only report attributed each pod exactly its
 own footprint (3.3 GiB = 3 GiB tensors + its CUDA context — not summed
