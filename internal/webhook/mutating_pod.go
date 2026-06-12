@@ -73,6 +73,18 @@ func (m *PodMutator) MutatePod(ctx context.Context, pod *corev1.Pod) error {
 		pod.Annotations[CDIAnnotationKey] = cdiDevice
 	}
 
+	// Pin the pod to ITS OWN card by SETTING NVIDIA_VISIBLE_DEVICES in the pod
+	// spec. The CDI edit above only APPENDS an env entry to the OCI process —
+	// but nvidia/cuda base images bake NVIDIA_VISIBLE_DEVICES=all into the
+	// IMAGE, and with duplicate entries the winner is runtime-dependent. On a
+	// multi-GPU node that ambiguity exposed every card to every pod (caught
+	// live on an 8×V100: pod B saw pod A's GPU; single-GPU boxes made the bug
+	// invisible because "all" ≡ the one card). Pod-spec env unambiguously
+	// OVERRIDES image env in Kubernetes, so this pin always wins.
+	if slice.Status.DeviceUUID != "" {
+		pinEnv(pod, "NVIDIA_VISIBLE_DEVICES", slice.Status.DeviceUUID)
+	}
+
 	// Also surface the allocation for workloads that want to read it.
 	// Informational only — not used for device binding.
 	payload, _ := json.Marshal(map[string]string{
@@ -85,4 +97,26 @@ func (m *PodMutator) MutatePod(ctx context.Context, pod *corev1.Pod) error {
 	log.Printf("Pod %s/%s mutated for vGPU claim %s (alloc=%s)",
 		pod.Namespace, pod.Name, claimName, slice.Status.AllocationID)
 	return nil
+}
+
+// pinEnv upserts name=value into every container and initContainer: replaces
+// an existing entry (a user/template-set value must not fight the platform's
+// device pin) and appends where absent.
+func pinEnv(pod *corev1.Pod, name, value string) {
+	upsert := func(c *corev1.Container) {
+		for i := range c.Env {
+			if c.Env[i].Name == name {
+				c.Env[i].Value = value
+				c.Env[i].ValueFrom = nil
+				return
+			}
+		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: name, Value: value})
+	}
+	for i := range pod.Spec.Containers {
+		upsert(&pod.Spec.Containers[i])
+	}
+	for i := range pod.Spec.InitContainers {
+		upsert(&pod.Spec.InitContainers[i])
+	}
 }

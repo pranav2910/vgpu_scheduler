@@ -61,10 +61,14 @@ PERCARD_BYTES=$((PERCARD_MIB * MiB))
 NODE=$(kubectl get nodes -o name | head -1 | sed 's|node/||')
 dim "$CARDS GPUs × ${PERCARD_MIB} MiB on $NODE"
 
-# Slice size: 4 per card with ~2Gi slack (driver reserve + rounding headroom).
-SLICE_BYTES=$(( ((PERCARD_BYTES - 2*GiB) / 4 / GiB) * GiB ))
+# Slice size: EXACTLY 4 per card by construction, MiB-granular. 1Gi of headroom
+# absorbs the driver reserve; 4×S fits, 5×S cannot. (GiB-flooring here once let
+# a 5th slice fit on exactly-16GiB V100s — best-fit correctly took it and the
+# validator wrongly flagged the CORRECT packing.)
+SLICE_MIB=$(( (PERCARD_MIB - 1024) / 4 ))
+SLICE_BYTES=$((SLICE_MIB * MiB))
 TOTAL_GRANTS=$((CARDS * 4))
-dim "slice size $((SLICE_BYTES>>30))Gi · packing $TOTAL_GRANTS grants (4/card)"
+dim "slice size ${SLICE_MIB}Mi · packing $TOTAL_GRANTS grants (exactly 4/card: 4×S+1Gi ≥ card > 5×S)"
 
 hdr "1. node advertises the SUM of all cards"
 ADV=$(kubectl get node "$NODE" -o jsonpath='{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}')
@@ -90,10 +94,11 @@ PERCARD_BAD=$(printf '%s\n' "$MAP" | awk 'NF{c[$1]++; s[$1]+=$2} END{for(u in c)
     || bad "per-card violation: $PERCARD_BAD"
 
 hdr "3. fragmentation fails LOUD"
-# Per-card hole ≈ percard − 4×slice (~2Gi). Ask for hole+1Gi×2: fits node-wide, no card.
-HOLE=$((PERCARD_BYTES - 4*SLICE_BYTES))
-FRAG_BYTES=$(( ((HOLE + 2*GiB) / GiB) * GiB ))
-dim "per-card hole ≈$((HOLE>>30))Gi · requesting $((FRAG_BYTES>>30))Gi"
+# After exact-4 packing, no card has a full slice-size hole left (≤1Gi each),
+# but node-wide the holes sum to several Gi: one more slice-sized request fits
+# the node pool and NO single card — the exact fail-loud case.
+FRAG_BYTES=$SLICE_BYTES
+dim "per-card hole ≤1Gi · requesting one more slice (${SLICE_MIB}Mi)"
 submit_grant "mg-frag" "$FRAG_BYTES"
 wait_for 120 "frag slice Failed" '
     ph=$(kubectl get vgpuslice mg-frag-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null);
