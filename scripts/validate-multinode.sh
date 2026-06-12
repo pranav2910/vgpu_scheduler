@@ -62,6 +62,7 @@ GPU_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "
 NNODES=$(printf '%s\n' "$GPU_NODES" | grep -c . || true)
 [[ "$NNODES" -ge 2 ]] || { echo "need ≥2 GPU nodes advertising vgpu-bytes (found $NNODES) — did each agent's advertise one-liner run?"; exit 2; }
 SMALLEST=$(printf '%s\n' "$GPU_NODES" | awk '{print $2}' | sort -n | head -1)
+LARGEST=$(printf '%s\n' "$GPU_NODES" | awk '{print $2}' | sort -n | tail -1)
 AGENTS=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
 printf '%s\n' "$GPU_NODES" | while read -r n c; do dim "$n → $((c>>30))Gi"; done
 [[ "$AGENTS" -ge "$NNODES" ]] && ok "$NNODES GPU nodes, $AGENTS running node agents" \
@@ -85,7 +86,7 @@ NODES_USED=$(kubectl get vgpuslice -n "$NS" -o jsonpath='{range .items[*]}{.spec
     || bad "slices used $NODES_USED/$NNODES nodes"
 
 hdr "T2 — node-level fit: a grant bigger than ANY node never binds"
-TOOBIG=$(( SMALLEST + 8*GiB ))
+TOOBIG=$(( LARGEST + 8*GiB ))   # bigger than the LARGEST node (heterogeneous-safe)
 submit_grant "mn-toobig" "$TOOBIG"
 sleep 20
 TB_NODE=$(kubectl get vgpuslice mn-toobig-claim-slice -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
