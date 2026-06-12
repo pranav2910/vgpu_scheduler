@@ -206,6 +206,17 @@ func TestReportReleaseComplete_LegalFromEveryLifecyclePhase(t *testing.T) {
 			t.Fatalf("release from %s: allocation fields not zeroed", from)
 		}
 	}
+
+	// A LATE RETRY reading back an already-Released slice must no-op cleanly —
+	// attempting Released→Releasing error-looped 496 times in one live
+	// 32-slice teardown storm.
+	done := schedSlice("w4", "uid-w4", "Released")
+	if err := r.ReportReleaseComplete(context.Background(), done); err != nil {
+		t.Fatalf("release of already-Released slice must be an idempotent no-op: %v", err)
+	}
+	if string(done.Status.Phase) != "Released" {
+		t.Fatalf("already-Released slice mutated to %s", done.Status.Phase)
+	}
 }
 
 // Allocator-level idempotency contract (the foundation the re-drive rests on).

@@ -59,6 +59,14 @@ func (r *Reporter) ReportAllocationFailed(ctx context.Context, slice *vgpuv1alph
 }
 
 func (r *Reporter) ReportReleaseComplete(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
+	// Already Released → the work is done. A teardown storm has the agent's
+	// retries racing the controller's own finishing writes; a late retry that
+	// reads back a terminal slice must no-op, not attempt Released→Releasing
+	// (an illegal transition that error-looped 496 times across one 32-slice
+	// namespace deletion).
+	if string(slice.Status.Phase) == state.SlicePhaseReleased {
+		return nil
+	}
 	// A slice can arrive here straight from Ready/Scheduled/Allocating/Failed
 	// (namespace teardown deletes it without anyone stamping Releasing first).
 	// The DAG only permits Releasing → Released, so step through Releasing
