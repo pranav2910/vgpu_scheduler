@@ -310,6 +310,21 @@ one child killed: the reservation failed loud with the exact designed reason
 zero slices left, capacity returned — batch B's all-or-nothing-for-life
 guarantee, watched frame by frame on real metal.
 
+**The rush-hour soak (the production-shaped finale)** — `scripts/soak-realworld.sh`
+on the 2-node cluster: 8 rounds of real CUDA pods churning through the full
+stack on both machines simultaneously, a gang forming and dissolving every
+round, a deliberate over-user (granted 2Gi, really using ~4Gi), and the
+scheduler **leader killed mid-churn**. Final run **7/7**: every round
+completed, the over-user caught and soft-warned live, a 4.5Gi profile
+learned, zero slices left, both agents' logs clean, and capacity gauges
+balanced back to exactly zero. Earlier soak iterations caught the pod-pinning
+bug (workload pods weren't pinned to their slice's node — invisible on
+single-node clusters, a StartError coin-flip on two) and a missed-release
+capacity leak, now defended in depth by a **cache janitor** (level-based
+sweep, `vgpu_scheduler_cache_janitor_forgets_total`) that turns any future
+missed release edge into a self-healing 60-second blip instead of a permanent
+leak.
+
 **Burst + teardown-storm hardening** (same 8×V100 box): re-running the
 multi-GPU suite — deliberately, to check determinism — caught a cluster of
 five lifecycle bugs that only a 32-slice burst with two controllers racing the
