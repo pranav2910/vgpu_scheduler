@@ -301,6 +301,12 @@ heterogeneous — joined over WireGuard flannel; `validate-multinode.sh
   vanished from scheduling immediately and new work landed only on the
   survivor (the `RemoveNode` ghost-capacity fix, proven on real machines).
 
+**Monitor mode on a multi-GPU node** (same 8×V100 box): two pods pinned to two
+different physical cards; the read-only report attributed each pod exactly its
+own footprint (3.3 GiB = 3 GiB tensors + its CUDA context — not summed
+card-wide, not swapped) against its declared request, with all 8 GPUs in the
+totals. The waste-report wedge is proven on the node shape real clusters run.
+
 *Honest scope:* per-card awareness lives in the **node agent**; the scheduler
 pools capacity per node, so a placement no single card can host is admitted
 node-level and then **fails loudly** at allocation (the message above) rather

@@ -55,8 +55,14 @@ bash scripts/validate-multinode.sh --node-loss  # adds T5 (deletes a node object
 | T4 topology | zone preference honored with the auditable condition |
 | T5 node loss | node deleted from the API → capacity gone, new work lands on survivors |
 
-After `--node-loss`, re-join the deleted node with
-`sudo systemctl restart k3s-agent` on that box (or just tear everything down).
+## Recovering a lost/deleted node
+
+Re-join with `sudo systemctl restart k3s-agent` on that box. **The capacity
+advertisement does not survive node deletion** — the node returns with no
+`vgpu-bytes`, invisible to the scheduler until you re-run its capacity patch
+(the same one-liner the agent script printed at join time) on the server.
+Check with `kubectl get nodes` + the node's capacity field before expecting
+placements there again.
 
 ## The parallel session plan (testing M-GPU and M-NODE at once)
 
