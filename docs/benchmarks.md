@@ -301,6 +301,15 @@ heterogeneous — joined over WireGuard flannel; `validate-multinode.sh
   vanished from scheduling immediately and new work landed only on the
   survivor (the `RemoveNode` ghost-capacity fix, proven on real machines).
 
+**Recovery + cross-machine fail-loud, rehearsed live** (same cluster): the lost
+node re-joined (agent restart + capacity re-advertise — the advertisement does
+not survive deletion; see INSTALL-MULTINODE) and immediately took a 40Gi
+placement only it could host. Then a 6-member gang spanning both machines had
+one child killed: the reservation failed loud with the exact designed reason
+("child lost after commit … 1 deleting"), survivors drained on BOTH machines,
+zero slices left, capacity returned — batch B's all-or-nothing-for-life
+guarantee, watched frame by frame on real metal.
+
 **Monitor mode on a multi-GPU node** (same 8×V100 box): two pods pinned to two
 different physical cards; the read-only report attributed each pod exactly its
 own footprint (3.3 GiB = 3 GiB tensors + its CUDA context — not summed
