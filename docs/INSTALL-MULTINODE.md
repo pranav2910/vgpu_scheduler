@@ -55,6 +55,15 @@ bash scripts/validate-multinode.sh --node-loss  # adds T5 (deletes a node object
 | T4 topology | zone preference honored with the auditable condition |
 | T5 node loss | node deleted from the API → capacity gone, new work lands on survivors |
 
+## Updating images on a multi-node cluster
+
+Images are imported into each node's containerd **locally** — there is no
+registry. Deploying a new agent build means **rebuild + import on EVERY GPU
+node** (re-run the build/import block from `multinode-agent.sh` on each), then
+restart the DaemonSet. Rebuilding on one node silently leaves the others on
+the old binary — found live: a node re-joined after a loss kept running a
+days-old agent through an entire soak.
+
 ## Recovering a lost/deleted node
 
 Re-join with `sudo systemctl restart k3s-agent` on that box. **The capacity
