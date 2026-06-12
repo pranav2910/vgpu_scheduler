@@ -112,7 +112,7 @@ wait_for 240 "packing released" '
     n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " ");
     [[ "$n" == "0" ]]
 ' || exit 1
-BIG_BYTES=$(( (PERCARD_BYTES * 55 / 100 / GiB) * GiB ))   # ~55% of a card → two must split
+BIG_BYTES=$(( (PERCARD_BYTES * 60 / 100 / GiB) * GiB ))   # ~60% of a card → two can NEVER share one (decisive on 16GB cards too)
 for n in mga mgb; do
     scripts/vgpu submit --name "$n" -n "$NS" --vram "$((BIG_BYTES>>30))Gi" \
         --image "$IMAGE" --command 'nvidia-smi -L; sleep 600' --runtime-class nvidia >/dev/null \
