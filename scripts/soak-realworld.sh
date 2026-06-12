@@ -175,14 +175,28 @@ for AG in $(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{
         || bad "agent $AG: soak violations=$V frag=$F"
 done
 
+# Gauges must return to zero — allow up to ~100s for the cache janitor's
+# level-based sweep to correct any missed release edge (its whole job).
 GAUGE_BAD=""
-for p in $(kubectl get pods -n vgpu-system -o name | grep scheduler); do
-    NZ=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${p#pod/}:8081/proxy/metrics" 2>/dev/null \
-        | awk '/^vgpu_node_(allocated|reserved)_bytes/ && $2+0 != 0 {print}' | head -2)
-    [[ -n "$NZ" ]] && GAUGE_BAD="$NZ"
+for _ in $(seq 1 20); do
+    GAUGE_BAD=""
+    for p in $(kubectl get pods -n vgpu-system -o name | grep scheduler); do
+        NZ=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${p#pod/}:8081/proxy/metrics" 2>/dev/null \
+            | awk '/^vgpu_node_(allocated|reserved)_bytes/ && $2+0 != 0 {print}' | head -2)
+        [[ -n "$NZ" ]] && GAUGE_BAD="$NZ"
+    done
+    [[ -z "$GAUGE_BAD" ]] && break
+    sleep 5
 done
 [[ -z "$GAUGE_BAD" ]] && ok "scheduler gauges back to baseline (allocated=0, reserved=0 on every node)" \
-    || bad "capacity gauges not back to zero: $GAUGE_BAD"
+    || bad "capacity gauges not back to zero even after a janitor sweep: $GAUGE_BAD"
+JF=""
+for p in $(kubectl get pods -n vgpu-system -o name | grep scheduler); do
+    v=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${p#pod/}:8081/proxy/metrics" 2>/dev/null \
+        | awk '/^vgpu_scheduler_cache_janitor_forgets_total/ {print $2}')
+    [[ -n "$v" && "$v" != "0" ]] && JF="$v"
+done
+[[ -n "$JF" ]] && dim "note: janitor forgot $JF entr(ies) — a release edge was missed and self-healed; uids are in the scheduler log"
 
 echo; echo "  PASS=$PASS  FAIL=$FAIL"
 if [[ $FAIL -eq 0 ]]; then

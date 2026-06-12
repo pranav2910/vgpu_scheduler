@@ -83,6 +83,19 @@ func main() {
 		log.Fatalf("adding cache-seed runnable: %v", err)
 	}
 
+	// Cache JANITOR — level-based correction for the whole missed-release bug
+	// class. Every release path is edge-triggered (a Released event, a delete
+	// event); a missed edge leaks capacity forever (seen live: 12Gi of
+	// allocated bytes surviving a churn-heavy soak with zero slices left).
+	// The janitor periodically compares the cache's tracked slice UIDs against
+	// a DIRECT API list (quorum read — an informer-lag absence must never
+	// release a live hold) and forgets entries whose objects no longer exist,
+	// loudly. Nonzero forgets = some edge was missed; the logged UIDs are the
+	// breadcrumbs for root-causing it.
+	if err := mgr.Add(&cacheJanitorRunnable{reader: mgr.GetAPIReader(), cache: cache, interval: 60 * time.Second}); err != nil {
+		log.Fatalf("adding cache janitor runnable: %v", err)
+	}
+
 	// Bug #3 fix: start the TTL reaper so expired speculative reservations
 	// get rolled back.
 	if err := mgr.Add(&ttlReaperRunnable{cache: cache, interval: 10 * time.Second}); err != nil {
@@ -208,6 +221,49 @@ func (r *ttlReaperRunnable) Start(ctx context.Context) error {
 	r.cache.StartTTLReaper(ctx, r.interval)
 	<-ctx.Done()
 	return nil
+}
+
+// cacheJanitorRunnable is the level-based safety net under every edge-
+// triggered release path: each sweep DIRECT-lists slices (quorum read — an
+// informer-lag absence must never release a live hold) and forgets any cache
+// entry whose slice no longer exists. Leader-gated like every runnable here.
+type cacheJanitorRunnable struct {
+	reader   client.Reader
+	cache    *scheduler.VRAMCache
+	interval time.Duration
+}
+
+func (j *cacheJanitorRunnable) Start(ctx context.Context) error {
+	ticker := time.NewTicker(j.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			tracked := j.cache.TrackedSliceUIDs()
+			if len(tracked) == 0 {
+				continue
+			}
+			var slices vgpuv1alpha1.VGPUSliceList
+			if err := j.reader.List(ctx, &slices); err != nil {
+				log.Printf("[janitor] slice list failed (%v) — skipping sweep", err)
+				continue
+			}
+			live := make(map[string]struct{}, len(slices.Items))
+			for i := range slices.Items {
+				live[string(slices.Items[i].UID)] = struct{}{}
+			}
+			for uid, node := range tracked {
+				if _, ok := live[uid]; ok {
+					continue
+				}
+				log.Printf("[janitor] cache entry for slice uid=%s (node %s) has no live object — forgetting (a release edge was missed; investigate via this uid)", uid, node)
+				j.cache.ForgetSlice(uid, node)
+				telemetry.CacheJanitorForgets.Inc()
+			}
+		}
+	}
 }
 
 // metricsCollectorRunnable periodically refreshes the inventory-style gauges

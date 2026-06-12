@@ -28,6 +28,9 @@ type VRAMCache struct {
 	// allocatedBytesBySlice remembers per-slice allocations so ReleaseAllocated
 	// can decrement the exact amount even if the caller's bytes arg is stale.
 	allocatedBytesBySlice map[string]int64
+	// allocatedNodeBySlice remembers WHICH node each allocation sits on, so the
+	// cache janitor can forget an allocated slice whose object no longer exists.
+	allocatedNodeBySlice map[string]string
 
 	// seeded is set once the cache has been warmed at startup with node capacity
 	// AND the consumption of all already-bound slices. The scheduler refuses to
@@ -79,6 +82,7 @@ func NewVRAMCache() *VRAMCache {
 		confirmedBySlice:      make(map[string]*AssumedAllocation),
 		syncedPhaseBySlice:    make(map[string]string),
 		allocatedBytesBySlice: make(map[string]int64),
+		allocatedNodeBySlice:  make(map[string]string),
 	}
 }
 
@@ -262,6 +266,7 @@ func (c *VRAMCache) PromoteSliceToAllocatedOnce(sliceUID, nodeName string, actua
 	// applied) to prevent retry loops.
 	c.syncedPhaseBySlice[sliceUID] = "Ready"
 	c.allocatedBytesBySlice[sliceUID] = actualBytes
+	c.allocatedNodeBySlice[sliceUID] = nodeName
 	return err
 }
 
@@ -275,8 +280,31 @@ func (c *VRAMCache) ReleaseSliceOnce(sliceUID, nodeName string) {
 	bytes := c.allocatedBytesBySlice[sliceUID]
 	c.syncedPhaseBySlice[sliceUID] = "Released"
 	delete(c.allocatedBytesBySlice, sliceUID)
+	delete(c.allocatedNodeBySlice, sliceUID)
 	c.mu.Unlock()
 	c.ReleaseAllocated(nodeName, bytes)
+}
+
+// TrackedSliceUIDs returns every slice UID the cache currently accounts
+// capacity for (assumed, confirmed, or allocated), mapped to its node. This is
+// the janitor's working set: every release path in the system is EDGE-
+// triggered (an event arrives, or it doesn't — and a missed edge leaks
+// forever); the janitor compares this set against the API's level and forgets
+// entries whose objects no longer exist.
+func (c *VRAMCache) TrackedSliceUIDs() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.assumedBySlice)+len(c.confirmedBySlice)+len(c.allocatedBytesBySlice))
+	for uid, a := range c.assumedBySlice {
+		out[uid] = a.NodeName
+	}
+	for uid, a := range c.confirmedBySlice {
+		out[uid] = a.NodeName
+	}
+	for uid, n := range c.allocatedNodeBySlice {
+		out[uid] = n
+	}
+	return out
 }
 
 func (c *VRAMCache) PromoteConfirmedToAllocated(sliceUID, nodeName string, actualBytes int64) error {

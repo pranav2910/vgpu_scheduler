@@ -110,6 +110,11 @@ var (
 		Help: "Times a bind outlived its reservation TTL and the confirmed capacity had to be re-armed. Nonzero means bind latency is outrunning the reservation TTL — investigate API-server latency.",
 	})
 
+	CacheJanitorForgets = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "vgpu_scheduler_cache_janitor_forgets_total",
+		Help: "Cache entries forgotten because their slice no longer exists. Nonzero means an edge-triggered release was missed somewhere — capacity self-healed, but the miss is worth investigating (the janitor logs the UIDs).",
+	})
+
 	GangAdmissionSlotHeld = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "vgpu_gang_admission_slot_held",
 		Help: "1 while a gang holds the serialized admission slot, 0 when free.",
@@ -409,7 +414,7 @@ func init() {
 		NamespaceAllocatedBytes, NamespaceQuotaBytes,
 		// slice lifecycle
 		SlicesByPhase, SliceScheduleAttempts, SliceScheduleLatency, SliceReady, SliceFailed,
-		ConfirmRearms,
+		ConfirmRearms, CacheJanitorForgets,
 		// gang
 		GangAttempts, GangAdmissionDecisions, GangQuorumWait, GangRollbacks,
 		GangAdmissionBackoffs, GangAdmissionSlotHeld,

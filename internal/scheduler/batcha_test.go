@@ -281,3 +281,43 @@ func TestScheduleFailsClosedWhenGateCannotReadSlice(t *testing.T) {
 		t.Fatalf("reserved bytes leaked after fail-closed abort: %d", got)
 	}
 }
+
+// The janitor's working set: every state the cache accounts capacity in must
+// surface in TrackedSliceUIDs, and ForgetSlice must clear it — this is the
+// level-based safety net under every edge-triggered release path.
+func TestTrackedSliceUIDsCoversAllStatesAndForgets(t *testing.T) {
+	c := NewVRAMCache()
+	c.UpdateNode("n1", 80*qGiB, 0)
+
+	if err := c.AssumeSlice("uid-a", "default", "n1", qGiB, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AssumeSlice("uid-c", "default", "n1", qGiB, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	c.ConfirmSliceOrRearm("uid-c", "default", "n1", qGiB)
+	if err := c.AssumeSlice("uid-p", "default", "n1", qGiB, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	c.ConfirmSliceOrRearm("uid-p", "default", "n1", qGiB)
+	if err := c.PromoteSliceToAllocatedOnce("uid-p", "n1", qGiB); err != nil {
+		t.Fatal(err)
+	}
+
+	tracked := c.TrackedSliceUIDs()
+	for _, uid := range []string{"uid-a", "uid-c", "uid-p"} {
+		if tracked[uid] != "n1" {
+			t.Fatalf("tracked[%s] = %q, want n1 (assumed/confirmed/allocated must ALL be janitor-visible)", uid, tracked[uid])
+		}
+	}
+
+	for uid := range tracked {
+		c.ForgetSlice(uid, tracked[uid])
+	}
+	if left := c.TrackedSliceUIDs(); len(left) != 0 {
+		t.Fatalf("after forgetting everything, tracked = %v, want empty", left)
+	}
+	if snap := c.SnapshotNode("n1"); snap.AllocatedVRAMBytes != 0 || snap.ReservedVRAMBytes != 0 {
+		t.Fatalf("node books after janitor pass: allocated=%d reserved=%d, want 0/0", snap.AllocatedVRAMBytes, snap.ReservedVRAMBytes)
+	}
+}
