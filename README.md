@@ -151,8 +151,10 @@ right-sized grants (3.5) · **soft feedback-aware scheduling** (3.6) · and the
 scheduler places it, the node agent binds a real GPU, and the mutating webhook
 injects it so the pod runs (v0.8) · **recommendation enforcement** — an
 under-provisioned request can be required to carry an explicit override (3.7a).
-All hardware-validated on an A10 **and a 1× H100**; defaults stay non-destructive
-(`softwarn`, `recommendOnly`).
+All hardware-validated on an A10, a 1× H100, an **8× V100 node** (per-card
+best-fit packing, fail-loud fragmentation, per-card pod isolation) and a
+**heterogeneous 2-node cluster** (cross-node spread + gang atomicity, live
+node-loss — v0.14); defaults stay non-destructive (`softwarn`, `recommendOnly`).
 
 **Recommendation enforcement (3.7a/b)** is done: `VGPU_RECOMMENDATION_MODE` =
 `recommendOnly` (default) · `warn` · `requireOverride` · **`autoResize`**.
@@ -163,8 +165,9 @@ never shrinks). Both act only at **Medium+** confidence, honor the
 `…/override-recommendation` annotation, and are **fail-open**
 (see [docs/recommendation-policy.md](docs/recommendation-policy.md)). Next frontier:
 a hard `block` mode and **auto-shrink** of over-provisioned requests. True per-process VRAM isolation today is
-soft (record + evict); **MIG-backed hard partitioning** (3.4e), multi-GPU-per-node, federation,
-and a managed SaaS layer are deferred.
+soft (record + evict); **MIG-backed hard partitioning** (3.4e), per-card scheduler
+awareness (the node agent owns per-card fit today, failing loud on fragmentation),
+cluster-scale validation, federation, and a managed SaaS layer are deferred.
 
 ## License
 

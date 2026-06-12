@@ -34,6 +34,7 @@ waste before adopting anything.
 - **Right-sizing works**: a job that asked for 16 GiB but used 21.5 GiB was recommended 24.7 GiB; in `autoResize` mode the request is corrected **before scheduling**, audited.
 - **Hardened**: a 15-test adversarial battery (over-subscription, leader-kill-mid-bind, gang atomicity, child-loss, soak) passes **15/15**; data-plane + runtime suites pass on real A10 + H100.
 - **Zero-risk entry point works**: the read-only monitor, live on an H100, flagged two jobs over-asking by ~37 GiB (~$1,000/mo) beside the stock scheduler — and its waste math was adversarially bug-hunted, catching a 7.8× over-report (finished/pending pods counted as waste) and fixing it *before* shipping.
+- **Scales past one card and one box**: on an 8× V100 node, 32 workloads packed exactly 4-per-card with per-card ledger enforcement and pods isolated to *their own* GPU; on a 2-node cluster (8×V100 + 1×H100), workloads spread across machines, a 9-member gang committed all-or-nothing **across nodes**, and a deleted node's capacity vanished from scheduling instantly.
 
   *Evidence + methodology: [benchmarks.md](benchmarks.md).*
 
@@ -45,7 +46,7 @@ size*. We pack by bytes **and get smarter about packing** — the platform becom
 self-correcting.
 
 ### 5. Honest limits
-- **Validated on one H100 node today.** Multi-GPU-per-node and multi-node packing are designed, not yet proven.
+- **Multi-GPU nodes and multi-node clusters are hardware-validated** (8× V100 per-card packing with fail-loud fragmentation; a heterogeneous 2-node cluster with cross-node gang atomicity and live node-loss). Cluster *scale* (tens of nodes) is not yet exercised, and per-card awareness lives in the node agent — the scheduler pools per node and impossible placements fail loudly rather than silently.
 - **Soft GPU sharing with runtime governance** (observe → warn → opt-in evict → right-size), **not** hardware partitioning. **MIG-backed hard isolation is future work.**
 - Open-source and early; pre-revenue, starting customer discovery.
 
@@ -62,4 +63,4 @@ cards. Sweet spot: teams with their own GPU clusters who want better utilization
 
 ---
 
-*Apache-2.0 · github.com/pranav2910/vgpu_scheduler · latest: v0.13 (correctness hardening, 24 fixes) · runbook: [INSTALL-H100.md](INSTALL-H100.md) · try it: `docs/USER-GUIDE.md`*
+*Apache-2.0 · github.com/pranav2910/vgpu_scheduler · latest: v0.14 (multi-GPU nodes + multi-node clusters) · runbooks: [INSTALL-H100.md](INSTALL-H100.md) · [INSTALL-MULTINODE.md](INSTALL-MULTINODE.md) · try it: `docs/USER-GUIDE.md`*

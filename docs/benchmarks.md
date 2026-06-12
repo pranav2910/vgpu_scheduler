@@ -46,8 +46,9 @@ GPU (`status.deviceUuid == GPU-…`). The node agent independently reads true pe
 usage via NVML v2 accounting, which is how the feedback numbers below are obtained
 (observed, not estimated).
 
-**Honest scope.** All hardware results are on **one GPU, one node**. Multi-GPU-per-node
-and multi-node packing are not yet validated (see Limitations).
+**Honest scope.** Results 1–6 are on **one GPU, one node**; Result 7 extends to
+**8 GPUs per node and a heterogeneous 2-node cluster** (see Limitations for what
+is still out of scope).
 
 ---
 
@@ -266,6 +267,50 @@ are injected (else it degrades to requested-only). The $ figure is an estimate (
 
 ---
 
+## Result 7 — Multi-GPU nodes + multi-node clusters (v0.14)
+
+**Multi-GPU per node** (8× Tesla V100-16GB, `validate-multigpu-a100.sh`, **7/7**):
+
+- The node advertises the **sum** of its cards (128Gi) and the allocator places
+  each slice on ONE physical card, **best-fit**: 32 grants → exactly 4 per card
+  across all 8 GPUs, per-card ledger never exceeding a card.
+- **Fragmentation fails loud**: with ≤1Gi holes per card, one more slice-sized
+  request fits the node pool but no single card —
+  `No single GPU has 3.8Gi free; node has 6.1Gi free across GPUs. Fragmented capacity.`
+  The slice fails terminally with that message; nothing silently retries or
+  over-packs a card.
+- **Per-card isolation, in-container**: two pods forced onto two different
+  physical GPUs each see exactly THEIR card's UUID inside the container. This
+  run caught a real bug first: the CDI env edit only *appended*
+  `NVIDIA_VISIBLE_DEVICES`, and nvidia/cuda images bake in `=all` — every pod
+  could see every GPU (invisible on single-GPU boxes, where "all" ≡ your card).
+  The webhook now pins the env in the pod spec, which Kubernetes guarantees
+  wins. Caught, fixed, and re-proven in the same session.
+
+**Multi-node** (8×V100-16GB server + 1×H100-80GB agent — deliberately
+heterogeneous — joined over WireGuard flannel; `validate-multinode.sh
+--node-loss`, **6/6**):
+
+- 9× 15Gi grants (sized to the smallest physical card) spread across **both
+  machines**, all Ready.
+- A 136Gi grant — bigger than any node — held Pending, never mis-bound.
+- A 9-member **gang that cannot fit on one machine committed all-or-nothing
+  across nodes**.
+- Zone preference honored across nodes (auditable condition).
+- **Live node loss**: the agent node deleted from the API → its capacity
+  vanished from scheduling immediately and new work landed only on the
+  survivor (the `RemoveNode` ghost-capacity fix, proven on real machines).
+
+*Honest scope:* per-card awareness lives in the **node agent**; the scheduler
+pools capacity per node, so a placement no single card can host is admitted
+node-level and then **fails loudly** at allocation (the message above) rather
+than being filtered earlier — per-card scheduler awareness is the next
+milestone. Validated at 2 nodes / 9 GPUs total; cluster *scale* (tens of nodes)
+is not yet exercised. One slice never spans cards; multi-GPU single pods and
+NVLink-aware placement are out of scope.
+
+---
+
 ## Reproduce it yourself (3 commands)
 
 On a fresh GPU node (drivers + docker + git; the script installs k3s itself):
@@ -290,9 +335,11 @@ Full runbook: [INSTALL-H100.md](INSTALL-H100.md).
 
 ## Limitations (read before quoting the numbers)
 
-1. **Single GPU, single node.** All hardware results are on one H100. Multi-GPU-per-node
-   and multi-node packing are designed but not yet validated. "Validated on 1× H100" is
-   the honest claim; cluster-scale is roadmap.
+1. **Validated at small scale.** Core results are on a 1× H100; multi-GPU (8× V100)
+   and multi-node (2 heterogeneous nodes) are validated in Result 7. Cluster *scale*
+   — tens of nodes, node churn under load — is designed but not yet exercised. The
+   scheduler pools capacity per node; per-card fit is enforced by the node agent
+   with loud failure on fragmentation (per-card scheduler awareness is roadmap).
 2. **Soft isolation, not a hardware fence.** A pod is given the whole GPU via
    `NVIDIA_VISIBLE_DEVICES`; its VRAM budget is *governed* (observe → warn → opt-in
    evict → right-size), not physically partitioned. A workload can briefly exceed its
