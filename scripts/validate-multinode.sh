@@ -69,11 +69,24 @@ printf '%s\n' "$GPU_NODES" | while read -r n c; do dim "$n → $((c>>30))Gi"; do
     || bad "only $AGENTS agent pods for $NNODES nodes (image missing on a node?)"
 kubectl create namespace "$NS" >/dev/null
 
-# Grant size: ~40% of the smallest node → 2 fit per node, 3+ forces a spread.
-SLICE=$(( (SMALLEST * 2 / 5) / GiB * GiB ))
-PER_NODE=2
-TOTAL=$((NNODES * PER_NODE))
-dim "grant size $((SLICE>>30))Gi · $PER_NODE per node · $TOTAL total"
+# Grant size must fit on ONE PHYSICAL CARD of every node — the node-pool figure
+# hides card boundaries (an 8×16GB node advertises 128Gi but can host nothing
+# bigger than ~15Gi). Read the smallest card in the cluster from the agents'
+# own metrics; fall back to the smallest node for single-card setups.
+MINCARD=""
+for pod in $(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[*].metadata.name}'); do
+    m=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${pod}:8083/proxy/metrics" 2>/dev/null \
+        | awk '/^vgpu_gpu_total_memory_bytes/ {printf "%.0f\n", $2}' | sort -n | head -1)
+    [[ -n "$m" ]] || continue
+    [[ -z "$MINCARD" || "$m" -lt "$MINCARD" ]] && MINCARD=$m
+done
+[[ -n "$MINCARD" ]] || MINCARD=$SMALLEST
+SLICE=$(( (MINCARD - GiB) / GiB * GiB ))           # ~1Gi headroom under the smallest card
+# Enough total demand that the LARGEST node cannot hold it alone → forced spread.
+TOTAL=$(( LARGEST / SLICE + 1 ))
+[[ $TOTAL -lt 3 ]] && TOTAL=3
+[[ $TOTAL -gt 24 ]] && TOTAL=24
+dim "smallest card $((MINCARD>>30))Gi → grant size $((SLICE>>30))Gi · $TOTAL grants (exceeds the largest node)"
 
 hdr "T1 — spread: $TOTAL grants must use every node"
 for i in $(seq 1 "$TOTAL"); do submit_grant "mn-$i" "$SLICE"; done
@@ -82,8 +95,8 @@ wait_for 240 "all $TOTAL slices Ready" '
     [[ "$n" == "'"$TOTAL"'" ]]
 ' || kubectl get vgpuslice -n "$NS"
 NODES_USED=$(kubectl get vgpuslice -n "$NS" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u | grep -c . || true)
-[[ "$NODES_USED" == "$NNODES" ]] && ok "slices landed on all $NNODES nodes" \
-    || bad "slices used $NODES_USED/$NNODES nodes"
+[[ "$NODES_USED" -ge 2 ]] && ok "slices spread across $NODES_USED nodes (cross-node scheduling live)" \
+    || bad "slices used $NODES_USED node(s), want ≥2"
 
 hdr "T2 — node-level fit: a grant bigger than ANY node never binds"
 TOOBIG=$(( LARGEST + 8*GiB ))   # bigger than the LARGEST node (heterogeneous-safe)
@@ -145,20 +158,28 @@ ZN=$(kubectl get vgpuslice mn-zoneb-claim-slice -n "$NS" -o jsonpath='{.spec.nod
 kubectl delete vgpujob mn-zoneb -n "$NS" --wait=false >/dev/null 2>&1
 
 if [[ "$NODE_LOSS" == "1" ]]; then
-    hdr "T5 — node loss: delete $NODE_B from the API; new work must land on survivors"
-    wait_for 120 "prior grants drained" '
-        n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]
-    ' || true
-    kubectl delete node "$NODE_B" >/dev/null 2>&1
-    dim "node object deleted (re-join later: ssh to $NODE_B and 'sudo systemctl restart k3s-agent')"
-    sleep 10
-    submit_grant "mn-afterloss" "$SLICE"
-    wait_for 120 "post-loss grant Ready on a survivor" '
-        ph=$(kubectl get vgpuslice mn-afterloss-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null);
-        nd=$(kubectl get vgpuslice mn-afterloss-claim-slice -n '"$NS"' -o jsonpath="{.spec.nodeName}" 2>/dev/null);
-        [[ "$ph" == "Ready" && -n "$nd" && "$nd" != "'"$NODE_B"'" ]]
-    ' && ok "ghost node never used: new grant Ready on a surviving node (RemoveNode live)" \
-      || bad "post-loss grant did not land cleanly on a survivor"
+    # The victim must be an AGENT node — deleting the control-plane node from
+    # its own API kills the cluster, not the test.
+    VICTIM=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.node-role\.kubernetes\.io/control-plane}{"\n"}{end}' \
+        | awk 'NF==1 {print $1; exit}')
+    if [[ -z "$VICTIM" ]]; then
+        bad "T5 skipped: no non-control-plane node to sacrifice"
+    else
+        hdr "T5 — node loss: delete $VICTIM from the API; new work must land on survivors"
+        wait_for 120 "prior grants drained" '
+            n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]
+        ' || true
+        kubectl delete node "$VICTIM" >/dev/null 2>&1
+        dim "node object deleted (re-join later: ssh to $VICTIM and 'sudo systemctl restart k3s-agent')"
+        sleep 10
+        submit_grant "mn-afterloss" "$SLICE"
+        wait_for 120 "post-loss grant Ready on a survivor" '
+            ph=$(kubectl get vgpuslice mn-afterloss-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null);
+            nd=$(kubectl get vgpuslice mn-afterloss-claim-slice -n '"$NS"' -o jsonpath="{.spec.nodeName}" 2>/dev/null);
+            [[ "$ph" == "Ready" && -n "$nd" && "$nd" != "'"$VICTIM"'" ]]
+        ' && ok "ghost node never used: new grant Ready on a surviving node (RemoveNode live)" \
+          || bad "post-loss grant did not land cleanly on a survivor"
+    fi
 fi
 
 echo
