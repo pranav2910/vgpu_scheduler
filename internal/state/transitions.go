@@ -10,9 +10,15 @@ import (
 
 // legalSliceTransitions is the absolute DAG for the system.
 var legalSliceTransitions = map[string]map[string]bool{
-	// state-machine fix applied: tightened DAG
-	"":                   {SlicePhasePending: true},
-	SlicePhasePending:    {SlicePhaseScheduled: true, SlicePhaseFailed: true},
+	// state-machine fix applied: tightened DAG.
+	// Releasing is legal from EVERY pre-Ready state, including the empty initial
+	// phase and Pending: a slice can be deleted at any instant (node loss, fast
+	// churn, namespace teardown) — including before it ever left phase "" — and
+	// teardown must be DAG-legal from wherever it is. Found by the multi-node
+	// soak: deleting a just-created slice raised "Cannot transition from '' to
+	// 'Releasing'".
+	"":                   {SlicePhasePending: true, SlicePhaseReleasing: true},
+	SlicePhasePending:    {SlicePhaseScheduled: true, SlicePhaseFailed: true, SlicePhaseReleasing: true},
 	SlicePhaseScheduled:  {SlicePhaseAllocating: true, SlicePhaseFailed: true, SlicePhaseReleasing: true},
 	SlicePhaseAllocating: {SlicePhaseReady: true, SlicePhaseFailed: true, SlicePhaseReleasing: true},
 	SlicePhaseReady:      {SlicePhaseReleasing: true, SlicePhaseFailed: true},

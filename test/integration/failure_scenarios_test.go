@@ -701,7 +701,10 @@ func TestStateMachine_IllegalTransitions(t *testing.T) {
 	}{
 		{state.SlicePhasePending, state.SlicePhaseAllocating},
 		{state.SlicePhasePending, state.SlicePhaseReady},
-		{state.SlicePhasePending, state.SlicePhaseReleasing},
+		// NOTE: Pending -> Releasing is now LEGAL by design — a slice can be
+		// deleted before it is ever scheduled, so teardown must be legal from
+		// every pre-Ready state (multi-node soak fix; see state/transitions.go
+		// and TestReleasingLegalFromEveryPreReadyState).
 		{state.SlicePhasePending, state.SlicePhaseReleased},
 		{state.SlicePhaseScheduled, state.SlicePhaseReady},
 		{state.SlicePhaseScheduled, state.SlicePhaseReleased},
