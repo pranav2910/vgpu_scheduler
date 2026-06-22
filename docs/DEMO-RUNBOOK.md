@@ -230,6 +230,17 @@ This creates a kind cluster advertising **one 80 GiB mock GPU**
 
 **The before/after that makes the value obvious.**
 
+> **⚠️ Reset between EVERY demo segment.** Slices persist after a segment and fill
+> the 80 GiB GPU, so the *next* segment sees a full card and "fails" confusingly
+> (jobs stuck `ClaimCreated` / `Pending`, slices with no node). Run this between
+> before / after / gang:
+> ```sh
+> kubectl delete vgpugangjobs,vgpujobs --all -n vgpu-demo   # wait ~15s for slices to clear
+> kubectl get vgpuslices -n vgpu-demo                       # → No resources found = clean slate
+> ```
+> (If you *do* see held `ClaimCreated` jobs mid-demo, that's the no-over-admission
+> guarantee working — the GPU is just full — not a bug.)
+
 ```sh
 kubectl apply -f demo/00-demo-namespace.yaml
 NODE=$(kubectl get nodes -o name | head -1 | sed 's|node/||')
@@ -523,6 +534,7 @@ kind delete cluster --name vgpu-test
 | dirty battery results | leftover wedged slices — `kind delete cluster` first, then re-run setup |
 | webhook errors on apply | cert-manager not ready — re-run `setup-kind-cluster.sh` (it waits for certs) |
 | `Forbidden … violates PodSecurity "restricted"` | the namespace enforces `restricted`, which GPU pods can't meet (no `runAsNonRoot`/drop-caps/seccomp; real GPU pods need device access). Relabel to baseline: `kubectl label ns NS pod-security.kubernetes.io/enforce=baseline --overwrite`. Common on hardened enterprise clusters. |
+| a demo segment's jobs stuck `ClaimCreated`/`Pending`, slices have no node | leftover slices from a prior segment fill the GPU. Reset: `kubectl delete vgpugangjobs,vgpujobs --all -n vgpu-demo` (the held state is the no-over-admission guarantee, not a bug) |
 
 ---
 
