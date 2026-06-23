@@ -57,10 +57,5 @@ the ML engineers who just want to ask for `16Gi` instead of fighting over whole
 cards. Sweet spot: teams with their own GPU clusters who want better utilization
 **without buying Run:ai or locking into a single vendor**.
 
-### 7. Open-source core vs. commercial
-- **Open-source (now):** the scheduler, VRAM bin-packing + gang/quota/preemption, runtime governance (detect → attribute → enforce), the feedback/right-size/autoResize loop, the `vgpu` CLI, Prometheus metrics.
-- **Commercial (later):** a dashboard, multi-tenant policy & quota hierarchy, multi-cluster/federation, MIG hard isolation, framework integrations (Ray / PyTorch / vLLM / Kubeflow), and enterprise support / SSO / audit.
-
----
 
 *Apache-2.0 · github.com/pranav2910/vgpu_scheduler · latest: v0.14 (multi-GPU nodes + multi-node clusters) · runbooks: [INSTALL-H100.md](INSTALL-H100.md) · [INSTALL-MULTINODE.md](INSTALL-MULTINODE.md) · try it: `docs/USER-GUIDE.md`*
