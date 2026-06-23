@@ -8,7 +8,10 @@ import (
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/state"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -39,24 +42,19 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	// Honour per-Job grace period (default 30s, configurable up to 3600s),
 	// then transition to Released so existing cleanup runs.
 	if string(slice.Status.Phase) == "Preempting" {
+		// Resolve the owning Job ONCE: needed both for the grace period and, on
+		// expiry, to evict its workload pod and mark it terminal.
+		job := r.resolveOwnerJob(ctx, &slice)
 		grace := 30 * time.Second
-		if slice.Spec.ClaimRef != "" {
-			var claim vgpuv1alpha1.VGPUClaim
-			if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: slice.Spec.ClaimRef}, &claim); err == nil {
-				if claim.Spec.JobRef != "" {
-					var job vgpuv1alpha1.VGPUJob
-					if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: claim.Spec.JobRef}, &job); err == nil {
-						if job.Spec.PreemptionGraceSeconds != nil && *job.Spec.PreemptionGraceSeconds > 0 {
-							grace = time.Duration(*job.Spec.PreemptionGraceSeconds) * time.Second
-						}
-					}
-				}
-			}
+		if job != nil && job.Spec.PreemptionGraceSeconds != nil && *job.Spec.PreemptionGraceSeconds > 0 {
+			grace = time.Duration(*job.Spec.PreemptionGraceSeconds) * time.Second
 		}
 		var since time.Time
+		var preemptMsg string
 		for _, c := range slice.Status.Conditions {
 			if c.Type == "Preempting" {
 				since = c.LastTransitionTime.Time
+				preemptMsg = c.Message
 				break
 			}
 		}
@@ -68,6 +66,20 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 			remaining := grace - elapsed
 			log.Printf("[preempting] %s/%s grace remaining %v", slice.Namespace, slice.Name, remaining.Round(time.Second))
 			return reconcile.Result{RequeueAfter: remaining}, nil
+		}
+		// Grace expired. BEFORE releasing the slice (which frees the VRAM the
+		// scheduler immediately re-sells), evict the victim's workload pod and mark
+		// its Job preempted. Without this, the pod keeps physically using a GPU
+		// whose memory was just handed to the higher-priority requester
+		// (double-booked VRAM → OOM), and the Job reconciler would recreate it.
+		// Mirrors the enforcement-evict contract in vgpujob_reconciler.go.
+		if job != nil {
+			if err := r.evictPreemptedWorkload(ctx, job, preemptMsg); err != nil {
+				// Best-effort: log and still release the slice. The Job
+				// reconciler's jobPreempted guard prevents recreation once the
+				// condition lands; a transient error here just delays pod cleanup.
+				log.Printf("[preempting] %s/%s: evict preempted workload: %v", slice.Namespace, slice.Name, err)
+			}
 		}
 		// Releasing, NOT Released: stamping Released directly skipped the node
 		// agent entirely (its release path triggers on Releasing/deletion only),
@@ -97,6 +109,61 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconcile.Result{}, nil
+}
+
+// resolveOwnerJob walks slice → claim → job. Returns nil if any link is missing
+// (e.g. a standalone slice, or claim/job already gone).
+func (r *VGPUSliceReconciler) resolveOwnerJob(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) *vgpuv1alpha1.VGPUJob {
+	if slice.Spec.ClaimRef == "" {
+		return nil
+	}
+	var claim vgpuv1alpha1.VGPUClaim
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: slice.Spec.ClaimRef}, &claim); err != nil {
+		return nil
+	}
+	if claim.Spec.JobRef == "" {
+		return nil
+	}
+	var job vgpuv1alpha1.VGPUJob
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: claim.Spec.JobRef}, &job); err != nil {
+		return nil
+	}
+	return &job
+}
+
+// evictPreemptedWorkload completes a preemption: it stamps the Preempted
+// condition on the owning Job (so the Job reconciler marks it terminal and won't
+// recreate the pod — see jobPreempted in vgpujob_reconciler.go) and then deletes
+// the workload pod so it stops using the GPU memory the scheduler is reselling.
+// Order matters: stamp the condition FIRST, so the Owns(Pod) delete event finds
+// it already set.
+func (r *VGPUSliceReconciler) evictPreemptedWorkload(ctx context.Context, job *vgpuv1alpha1.VGPUJob, msg string) error {
+	if msg == "" {
+		msg = "Preempted for higher-priority work."
+	}
+	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh vgpuv1alpha1.VGPUJob
+		if err := r.Client.Get(ctx, key, &fresh); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:    preemptedConditionType,
+			Status:  metav1.ConditionTrue,
+			Reason:  preemptedReason,
+			Message: msg,
+		})
+		return r.Client.Status().Update(ctx, &fresh)
+	}); err != nil {
+		return fmt.Errorf("stamping Preempted condition: %w", err)
+	}
+	// Delete the workload pod (best-effort; the Job reconciler honors the
+	// condition regardless once the pod is gone).
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: job.Namespace, Name: workloadPodName(job.Name)}}
+	if err := r.Client.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting preempted workload pod: %w", err)
+	}
+	return nil
 }
 
 func (r *VGPUSliceReconciler) reconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {

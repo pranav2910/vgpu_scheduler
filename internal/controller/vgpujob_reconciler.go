@@ -51,6 +51,15 @@ const (
 	enforcementConditionType = "MemoryEnforcement"
 	enforcementEvictedReason = "ChildSliceEvicted"
 
+	// Contract with preemption (Phase 2.3): when the scheduler preempts a slice
+	// for higher-priority work, the controller (slice reconciler) evicts the
+	// victim's workload pod and stamps the parent VGPUJob with this condition. A
+	// pod-owning Job MUST honor it as terminal and NOT recreate the pod —
+	// otherwise the controller would re-run a preempted workload on capacity that
+	// was already handed to the higher-priority job (double-booked VRAM → OOM).
+	preemptedConditionType = "Preempted"
+	preemptedReason        = "PreemptedForHigherPriority"
+
 	// podAllocationRequeue is how often we re-check for slice allocation while a
 	// pod-owning job waits (the webhook rejects the pod until it is allocated).
 	podAllocationRequeue = 3 * time.Second
@@ -353,6 +362,17 @@ func (r *VGPUJobReconciler) reconcileWorkloadPod(
 			claimRef, "", "", "")
 	}
 
+	// Pod missing because this workload was PREEMPTED for higher-priority work
+	// (the slice reconciler evicted it on grace-expiry and stamped the Preempted
+	// condition): honor it — do NOT recreate (that would re-run on capacity already
+	// reallocated to the higher-priority job). Mark terminal once; the Preempted
+	// condition explains why.
+	if jobPreempted(job) {
+		return reconcile.Result{}, r.jobStatusUpdate(ctx, key, vgpuv1alpha1.JobPhaseFailed,
+			"Workload preempted for higher-priority work; not recreated.",
+			claimRef, "", "", "")
+	}
+
 	// Pod missing + not yet allocated → record WHY we're waiting, requeue.
 	if !allocated {
 		if err := r.jobStatusUpdate(ctx, key, claimPhase, claimMsg, claimRef, "", "", "",
@@ -537,6 +557,14 @@ func condWaitingForSlice(waiting bool) metav1.Condition {
 func jobEnforcementEvicted(job *vgpuv1alpha1.VGPUJob) bool {
 	c := apimeta.FindStatusCondition(job.Status.Conditions, enforcementConditionType)
 	return c != nil && c.Status == metav1.ConditionTrue && c.Reason == enforcementEvictedReason
+}
+
+// jobPreempted reports whether this workload was preempted for higher-priority
+// work — in which case the slice reconciler already evicted its pod, and it must
+// not be recreated.
+func jobPreempted(job *vgpuv1alpha1.VGPUJob) bool {
+	c := apimeta.FindStatusCondition(job.Status.Conditions, preemptedConditionType)
+	return c != nil && c.Status == metav1.ConditionTrue
 }
 
 func condPodCreated(created bool, podName string) metav1.Condition {
