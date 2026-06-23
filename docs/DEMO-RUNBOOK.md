@@ -17,7 +17,8 @@ used in CI and on hardware. Where a feature needs a real GPU, it's marked
 | 1 | **Byte-granular packing** | "1 GPU does the work of 4" | [kind] |
 | 2 | **Atomic gang scheduling** | "Multi-worker jobs commit all-or-nothing" | [kind] |
 | 3 | **Gang-atomic quota** | "An over-quota gang is held out *whole*" | [kind] |
-| 4 | **Preemption** | "Bounded, deduplicated, atomic eviction" | [kind] |
+| 4 | **Preemption** | "Higher-priority job reclaims a slice; victim's pod evicted" | [kind] |
+| 4b | **Topology** (soft zone preference) | "Honors a preferred zone; records whether it did" | [kind multi-node] |
 | 5 | **HA failover** | "Leader killed mid-flight: no over-admission" | [kind] |
 | 6 | **15-test adversarial battery** | "Invariants hold under chaos, in composition" | [kind] |
 | 7 | **Observability** | "Prometheus metrics for every subsystem" | [kind] |
@@ -350,6 +351,155 @@ workload llama  (ns=default, requested 16.0 GiB)
 
 ---
 
+### 5.6 Feature 4 — Preemption (standalone)  [kind]
+
+**The claim:** a higher-priority job reclaims a slice from a lower-priority,
+`preemptible: true` job — the victim's pod is **evicted** and the requester runs.
+**Trigger:** the requester must out-rank a victim by **≥100** (`PreemptionPriorityGap`),
+and only `preemptible: true`, `Ready` slices are eligible. Gang members are never
+preempted (atomicity).
+
+```
+  fill GPU with low-prio preemptible jobs ──► submit high-prio job (gap ≥100)
+        (priority 50)                              (priority 900)
+                                                       │ no room
+                                                       ▼
+   victim slice ─► Preempting ─(grace)─► Releasing ─► Released   (VRAM reclaimed)
+        │                                                 │
+        ▼ victim POD evicted, job → Failed (Preempted)    ▼
+                                          requester gets the freed 16 GiB ─► Running
+```
+
+Reset first — preemption only triggers when the GPU is full:
+
+```sh
+kubectl delete vgpugangjobs,vgpujobs --all -n vgpu-demo    # clean slate
+
+# 1. Fill the 80 GiB GPU with 5 LOW-priority, PREEMPTIBLE 16 GiB jobs:
+for i in 0 1 2 3 4; do cat <<EOF | kubectl apply -f -
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata: { name: victim-$i, namespace: vgpu-demo, labels: { demo: preempt } }
+spec:
+  priority: 50
+  preemptible: true            # <-- only preemptible jobs can be evicted
+  preemptionGraceSeconds: 10   # grace before the victim's pod is evicted
+  workloadClass: Batch
+  claimTemplate:
+    spec: { requestedVramBytes: 17179869184, serviceTier: BestEffort }
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers: [ { name: workload, image: busybox:1.36, command: ["/bin/sh","-c","sleep 3600"], resources: {} } ]
+EOF
+done
+
+# 2. Submit ONE HIGH-priority (900) job onto the now-full GPU (gap 850 ≥ 100):
+cat <<EOF | kubectl apply -f -
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata: { name: vip, namespace: vgpu-demo, labels: { demo: preempt } }
+spec:
+  priority: 900
+  workloadClass: Training
+  claimTemplate:
+    spec: { requestedVramBytes: 17179869184, serviceTier: Guaranteed }
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers: [ { name: workload, image: busybox:1.36, command: ["/bin/sh","-c","sleep 3600"], resources: {} } ]
+EOF
+
+# 3. Watch a victim get preempted and the VIP take its place:
+kubectl get vgpuslices -n vgpu-demo -w     # one slice → Preempting → Released
+kubectl get vgpujobs   -n vgpu-demo        # one victim → Failed, vip → Running
+```
+
+What you'll see (verified on kind):
+```
+victim-0   Failed     ← preempted: pod EVICTED (gone), job terminal, NOT recreated
+victim-1..4 Running
+vip        Running     ← got the reclaimed 16 GiB
+slices: {Released: 1, Ready: 5}    ← 5 × 16 = 80 GiB, NO over-admission
+
+# the victim job carries the proof of WHY:
+kubectl get vgpujob victim-0 -n vgpu-demo \
+  -o jsonpath='{.status.conditions[?(@.type=="Preempted")].message}'
+  →  Preempted by vgpu-demo/vip-claim-slice; grace=10s
+```
+
+> Preemption is **atomic eviction**: the victim's pod is reclaimed *before* its
+> memory is handed to the requester (no double-booked VRAM). On a real GPU it's
+> identical — just add `runtimeClassName: nvidia` to each podTemplate (see §6.8).
+
+---
+
+### 5.7 Feature 4b — Topology (soft zone preference)  [kind multi-node]
+
+**The claim:** a workload can express a **soft** zone preference; the scheduler
+prefers in-zone nodes and records, *on the slice*, whether it honored the
+preference. Needs ≥2 nodes/zones to show preference, so use the multi-node cluster.
+
+```
+  node label:        topology.vgpu.pranav2910.com/zone = zone-b
+  workload annotation: topology.vgpu.pranav2910.com/preferred-zone = zone-b
+        │ (propagates VGPUJob → claim → slice)
+        ▼
+  scheduler scores in-zone nodes higher → places in zone-b → stamps the slice:
+        TopologyPreferenceSatisfied = True (PreferredZoneHonored)
+  (SOFT: if no in-zone node fits, it still schedules elsewhere and records the fallback)
+```
+
+```sh
+# 1. Multi-node cluster (1 control-plane + 3 workers):
+bash scripts/kind-multinode-up.sh
+
+# 2. Label the workers into zones, then re-seed the scheduler (the seed reads zones):
+kubectl label node vgpu-multinode-worker  topology.vgpu.pranav2910.com/zone=zone-a --overwrite
+kubectl label node vgpu-multinode-worker2 topology.vgpu.pranav2910.com/zone=zone-b --overwrite
+kubectl label node vgpu-multinode-worker3 topology.vgpu.pranav2910.com/zone=zone-c --overwrite
+kubectl rollout restart deploy/vgpu-scheduler -n vgpu-system
+kubectl rollout status  deploy/vgpu-scheduler -n vgpu-system
+
+# 3. Submit a job that PREFERS zone-b (annotation on the VGPUJob):
+cat <<EOF | kubectl apply -f -
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: topo-b
+  namespace: default
+  annotations:
+    topology.vgpu.pranav2910.com/preferred-zone: "zone-b"
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec: { requestedVramBytes: 17179869184, serviceTier: Guaranteed }
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers: [ { name: workload, image: busybox:1.36, command: ["/bin/sh","-c","sleep 3600"], resources: {} } ]
+EOF
+
+# 4. Confirm placement + the auditable condition:
+kubectl get vgpuslice topo-b-claim-slice -o jsonpath='{.spec.nodeName}'; echo
+kubectl get vgpuslice topo-b-claim-slice \
+  -o jsonpath='{.status.conditions[?(@.type=="TopologyPreferenceSatisfied")].message}'; echo
+```
+
+What you'll see (verified on the 3-worker cluster):
+```
+topo-b  preferred=zone-b  →  landed on vgpu-multinode-worker2 (zone-b)
+slice condition:
+  TopologyPreferenceSatisfied=True (PreferredZoneHonored) scheduled in preferred zone "zone-b"
+```
+
+> SOFT, not hard: if the preferred zone has no room, the workload still schedules
+> elsewhere and the condition records the fallback — a *preference*, not a
+> constraint. Tear down: `kind delete cluster --name vgpu-multinode`.
+
+---
+
 ## 6. TRACK B — Real GPU: the runtime intelligence  [GPU]
 
 The half a laptop can't show: a workload **actually runs** on a sliced GPU, and the
@@ -474,6 +624,47 @@ bash demo/h100-before-after.sh        # submits one more than fits; --keep to le
      the 5th held Pending (no-over-admission guarantee)
      each pod's nvidia-smi reports the same GPU UUID as its slice
 ```
+
+---
+
+### 6.8 Run the Track-A scheduling demos on a real GPU  [GPU]
+
+Everything in Track A — packing (§5.1), gang (§5.2), preemption (§5.6), topology
+(§5.7) — runs the **same** on a real GPU; the scheduler logic is identical. The
+only delta is that **workload pods need `runtimeClassName: nvidia`** so the NVIDIA
+runtime injects the device. Two ways to add it:
+
+```sh
+# A) via the CLI — the flag is built in:
+scripts/vgpu submit --name infer --vram 16Gi --image my-model:latest \
+  --command 'python serve.py' --runtime-class nvidia
+
+# B) in any VGPUJob/demo manifest — add it to each podTemplate:
+#   podTemplate:
+#     spec:
+#       runtimeClassName: nvidia        # <-- the one real-GPU delta
+#       containers: [ ... ]
+```
+
+The auto-sized before/after packing, live on the card:
+
+```sh
+bash scripts/h100-control-plane.sh          # full control plane on the GPU node
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+bash demo/h100-before-after.sh              # auto-sizes per-job to the card; --keep to leave running
+```
+```
+  → BEFORE: 1 Running, the rest Pending forever (whole-GPU granularity)
+  → AFTER:  N right-sized workloads packed onto ONE card (~80% util), the
+            over-one held Pending (no over-admission); each pod's nvidia-smi
+            shows the same GPU UUID as its slice.
+```
+
+**What's different from kind (mock):** on real hardware the node advertises *real*
+VRAM (so the packing count auto-sizes to the card), the data plane is real (CDI
+inject, `nvidia-smi` inside the pod), and the runtime-intelligence stack (§6.3–6.6)
+actually observes/enforces/learns. Preemption and topology behave identically —
+they're scheduler decisions, GPU-agnostic.
 
 ---
 
