@@ -149,5 +149,8 @@ func (s *Store) Delete(allocationID string) error {
 	if err != nil {
 		return fmt.Errorf("checkpoint serialisation failed during delete: %w", err)
 	}
-	return os.WriteFile(s.path(), out, 0640)
+	// Same atomicity requirement as Save: Delete runs on every job completion,
+	// so a truncate-in-place write here was the widest window for the torn-file
+	// corruption the Bug #4 guard then refuses forever (node can't allocate).
+	return writeAtomic(s.path(), out, 0640)
 }
