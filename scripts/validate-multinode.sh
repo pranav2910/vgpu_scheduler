@@ -17,7 +17,7 @@
 #   bash scripts/validate-multinode.sh --node-loss  # T1–T5
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 GiB=$((1024*1024*1024))
 NS="mnode-$(date +%s)"

@@ -9,7 +9,7 @@
 #   bash scripts/validate-submit-flow-h100.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS="${NS:-default}"
 NAME="${NAME:-h100demo}"

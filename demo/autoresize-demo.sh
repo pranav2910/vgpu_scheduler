@@ -12,7 +12,7 @@
 #   IMAGE=nvidia/cuda:12.4.1-base-ubuntu22.04 RUNTIME_CLASS=nvidia bash demo/autoresize-demo.sh   # real GPU
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 [[ -r "$KUBECONFIG" ]] || export KUBECONFIG="$HOME/.kube/config"
 
 NS="${NS:-default}"; SYS_NS=vgpu-system; GROUP=infrastructure.pranav2910.com

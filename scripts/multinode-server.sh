@@ -34,12 +34,17 @@ if command -v k3s >/dev/null 2>&1; then
     ok "k3s already installed — assuming it was installed by this script with the right flags"
 else
     curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="server \
-        --write-kubeconfig-mode 644 \
+        --write-kubeconfig-mode 600 \
         --flannel-backend=wireguard-native \
         --node-external-ip=$PUBLIC_IP \
         --tls-san=$PUBLIC_IP" sh - || die "k3s server install failed"
 fi
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# Audit fix: admin kubeconfig stays root-only (600); use a user-owned copy.
+mkdir -p "$HOME/.kube"
+sudo cp /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config"
+sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+chmod 600 "$HOME/.kube/config"
+export KUBECONFIG="$HOME/.kube/config"
 for _ in $(seq 1 40); do kubectl get nodes 2>/dev/null | grep -q ' Ready ' && break; sleep 3; done
 kubectl get nodes | grep -q ' Ready ' || die "server node not Ready"
 ok "server Ready"

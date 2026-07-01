@@ -6,7 +6,7 @@
 #   k3s  →  NVIDIA runtime (RuntimeClass)  →  CRDs/RBAC  →  NVML node agent
 #
 # Then run the validation it enables:
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-runtime-3.4-a10.sh
 #
 # Idempotent — safe to re-run. Needs sudo + docker + a working nvidia-smi (all
@@ -37,14 +37,21 @@ ok "GPU + docker present (docker=\"$DOCKER\")"
 # ── 1. k3s ───────────────────────────────────────────────────────────────────
 say "k3s (single-node)"
 if ! command -v k3s >/dev/null 2>&1; then
-    echo "installing k3s (kubeconfig world-readable)..."
-    curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh - \
+    echo "installing k3s (kubeconfig root-only, mode 600)..."
+    curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="--write-kubeconfig-mode 600" sh - \
         || die "k3s install failed"
 else
     ok "k3s already installed"
 fi
 command -v kubectl >/dev/null 2>&1 || sudo ln -sf "$(command -v k3s)" /usr/local/bin/kubectl
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# Audit fix: the admin kubeconfig stays root-only (600) — a world-readable
+# cluster-admin credential is a local-priv-esc on a shared GPU box. Non-root
+# use goes through a user-owned copy.
+mkdir -p "$HOME/.kube"
+sudo cp /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config"
+sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+chmod 600 "$HOME/.kube/config"
+export KUBECONFIG="$HOME/.kube/config"
 for _ in $(seq 1 40); do
     kubectl get nodes 2>/dev/null | grep -q ' Ready ' && break
     sleep 3
@@ -134,5 +141,5 @@ say "bootstrap complete"
 echo "  The stack is up and the node agent reads the GPU via NVML."
 echo "  Run the Phase 3.4a/3.4b/3.4c end-to-end validation now:"
 echo
-echo "      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
+echo "      export KUBECONFIG=\$HOME/.kube/config"
 echo "      bash scripts/validate-runtime-3.4-a10.sh"

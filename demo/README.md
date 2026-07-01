@@ -80,7 +80,7 @@ auto-sizing script:
 
 ```sh
 bash scripts/h100-control-plane.sh            # full control plane on the GPU node
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export KUBECONFIG=$HOME/.kube/config
 bash demo/h100-before-after.sh                # submits one more than fits; --keep to leave running
 ```
 

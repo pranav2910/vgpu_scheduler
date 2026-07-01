@@ -8,12 +8,12 @@
 # scheduler, changes nothing, and shows the waste.
 #
 #   bash scripts/a10-bootstrap.sh                       # k3s + nvidia runtime + vgpu-nodeagent:nvml
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   kubectl apply -f deployments/monitor/monitor.yaml   # the read-only monitor
 #   bash demo/monitor-demo.sh                           # this (use --keep to leave pods running)
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS="${NS:-default}"
 MON_NS="${MON_NS:-vgpu-monitor}"

@@ -12,7 +12,7 @@
 # restores softwarn on exit. Default everywhere else stays softwarn.
 #
 #   bash scripts/a10-bootstrap.sh
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-runtime-3.4d-a10.sh
 set -uo pipefail
 

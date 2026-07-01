@@ -95,9 +95,11 @@ const (
 	maxEvictionsPerWindow = 3
 	evictionWindow        = 5 * time.Minute
 
-	// enforcementExemptLabel opts a pod (or its namespace) out of eviction. It is
-	// still detected, marked, and soft-warned — only the destructive step is
-	// skipped. Reuses the existing infrastructure.pranav2910.com/ label domain.
+	// enforcementExemptLabel opts a NAMESPACE's workloads out of eviction. They
+	// are still detected, marked, and soft-warned — only the destructive step is
+	// skipped. Honored on the namespace ONLY: a pod-level label would let a
+	// workload self-exempt (see isExempt). Reuses the existing
+	// infrastructure.pranav2910.com/ label domain.
 	enforcementExemptLabel = "infrastructure.pranav2910.com/enforcement-exempt"
 
 	memoryEnforcementCondition  = "MemoryEnforcement"
@@ -379,7 +381,7 @@ func (d *SliceViolationDetector) maybeEvict(ctx context.Context, u *sliceUsage, 
 			// eviction never re-engaged until an agent restart. Re-check every
 			// cycle instead (notifyBlocked dedups the event by pod+reason).
 			d.notifyBlocked(u, nn, "exempt",
-				fmt.Sprintf("Pod is exempt from eviction (%s=true); over-use stays marked + soft-warned but the pod is NOT evicted", enforcementExemptLabel))
+				fmt.Sprintf("Pod's namespace is exempt from eviction (%s=true on the namespace); over-use stays marked + soft-warned but the pod is NOT evicted", enforcementExemptLabel))
 			continue
 		}
 		if !d.evictionAllowed() {
@@ -418,14 +420,16 @@ func (d *SliceViolationDetector) evictViaAPI(ctx context.Context, nn types.Names
 	return d.client.SubResource("eviction").Create(ctx, pod, eviction)
 }
 
-// isExempt reports whether a pod — or its namespace — opted out of eviction. An
+// isExempt reports whether a pod's NAMESPACE opted it out of eviction. An
 // exempt workload is still detected, marked, and soft-warned; only the
 // destructive step is skipped.
+//
+// Namespace-only by design (audit fix): honoring the label on the pod itself
+// let a workload SELF-exempt — whoever writes the pod spec could dodge the one
+// hard VRAM-reclamation mechanism by adding a label to their own pod. A
+// namespace label is set by whoever administers the namespace, which is the
+// correct authority for an enforcement carve-out.
 func (d *SliceViolationDetector) isExempt(ctx context.Context, nn types.NamespacedName) bool {
-	var pod corev1.Pod
-	if err := d.apiReader.Get(ctx, nn, &pod); err == nil && pod.Labels[enforcementExemptLabel] == "true" {
-		return true
-	}
 	var ns corev1.Namespace
 	if err := d.apiReader.Get(ctx, types.NamespacedName{Name: nn.Namespace}, &ns); err == nil && ns.Labels[enforcementExemptLabel] == "true" {
 		return true

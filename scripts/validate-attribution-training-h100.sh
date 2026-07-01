@@ -14,11 +14,11 @@
 # If your number ≈ allocated, autoResize would undersize a real training job → OOM.
 #
 #   bash scripts/h100-control-plane.sh
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-attribution-training-h100.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS="${NS:-default}"; SYS_NS=vgpu-system
 IMAGE="${IMAGE:-pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime}"

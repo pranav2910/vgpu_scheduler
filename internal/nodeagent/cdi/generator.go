@@ -5,7 +5,24 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 )
+
+// allocationIDPattern is the defense-in-depth allowlist for AllocationIDs used
+// in host paths (audit finding): both Generate and Teardown build a file path
+// under /var/run/cdi from the ID, and Teardown reads it from slice STATUS — a
+// compromised writer could otherwise smuggle path traversal ("../..") into a
+// root-owned create/delete. The allocator only ever mints "alloc-<hex>-<num>",
+// so anything outside [a-z0-9-] after the prefix is rejected, never pathed.
+var allocationIDPattern = regexp.MustCompile(`^alloc-[a-z0-9-]+$`)
+
+func validateAllocationID(id string) error {
+	if !allocationIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid AllocationID %q: must match %s (refusing to build a host path from it)",
+			id, allocationIDPattern)
+	}
+	return nil
+}
 
 // cdiDirectory is a var (not const) solely so tests can point spec writes at
 // a temp dir via SetDirectoryForTesting; production never changes it.
@@ -45,6 +62,9 @@ type ContainerEdits struct {
 // (internal/webhook/mutating_pod.go) — the device Name here and that request
 // must be identical or containerd's CDI lookup finds nothing.
 func GenerateFirewall(deviceName string, uuid string) error {
+	if err := validateAllocationID(deviceName); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(cdiDirectory, 0750); err != nil {
 		return fmt.Errorf("failed to create CDI directory: %w", err)
 	}
@@ -89,6 +109,9 @@ func GenerateFirewall(deviceName string, uuid string) error {
 // container's hardware access — and ONLY that container's. Takes the
 // AllocationID (the same name GenerateFirewall keyed the file by).
 func TeardownFirewall(allocationID string) error {
+	if err := validateAllocationID(allocationID); err != nil {
+		return err
+	}
 	filePath := filepath.Join(cdiDirectory, fmt.Sprintf("%s-%s.json", vendorName, allocationID))
 	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to teardown CDI firewall for %s: %w", allocationID, err)

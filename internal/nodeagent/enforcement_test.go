@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -226,15 +227,16 @@ func TestEnforce_EvictsAfterEvictionGrace(t *testing.T) {
 	}
 }
 
-func TestEnforce_ExemptPodNotEvicted(t *testing.T) {
+func TestEnforce_ExemptNamespaceNotEvicted(t *testing.T) {
 	d, c := fixture(t, 12*giB)
-	// Opt the pod out of eviction (the violation is still marked + soft-warned).
-	pod := getPod(t, c, "wl")
-	if pod.Labels == nil {
-		pod.Labels = map[string]string{}
-	}
-	pod.Labels[enforcementExemptLabel] = "true"
-	if err := c.Update(context.Background(), pod); err != nil {
+	// Opt the NAMESPACE out of eviction (the violation is still marked +
+	// soft-warned). Exemption is namespace-only: the label is honored where the
+	// namespace admin sets it, not on the workload's own pod.
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:   "default",
+		Labels: map[string]string{enforcementExemptLabel: "true"},
+	}}
+	if err := c.Create(context.Background(), ns); err != nil {
 		t.Fatal(err)
 	}
 	d.enforceMode = EnforcementEvict
@@ -247,10 +249,37 @@ func TestEnforce_ExemptPodNotEvicted(t *testing.T) {
 	driveToEviction(t, ctx, d, &clock)
 
 	if evictCalled {
-		t.Fatalf("exempt pod must not be evicted")
+		t.Fatalf("pod in exempt namespace must not be evicted")
 	}
 	if got := testutil.ToFloat64(telemetry.MemoryEvictionsBlocked.WithLabelValues("node-a", "default", "slice-1", "exempt")); got != 1 {
 		t.Fatalf("exempt blocked metric = %v, want 1", got)
+	}
+}
+
+// Regression (audit security fix): a pod labeling ITSELF exempt must NOT dodge
+// eviction — self-exemption was a hole that let any workload owner opt out of
+// the only hard VRAM-reclamation mechanism. Only the namespace label counts.
+func TestEnforce_PodSelfExemptionIgnored(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	pod := getPod(t, c, "wl")
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[enforcementExemptLabel] = "true" // the self-exemption attempt
+	if err := c.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	evictCalled := false
+	d.evictFn = func(context.Context, types.NamespacedName) error { evictCalled = true; return nil }
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if !evictCalled {
+		t.Fatalf("self-exempt-labeled pod must still be evicted (namespace label is the only authority)")
 	}
 }
 

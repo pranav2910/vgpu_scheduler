@@ -10,7 +10,7 @@
 # agent (run scripts/a10-bootstrap.sh first).
 #
 #   bash scripts/a10-bootstrap.sh
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-runtime-3.5-a10.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

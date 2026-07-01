@@ -18,7 +18,7 @@
 #     --command 'nvidia-smi -L; sleep 3600' --runtime-class nvidia
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS=vgpu-system
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.15.3}"

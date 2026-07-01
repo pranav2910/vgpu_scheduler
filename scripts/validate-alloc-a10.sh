@@ -15,7 +15,7 @@
 # not the whole stack. Run the FULL submit→run flow only after this is green.
 #
 #   bash scripts/a10-bootstrap.sh          # builds + deploys the -tags nvml node agent (latest code)
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-alloc-a10.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

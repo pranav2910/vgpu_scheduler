@@ -16,11 +16,11 @@
 # Requires the full control plane (scripts/h100-control-plane.sh) on a real GPU node.
 #
 #   bash scripts/h100-control-plane.sh
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-attribution-h100.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS="${NS:-default}"
 SYS_NS=vgpu-system

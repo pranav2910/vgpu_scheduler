@@ -17,7 +17,7 @@
 # run this:
 #
 #   bash scripts/a10-bootstrap.sh           # one-shot, idempotent
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-runtime-3.4-a10.sh
 #
 # Requirements on the host: kubectl, a running vgpu-nodeagent pod (provider=nvml)

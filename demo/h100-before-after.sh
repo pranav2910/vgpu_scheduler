@@ -13,12 +13,12 @@
 # Requires the full control plane (scripts/h100-control-plane.sh) to be up.
 #
 #   bash scripts/h100-control-plane.sh
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash demo/h100-before-after.sh            # auto-sizes to the GPU
 #   bash demo/h100-before-after.sh --keep     # leave the workloads running
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 NS="${NS:-default}"
 PREFIX="${PREFIX:-hpack}"

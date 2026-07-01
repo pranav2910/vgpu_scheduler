@@ -18,11 +18,11 @@
 #   with a real observed peak · scheduler gauges return to allocated=0 +
 #   reserved=0 on every node.
 #
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/soak-realworld.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 GiB=$((1024*1024*1024))
 NS="soak-$(date +%s)"

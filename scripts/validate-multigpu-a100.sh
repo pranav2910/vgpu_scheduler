@@ -10,11 +10,11 @@
 #      (nvidia-smi UUID in-pod == that slice's deviceUuid; UUIDs differ)
 #   5. release restores capacity (quick re-grant)
 #
-#   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+#   export KUBECONFIG=$HOME/.kube/config
 #   bash scripts/validate-multigpu-a100.sh
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 GiB=$((1024*1024*1024)); MiB=$((1024*1024))
 NS="mgpu-$(date +%s)"
