@@ -134,4 +134,3 @@ func (l *VGPUQuotaList) DeepCopy() *VGPUQuotaList {
 	l.DeepCopyInto(out)
 	return out
 }
-

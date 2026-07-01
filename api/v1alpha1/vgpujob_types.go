@@ -219,4 +219,3 @@ func (l *VGPUJobList) DeepCopy() *VGPUJobList {
 	l.DeepCopyInto(out)
 	return out
 }
-

@@ -19,7 +19,7 @@ func mockNode(t *testing.T, cards int, memBytes int64) *Allocator {
 	return NewAllocator(true)
 }
 
-func itoa(n int) string    { return i64toa(int64(n)) }
+func itoa(n int) string { return i64toa(int64(n)) }
 func i64toa(n int64) string {
 	// strconv-free helper keeps the test file import list tiny.
 	if n == 0 {

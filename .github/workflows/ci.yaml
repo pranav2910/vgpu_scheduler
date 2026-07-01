@@ -14,8 +14,28 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21'
+        go-version: '1.22'
+    - name: gofmt (fail on any unformatted file)
+      run: |
+        UNFMT=$(gofmt -l .)
+        if [ -n "$UNFMT" ]; then
+          echo "unformatted files:"; echo "$UNFMT"; exit 1
+        fi
+    - name: go vet
+      run: go vet ./...
     - name: Run Unit Tests
       run: go test -v ./...
     - name: Run Fuzz Tests
       run: go test -fuzz=FuzzBinPack -fuzztime=10s ./test/fuzz
+
+  # Separate job: govulncheck manages its own toolchain (the local dev
+  # environment could not run it — analyzer/toolchain mismatches — so CI is
+  # the authoritative CVE gate).
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+    - name: govulncheck
+      uses: golang/govulncheck-action@v1
+      with:
+        go-version-input: '1.22.2'
+        go-package: ./...

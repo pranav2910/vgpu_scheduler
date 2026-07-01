@@ -24,7 +24,7 @@ func TestParseRequestedMem(t *testing.T) {
 	const GiB = int64(1024 * 1024 * 1024)
 	cases := map[string]int64{
 		"16Gi":        16 * GiB,
-		"17179869184": 17179869184, // quantity with no unit = bytes
+		"17179869184": 17179869184,         // quantity with no unit = bytes
 		"16384":       16384 * 1024 * 1024, // bare int = MiB (Run:ai/KAI convention)
 		"512Mi":       512 * 1024 * 1024,
 		"":            0,

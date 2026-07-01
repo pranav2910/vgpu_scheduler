@@ -73,7 +73,7 @@ func TestQuota_PendingAndTerminalSlicesDoNotCount(t *testing.T) {
 	// Pending (no nodeName), Released, and Failed slices hold no capacity.
 	qc := buildChecker(t,
 		quotaObj("default", 40*qGiB),
-		qSlice("pending", "", 30*qGiB, 0, "", "Pending"),         // no nodeName
+		qSlice("pending", "", 30*qGiB, 0, "", "Pending"), // no nodeName
 		qSlice("released", "", 30*qGiB, 30*qGiB, "node-a", "Released"),
 		qSlice("failed", "", 30*qGiB, 0, "node-a", "Failed"),
 	)

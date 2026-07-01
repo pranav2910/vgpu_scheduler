@@ -27,11 +27,11 @@ func TestJobAutoResizer(t *testing.T) {
 	lo := vgpuv1alpha1.ProfileConfidenceLow
 
 	cases := []struct {
-		name       string
-		mode       recommendation.Mode
-		profile    *vgpuv1alpha1.VGPUWorkloadProfile
-		override   bool
-		wantPatch  bool
+		name      string
+		mode      recommendation.Mode
+		profile   *vgpuv1alpha1.VGPUWorkloadProfile
+		override  bool
+		wantPatch bool
 	}{
 		{"autoResize + High + undersized → PATCH", recommendation.AutoResize, profileWith("w", rec24, hi), false, true},
 		{"autoResize + override → no patch", recommendation.AutoResize, profileWith("w", rec24, hi), true, false},

@@ -20,7 +20,7 @@ func sliceAt(phase string) *vgpuv1alpha1.VGPUSlice {
 }
 
 // THE FIX: deleting a slice before it ever left "" (or Pending) must be able to
-// start teardown. Before this, the soak logged "Cannot transition from '' to
+// start teardown. Before this, the soak logged "Cannot transition from ” to
 // 'Releasing'" under churn / node loss.
 func TestReleasingLegalFromEveryPreReadyState(t *testing.T) {
 	for _, from := range []string{"", SlicePhasePending, SlicePhaseScheduled, SlicePhaseAllocating, SlicePhaseReady, SlicePhaseFailed} {
@@ -49,11 +49,11 @@ func TestEmptyPhaseTearsDownToReleased(t *testing.T) {
 // stays terminal.
 func TestIllegalTransitionsStillRejected(t *testing.T) {
 	bad := []struct{ from, to string }{
-		{"", SlicePhaseReady},              // can't allocate from nothing
+		{"", SlicePhaseReady}, // can't allocate from nothing
 		{SlicePhasePending, SlicePhaseReady},
 		{SlicePhaseReleased, SlicePhaseReleasing}, // terminal
 		{SlicePhaseReleased, SlicePhasePending},
-		{SlicePhaseReady, SlicePhaseAllocating},   // no going backwards
+		{SlicePhaseReady, SlicePhaseAllocating}, // no going backwards
 	}
 	for _, c := range bad {
 		if err := TransitionSlicePhase(sliceAt(c.from), c.to, "x", "y"); err == nil {

@@ -76,11 +76,11 @@ type PriorityFunc func(request any) int
 
 // Queue is a tier-aware priority workqueue. It is safe for concurrent use.
 type Queue struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	heap    itemHeap
-	dirty   map[any]*item // Add-after-Add coalesces; latest priority wins
-	processing map[any]struct{}
+	mu                   sync.Mutex
+	cond                 *sync.Cond
+	heap                 itemHeap
+	dirty                map[any]*item // Add-after-Add coalesces; latest priority wins
+	processing           map[any]struct{}
 	dirtyAfterProcessing map[any]int // requests Add'd while being processed
 
 	// rate limiting

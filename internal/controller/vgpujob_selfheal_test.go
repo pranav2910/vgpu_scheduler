@@ -80,7 +80,8 @@ func podExists(r *VGPUJobReconciler) bool {
 }
 
 // A) Missing pod + allocated slice + non-terminal job → the controller CREATES
-//    the pod (owned, claim-stamped) and moves the job to PodCreating.
+//
+//	the pod (owned, claim-stamped) and moves the job to PodCreating.
 func TestReconcileWorkloadPod_CreatesWhenMissing(t *testing.T) {
 	s := selfhealScheme(t)
 	job := podOwningJob("")
@@ -107,8 +108,9 @@ func TestReconcileWorkloadPod_CreatesWhenMissing(t *testing.T) {
 }
 
 // B) THE REGRESSION GUARD: a terminating pod (DeletionTimestamp set) must NOT be
-//    mirrored as terminal — the job phase stays Running so self-heal can recreate
-//    it once it's gone.
+//
+//	mirrored as terminal — the job phase stays Running so self-heal can recreate
+//	it once it's gone.
 func TestReconcileWorkloadPod_SkipsTerminatingPod(t *testing.T) {
 	s := selfhealScheme(t)
 	job := podOwningJob(vgpuv1alpha1.JobPhaseRunning)
@@ -133,7 +135,8 @@ func TestReconcileWorkloadPod_SkipsTerminatingPod(t *testing.T) {
 }
 
 // C) A genuinely failed pod (exists, NO DeletionTimestamp) → the job goes Failed
-//    and the pod is left in place (no crash-loop recreate).
+//
+//	and the pod is left in place (no crash-loop recreate).
 func TestReconcileWorkloadPod_GenuineFailureStaysFailed(t *testing.T) {
 	s := selfhealScheme(t)
 	job := podOwningJob(vgpuv1alpha1.JobPhaseRunning)
@@ -168,7 +171,8 @@ func TestReconcileWorkloadPod_NoRecreateAfterSucceeded(t *testing.T) {
 }
 
 // F) Missing pod + the Job was EVICTED by enforcement (opt-in evict mode) → do
-//    NOT recreate (honor the evictor; no recreate→evict loop). Marks job Failed.
+//
+//	NOT recreate (honor the evictor; no recreate→evict loop). Marks job Failed.
 func TestReconcileWorkloadPod_NoRecreateAfterEnforcementEviction(t *testing.T) {
 	s := selfhealScheme(t)
 	job := podOwningJob(vgpuv1alpha1.JobPhaseRunning)
@@ -193,7 +197,8 @@ func TestReconcileWorkloadPod_NoRecreateAfterEnforcementEviction(t *testing.T) {
 }
 
 // E) Missing pod + claim not yet allocated → wait (requeue), do NOT create a pod
-//    (the webhook would reject it pre-allocation).
+//
+//	(the webhook would reject it pre-allocation).
 func TestReconcileWorkloadPod_WaitsForAllocation(t *testing.T) {
 	s := selfhealScheme(t)
 	job := podOwningJob("")

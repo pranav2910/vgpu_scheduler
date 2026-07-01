@@ -76,11 +76,11 @@ func TestJobValidator(t *testing.T) {
 	lo := vgpuv1alpha1.ProfileConfidenceLow
 
 	cases := []struct {
-		name       string
-		mode       recommendation.Mode
-		profile    *vgpuv1alpha1.VGPUWorkloadProfile
-		override   bool
-		wantAllow  bool
+		name      string
+		mode      recommendation.Mode
+		profile   *vgpuv1alpha1.VGPUWorkloadProfile
+		override  bool
+		wantAllow bool
 	}{
 		{"requireOverride + High + undersized + no override → DENY", recommendation.RequireOverride, profileWith("w", rec24, hi), false, false},
 		{"requireOverride + High + override → allow", recommendation.RequireOverride, profileWith("w", rec24, hi), true, true},

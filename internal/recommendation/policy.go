@@ -37,9 +37,9 @@ const (
 	OverrideAnnotation = "infrastructure.pranav2910.com/override-recommendation"
 	// Audit annotations stamped by the autoResize mutating webhook (3.7b) so a
 	// resize is never silent — the user can read both numbers off the object.
-	OriginalVRAMAnnotation    = "infrastructure.pranav2910.com/original-vram-bytes"
-	AutoResizedVRAMAnnotation = "infrastructure.pranav2910.com/autoresized-vram-bytes"
-	AutoResizedAnnotation     = "infrastructure.pranav2910.com/autoresized"      // "true" marker for the controller
+	OriginalVRAMAnnotation     = "infrastructure.pranav2910.com/original-vram-bytes"
+	AutoResizedVRAMAnnotation  = "infrastructure.pranav2910.com/autoresized-vram-bytes"
+	AutoResizedAnnotation      = "infrastructure.pranav2910.com/autoresized"       // "true" marker for the controller
 	AutoResizeCappedAnnotation = "infrastructure.pranav2910.com/autoresize-capped" // value = the uncapped recommendation
 )
 
