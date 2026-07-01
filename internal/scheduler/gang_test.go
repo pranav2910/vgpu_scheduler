@@ -143,6 +143,115 @@ func TestGate_SerializedAdmission_OneGangAtATime(t *testing.T) {
 	}
 }
 
+// TestGate_GhostHolderForgottenOnStall is the regression test for the battery
+// 2.7 starvation: a gang whose slices no longer exist (namespace deleted —
+// deletion never re-enters the scheduler, so the terminal-phase forget path
+// never fires) held the admission slot, and on stall was merely BACKED OFF.
+// Its old createdAt then out-ranked every live gang under age-asc ordering
+// each time the backoff elapsed — starving a feasible gang for its entire
+// reservation deadline (filler-rsv died at 60s with 0/4 slots). A holder that
+// stalls the full timeout with ZERO members is definitionally such a ghost (a
+// live holder registers its first member in the very check that granted it
+// the slot), and must be forgotten outright.
+func TestGate_GhostHolderForgottenOnStall(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().
+		WithScheme(gangTestScheme(t)).
+		WithObjects(reservingRsv("rsv-live", 2)).
+		Build()
+	gate := NewGangBindingGate(c)
+
+	// Plant the ghost: an old, member-less cohort holding the slot past the
+	// stall timeout. Its reservation does NOT exist in the API (namespace
+	// gone) and no slice of its will ever check in again.
+	const ghostKey = "default/rsv-ghost"
+	gate.cohorts[ghostKey] = &gangCohort{
+		gangSize:  4,
+		priority:  500,
+		members:   map[string]gangMember{},
+		createdAt: time.Now().Add(-6 * time.Minute), // oldest → would win age-asc forever
+	}
+	gate.admitting = ghostKey
+	gate.admittingSince = time.Now().Add(-gangAdmissionTimeout - 5*time.Second)
+
+	// A live, feasible gang checks in. This single check must: detect the
+	// stalled member-less holder, forget it (NOT back it off), and hand the
+	// slot to the live gang.
+	res, _, err := gate.CheckSliceWithCohort(ctx, gangSlice("live-0", "rsv-live", 500, "u-live-0"), "node-a", 10)
+	if err != nil {
+		t.Fatalf("live-0 check: %v", err)
+	}
+	if res != GangBindDeferred {
+		t.Fatalf("live-0: got %v, want Deferred (live gang must take the slot over the ghost)", res)
+	}
+	if gate.admitting != "default/rsv-live" {
+		t.Fatalf("slot holder = %q, want default/rsv-live", gate.admitting)
+	}
+	if _, still := gate.cohorts[ghostKey]; still {
+		t.Fatalf("ghost cohort still tracked after stall — it must be forgotten, not backed off")
+	}
+	if _, backed := gate.backoff[ghostKey]; backed {
+		t.Fatalf("ghost cohort placed in backoff — backoff lets it re-win the slot via age-asc ordering")
+	}
+
+	// And the live gang completes: quorum on its second member.
+	res, _, err = gate.CheckSliceWithCohort(ctx, gangSlice("live-1", "rsv-live", 500, "u-live-1"), "node-a", 10)
+	if err != nil {
+		t.Fatalf("live-1 check: %v", err)
+	}
+	if res != GangBindAllowed {
+		t.Fatalf("live-1: got %v, want Allowed (quorum)", res)
+	}
+}
+
+// TestGate_RealStallerForfeitsSeniority: a holder that stalls WITH members (a
+// real but slow/oversized gang) is backed off — and must lose its age
+// seniority, or it re-wins the slot over younger feasible gangs after every
+// backoff (rotation, not starvation).
+func TestGate_RealStallerForfeitsSeniority(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().
+		WithScheme(gangTestScheme(t)).
+		WithObjects(reservingRsv("rsv-live", 2)).
+		Build()
+	gate := NewGangBindingGate(c)
+
+	testStart := time.Now()
+	const slowKey = "default/rsv-slow"
+	gate.cohorts[slowKey] = &gangCohort{
+		gangSize: 4,
+		priority: 500,
+		members: map[string]gangMember{
+			"u-slow-0": {sliceUID: "u-slow-0", nodeName: "node-a", bytes: 10},
+		},
+		// Old enough to hold age seniority, but inside the gateMaxHoldAge (90s)
+		// window — the stale-cohort reaper runs before the stall branch and
+		// would otherwise reap the cohort before demotion is exercised.
+		createdAt: testStart.Add(-60 * time.Second),
+	}
+	gate.admitting = slowKey
+	gate.admittingSince = testStart.Add(-gangAdmissionTimeout - 5*time.Second)
+
+	res, _, err := gate.CheckSliceWithCohort(ctx, gangSlice("live-0", "rsv-live", 500, "u-live-0"), "node-a", 10)
+	if err != nil {
+		t.Fatalf("live-0 check: %v", err)
+	}
+	if res != GangBindDeferred {
+		t.Fatalf("live-0: got %v, want Deferred (slot freed by the stall)", res)
+	}
+
+	slow, ok := gate.cohorts[slowKey]
+	if !ok {
+		t.Fatalf("real staller (has members) must be kept + backed off, not forgotten")
+	}
+	if _, backed := gate.backoff[slowKey]; !backed {
+		t.Fatalf("real staller must be in backoff")
+	}
+	if slow.createdAt.Before(testStart) {
+		t.Fatalf("staller kept its age seniority (createdAt=%v) — it would out-rank every younger gang after backoff", slow.createdAt)
+	}
+}
+
 // TestGate_TerminalReservationFreesSlot verifies that if the admitting gang's
 // reservation goes terminal (Failed/Released), the slot is freed immediately
 // so a waiting gang is not blocked until the stall timeout.

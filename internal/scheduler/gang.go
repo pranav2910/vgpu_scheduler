@@ -266,11 +266,38 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	// (if free) hand it to the head of the contending set. Only the gang
 	// holding the slot may keep capacity; everyone else is told to release.
 	if g.admitting != "" && now.Sub(g.admittingSince) > gangAdmissionTimeout {
-		log.Printf("[gang] admitting gang %s stalled (%v without quorum) — backing off, freeing slot",
-			g.admitting, now.Sub(g.admittingSince).Round(time.Second))
-		telemetry.GangAdmissionBackoffs.Inc()
-		g.backoff[g.admitting] = now.Add(gangAdmissionBackoff)
-		g.releaseHoldsLocked(g.admitting)
+		holder := g.cohorts[g.admitting]
+		if holder != nil && len(holder.members) == 0 {
+			// GHOST holder (battery 2.7 starvation bug): a live gang registers
+			// its first member in the very check that granted it the slot, so a
+			// holder that stalls the full timeout with ZERO members is a gang
+			// whose slices no longer exist (e.g. its namespace was deleted —
+			// nothing re-enters the scheduler on deletion, so forgetCohort's
+			// terminal-phase path never fires). Backing it off used to let it
+			// RE-WIN the slot after every backoff — its old createdAt beat every
+			// live gang under age-asc ordering — starving feasible gangs until
+			// the 90s reaper caught up. Forget it outright: cohort state is
+			// fully reconstructible from slice checks if the gang is alive.
+			log.Printf("[gang] admitting gang %s stalled %v with no members — forgetting ghost cohort",
+				g.admitting, now.Sub(g.admittingSince).Round(time.Second))
+			telemetry.GangAdmissionBackoffs.Inc()
+			delete(g.cohorts, g.admitting)
+			delete(g.backoff, g.admitting)
+		} else {
+			log.Printf("[gang] admitting gang %s stalled (%v without quorum) — backing off, freeing slot",
+				g.admitting, now.Sub(g.admittingSince).Round(time.Second))
+			telemetry.GangAdmissionBackoffs.Inc()
+			g.backoff[g.admitting] = now.Add(gangAdmissionBackoff)
+			if holder != nil {
+				// A staller forfeits its age seniority: under priority-desc →
+				// age-asc ordering, an old repeatedly-stalling cohort would
+				// otherwise out-rank every younger feasible gang each time its
+				// backoff elapsed. Re-stamping createdAt sends it to the back
+				// of its priority class instead (round-robin among stallers).
+				holder.createdAt = now
+			}
+			g.releaseHoldsLocked(g.admitting)
+		}
 		g.admitting = ""
 	}
 	if g.admitting == "" {
