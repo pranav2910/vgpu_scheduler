@@ -2,7 +2,7 @@
 
 > **On a single NVIDIA H100, we ran 4× more workloads than vanilla Kubernetes** by
 > letting ML engineers request GPU **memory in GiB** instead of whole GPUs —
-> lifting memory utilization from **~25% to ~80%**, refusing to over-commit the
+> lifting memory utilization from **~20% to ~80%**, refusing to over-commit the
 > card, and **automatically right-sizing** future requests from observed usage.
 
 An open-source, Kubernetes-native GPU scheduler with a runtime feedback loop.
@@ -29,7 +29,7 @@ scheduling, no mutation, no CRDs, one RBAC verb. It's the zero-risk way to see t
 waste before adopting anything.
 
 ### 3. Proof (single H100, reproducible from the repo in 3 commands)
-- **4 workloads on one 80 GB H100** where vanilla Kubernetes runs **1** → **~25% → ~80%** memory utilization.
+- **4 workloads on one 80 GB H100** where vanilla Kubernetes runs **1** → **~20% → ~80%** memory utilization (16 → 64 of 80 GiB).
 - The **5th is safely held** — the scheduler refuses to over-commit the card (no OOM roulette).
 - **Right-sizing works**: a job that asked for 16 GiB but used 21.5 GiB was recommended 24.7 GiB; in `autoResize` mode the request is corrected **before scheduling**, audited.
 - **Hardened**: a 15-test adversarial battery (over-subscription, leader-kill-mid-bind, gang atomicity, child-loss, soak) passes **15/15**; data-plane + runtime suites pass on real A10 + H100.

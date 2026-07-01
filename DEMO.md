@@ -33,7 +33,7 @@ scripts/setup-kind-cluster.sh
 # over-subscribes capacity, and runs sustained submit/delete cycles — asserting
 # the core invariants hold throughout.
 bash real_world_test.sh
-#   → 14/14 green (Wave 1 correctness · Wave 2 chaos · Wave 3 adversarial)
+#   → 15/15 green (Wave 1 correctness · Wave 2 chaos · Wave 3 adversarial)
 ```
 
 What the battery proves, in composition (not isolation):

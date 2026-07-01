@@ -140,7 +140,7 @@ Per-workload learned behavior. Observe-only: never drives scheduling in 3.5/3.6.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `vgpu_allocations_total` | counter | `node`, `status` | Physical hardware allocations, success/failed. |
-| `vgpu_drift_events_total` | counter | — | State-drift detections by the self-healing engine. |
+| `vgpu_drift_events_total` | counter | — | State-drift detections by the drift detector (detect + prune; no auto-heal). |
 
 ## Sample Prometheus scrape config
 

@@ -6,6 +6,11 @@ cluster that shows how much GPU memory each workload **asks for** vs. how much i
 
 > **Read-only. No scheduling. No pod mutation. No eviction. No CRDs required.**
 > **Runs alongside Kubernetes, KAI, Volcano, Run:ai, or Slurm-on-K8s.**
+>
+> **Honest blast radius:** "read-only" means read-only *to your cluster* — the
+> RBAC is list/watch pods, nothing else. The agent pod itself runs `privileged`
+> + `hostPID` (required for NVML + PID→pod attribution), like any GPU telemetry
+> agent — so treat the container as node-root when you review it.
 
 It does not replace your scheduler. It watches beside it. (When you're ready for the
 full platform — packing, right-sizing, autoResize — that's a separate, opt-in step.)

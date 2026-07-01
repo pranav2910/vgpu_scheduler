@@ -38,7 +38,7 @@ VGPUGangJob ─┐  (a multi-worker job: "N workers, each needs G bytes, all-or-
 |---|---|---|
 | **Scheduler** | placement: Filter → Score → Reserve → Bind → Confirm, the gang admission gate, preemption, quota checks, an in-memory VRAM cache | leader-elected, 2 replicas; warm-up re-accounts bound slices before scheduling |
 | **Controller** | the CRD lifecycle (gang → reservation → job → claim → slice), the admission webhooks, and the Phase 3.5/3.6 feedback aggregation + advisory | leader-elected, 2 replicas; webhooks optional (`VGPU_DISABLE_WEBHOOKS`) |
-| **Node agent** | per-node DaemonSet: hardware allocation (CDI), drift healing, NVML observation, and the Phase 3.4 runtime over-use detection + enforcement | `hostPID` for PID→pod attribution; real NVML behind a build tag, fake by default |
+| **Node agent** | per-node DaemonSet: hardware allocation (CDI), drift detection (checkpoint pruning), NVML observation, and the Phase 3.4 runtime over-use detection + enforcement | `hostPID` for PID→pod attribution; real NVML behind a build tag, fake by default |
 
 ## Scheduling: serialized gang admission
 
@@ -84,9 +84,10 @@ always one deliberate flag away — never the default.
 
 - **HA**: leader election on scheduler + controller; readiness tied to cache
   warm-up so a cold replica never schedules. See [ha-failover.md](ha-failover.md).
-- **Recovery**: finalizers + drift healing reconcile hardware against checkpoints
-  after crashes. See [recovery.md](recovery.md) and [state-machine.md](state-machine.md).
+- **Recovery**: finalizers + drift detection prune checkpoints whose slices are
+  gone after crashes. Detection-and-prune only — full hardware re-inspection and
+  automatic re-heal are roadmap, not shipped.
 - **Observability**: Prometheus metrics across capacity, gang admission,
   preemption, GPU truth, enforcement, and feedback. See [metrics.md](metrics.md).
-- **Validation**: a 14-test adversarial battery (`real_world_test.sh`) on kind,
+- **Validation**: a 15-test adversarial battery (`real_world_test.sh`) on kind,
   plus the `validate-runtime-*-a10.sh` hardware suites. See [DEMO.md](../DEMO.md).

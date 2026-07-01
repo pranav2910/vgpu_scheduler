@@ -24,7 +24,7 @@ detect VRAM over-use → attribute it to the exact workload → warn → opt-in 
 |---|---|
 | **Scheduler** | VRAM-aware Filter/Score/Reserve/Bind/Confirm; gang admission gate; preemption; quota; in-memory VRAM cache. Leader-elected, 2 replicas. |
 | **Controller** | Reconciles the CRDs (`VGPUGangJob` → `VGPUGangReservation` + child `VGPUJob`/`VGPUClaim`/`VGPUSlice`); admission webhook. Leader-elected, 2 replicas. |
-| **Node agent** | Per-node DaemonSet: hardware allocation, CDI, drift healing, and GPU hardware-truth observation (NVML behind a build tag; fake provider by default). |
+| **Node agent** | Per-node DaemonSet: hardware allocation, CDI, drift detection (checkpoint pruning), and GPU hardware-truth observation (NVML behind a build tag; fake provider by default). |
 
 ## Validated guarantees
 
@@ -64,7 +64,7 @@ containerd CDI + the Kubernetes Eviction API** on actual GPUs (`scripts/a10-boot
   then runs a workload on a shared GPU with **zero manual wiring**: the controller
   auto-creates the Claim+Slice, the scheduler places it, the node agent binds a
   real GPU, the mutating webhook auto-injects it, and the pod runs
-  (`validate-submit-flow-h100.sh` `8/8`). This is the complete ML-engineer
+  (`validate-submit-flow-h100.sh` `14/14`). This is the complete ML-engineer
   experience, end to end on real hardware.
 - **Data plane (allocate → CDI → inject)** — a slice is bound to a real GPU UUID
   via NVML, the node agent writes a CDI spec, and a pod referencing it gets the

@@ -71,7 +71,7 @@ than fits), via `demo/h100-before-after.sh`.
 - **vGPU** packs **4 workloads (64 GiB) onto the one card**, all four pods `Running`,
   each seeing the same physical GPU UUID inside the container.
 
-**Throughput: 4×. Memory utilization: ~20% → ~80%. Same hardware, same 16 GiB jobs.**
+**Workload density: 4×. Memory utilization: ~20% → ~80%. Same hardware, same 16 GiB jobs.** (Density, not measured throughput — no per-job speed benchmark was run.)
 
 ---
 
