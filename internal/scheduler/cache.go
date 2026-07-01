@@ -361,7 +361,7 @@ func (c *VRAMCache) RollbackAssumedSlice(sliceUID string) {
 // no-op for states the slice isn't in, and a slice is only ever in one of the
 // three states, so there is no risk of double-release.
 func (c *VRAMCache) ForgetSlice(sliceUID, nodeName string) {
-	c.RollbackAssumedSlice(sliceUID) // speculative hold, if any
+	c.RollbackAssumedSlice(sliceUID)  // speculative hold, if any
 	c.ReleaseConfirmedSlice(sliceUID) // confirmed-but-not-allocated, if any
 	if nodeName != "" {
 		c.ReleaseSliceOnce(sliceUID, nodeName) // allocated, if any
@@ -439,8 +439,17 @@ func (c *VRAMCache) UpdateNodeCapacity(nodeName string, totalGiB int64) {
 // fit, wins Filter/Score, and slices bind to a spec.nodeName with no kubelet
 // or node agent behind it, hanging in Scheduled until a human notices.
 // Reservations held against the node are dropped with it (the TTL reaper would
-// only have skipped their node-side bookkeeping anyway); per-slice sync state
-// is kept so a node that re-registers doesn't double-count re-observed slices.
+// only have skipped their node-side bookkeeping anyway).
+//
+// The per-slice ledger for the node's slices is cleared WITH the node. Keeping
+// it (the old behavior, meant to avoid double-counting) meant the "already
+// synced Ready" markers survived while the node's AllocatedVRAMBytes died with
+// its NodeState — so when a same-named node re-registered with live Ready
+// slices, PromoteSliceToAllocatedOnce early-returned on every one of them, the
+// fresh node showed allocated=0, and the scheduler over-admitted onto a full
+// node. Clearing both together makes re-registration re-account from zero:
+// each re-observed Ready slice promotes exactly once against the fresh state,
+// so there is still no double-count.
 func (c *VRAMCache) RemoveNode(nodeName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -455,6 +464,13 @@ func (c *VRAMCache) RemoveNode(nodeName string) {
 	for uid, a := range c.confirmedBySlice {
 		if a.NodeName == nodeName {
 			delete(c.confirmedBySlice, uid)
+		}
+	}
+	for uid, n := range c.allocatedNodeBySlice {
+		if n == nodeName {
+			delete(c.allocatedNodeBySlice, uid)
+			delete(c.allocatedBytesBySlice, uid)
+			delete(c.syncedPhaseBySlice, uid)
 		}
 	}
 	delete(c.nodes, nodeName)

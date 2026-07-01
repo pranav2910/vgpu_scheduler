@@ -75,6 +75,66 @@ func TestRemoveNodeDropsGhostCandidate(t *testing.T) {
 	}
 }
 
+// TestRemoveNodeClearsSliceLedgerForReRegistration is the regression test for
+// the audit's over-admit-on-re-register edge: RemoveNode deleted the NodeState
+// (allocated figure dies) but KEPT the per-slice ledger ("already synced
+// Ready" markers). When a same-named node re-registered with live Ready
+// slices, PromoteSliceToAllocatedOnce early-returned on every one, the fresh
+// node showed allocated=0, and the scheduler over-admitted onto a full node.
+func TestRemoveNodeClearsSliceLedgerForReRegistration(t *testing.T) {
+	c := NewVRAMCache()
+	c.UpdateNode("n1", 80*testGiB, 0)
+	c.UpdateNode("n2", 80*testGiB, 0)
+
+	// Live workloads: 64 GiB on n1, 16 GiB on n2. No prior assumption exists in
+	// this synthetic setup, so promote takes the restart-fallback direct-add
+	// path, which returns an informational error while still applying — same
+	// convention as TestPromoteOnceIsAtomicUnderConcurrency.
+	for _, uid := range []string{"a", "b", "c", "d"} {
+		_ = c.PromoteSliceToAllocatedOnce("uid-"+uid, "n1", 16*testGiB)
+	}
+	_ = c.PromoteSliceToAllocatedOnce("uid-n2", "n2", 16*testGiB)
+
+	// Node object deleted (drain, restart, transient loss)…
+	c.RemoveNode("n1")
+	// …and a same-named node re-registers. The API reports allocated=0 (no
+	// kubelet bookkeeping for the extended resource).
+	c.UpdateNode("n1", 80*testGiB, 0)
+
+	// The informer re-walks the still-Ready slices (fallback direct-add again —
+	// informational error, allocation applied). Before the fix these all
+	// early-returned on the stale "Ready" markers.
+	for _, uid := range []string{"a", "b", "c", "d"} {
+		_ = c.PromoteSliceToAllocatedOnce("uid-"+uid, "n1", 16*testGiB)
+	}
+
+	snap := c.SnapshotNode("n1")
+	if snap.AllocatedVRAMBytes != 64*testGiB {
+		t.Fatalf("allocated after re-register = %d GiB, want 64 GiB (over-admit window)",
+			snap.AllocatedVRAMBytes/testGiB)
+	}
+	// The over-admission itself: only 16 GiB is really free; 32 must not fit.
+	if ok, _, _ := c.CanFit("n1", 32*testGiB); ok {
+		t.Fatalf("CanFit admitted 32 GiB onto a node with 16 GiB free — over-admission")
+	}
+
+	// Precision: n2's ledger was untouched — a re-observed promote there must
+	// still be a no-op (no double count).
+	if err := c.PromoteSliceToAllocatedOnce("uid-n2", "n2", 16*testGiB); err != nil {
+		t.Fatalf("re-promote on n2: %v", err)
+	}
+	if snap := c.SnapshotNode("n2"); snap.AllocatedVRAMBytes != 16*testGiB {
+		t.Fatalf("n2 allocated = %d GiB, want 16 GiB (ledger over-cleared → double count)",
+			snap.AllocatedVRAMBytes/testGiB)
+	}
+
+	// Books still balance: releasing a re-promoted slice returns its bytes.
+	c.ReleaseSliceOnce("uid-a", "n1")
+	if snap := c.SnapshotNode("n1"); snap.AllocatedVRAMBytes != 48*testGiB {
+		t.Fatalf("allocated after release = %d GiB, want 48 GiB", snap.AllocatedVRAMBytes/testGiB)
+	}
+}
+
 // TestSetNodeHealthGatesPlacement: CanFit/AssumeSlice must refuse a NotReady
 // node (the flag used to be set by nothing, making the rejection path dead).
 func TestSetNodeHealthGatesPlacement(t *testing.T) {
