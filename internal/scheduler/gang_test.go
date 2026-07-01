@@ -20,50 +20,69 @@ import (
 func TestPickAdmissionHead_PriorityThenAgeThenName(t *testing.T) {
 	now := time.Now()
 	gate := NewGangBindingGate(nil)
+	// Ordering sub-cases give every cohort a member: a member-less cohort is
+	// (deliberately) unpickable except via its own check — covered separately.
+	m := func() map[string]gangMember { return map[string]gangMember{"u": {sliceUID: "u"}} }
 
 	// Same age, different priority → highest priority wins.
 	gate.cohorts = map[string]*gangCohort{
-		"ns/low":  {gangSize: 2, priority: 1, createdAt: now},
-		"ns/high": {gangSize: 2, priority: 9, createdAt: now},
-		"ns/mid":  {gangSize: 2, priority: 5, createdAt: now},
+		"ns/low":  {gangSize: 2, priority: 1, createdAt: now, members: m()},
+		"ns/high": {gangSize: 2, priority: 9, createdAt: now, members: m()},
+		"ns/mid":  {gangSize: 2, priority: 5, createdAt: now, members: m()},
 	}
-	if got := gate.pickAdmissionHeadLocked(now); got != "ns/high" {
+	if got := gate.pickAdmissionHeadLocked(now, ""); got != "ns/high" {
 		t.Fatalf("priority ordering: got %q, want ns/high", got)
 	}
 
 	// Equal priority → oldest (earliest createdAt) wins.
 	gate.cohorts = map[string]*gangCohort{
-		"ns/younger": {gangSize: 2, priority: 5, createdAt: now},
-		"ns/older":   {gangSize: 2, priority: 5, createdAt: now.Add(-time.Minute)},
+		"ns/younger": {gangSize: 2, priority: 5, createdAt: now, members: m()},
+		"ns/older":   {gangSize: 2, priority: 5, createdAt: now.Add(-time.Minute), members: m()},
 	}
-	if got := gate.pickAdmissionHeadLocked(now); got != "ns/older" {
+	if got := gate.pickAdmissionHeadLocked(now, ""); got != "ns/older" {
 		t.Fatalf("age ordering: got %q, want ns/older", got)
 	}
 
 	// Equal priority and age → lexicographically smaller key wins.
 	gate.cohorts = map[string]*gangCohort{
-		"ns/bbb": {gangSize: 2, priority: 5, createdAt: now},
-		"ns/aaa": {gangSize: 2, priority: 5, createdAt: now},
+		"ns/bbb": {gangSize: 2, priority: 5, createdAt: now, members: m()},
+		"ns/aaa": {gangSize: 2, priority: 5, createdAt: now, members: m()},
 	}
-	if got := gate.pickAdmissionHeadLocked(now); got != "ns/aaa" {
+	if got := gate.pickAdmissionHeadLocked(now, ""); got != "ns/aaa" {
 		t.Fatalf("name tiebreak: got %q, want ns/aaa", got)
 	}
 
 	// Released and backed-off cohorts are skipped.
 	gate.cohorts = map[string]*gangCohort{
-		"ns/done":    {gangSize: 2, priority: 9, createdAt: now, released: true},
-		"ns/cooling": {gangSize: 2, priority: 8, createdAt: now},
-		"ns/ready":   {gangSize: 2, priority: 1, createdAt: now},
+		"ns/done":    {gangSize: 2, priority: 9, createdAt: now, released: true, members: m()},
+		"ns/cooling": {gangSize: 2, priority: 8, createdAt: now, members: m()},
+		"ns/ready":   {gangSize: 2, priority: 1, createdAt: now, members: m()},
 	}
 	gate.backoff = map[string]time.Time{"ns/cooling": now.Add(time.Minute)}
-	if got := gate.pickAdmissionHeadLocked(now); got != "ns/ready" {
+	if got := gate.pickAdmissionHeadLocked(now, ""); got != "ns/ready" {
 		t.Fatalf("skip released+backoff: got %q, want ns/ready", got)
 	}
 
 	// Backoff that has elapsed makes the cohort eligible again.
 	gate.backoff = map[string]time.Time{"ns/cooling": now.Add(-time.Second)}
-	if got := gate.pickAdmissionHeadLocked(now); got != "ns/cooling" {
+	if got := gate.pickAdmissionHeadLocked(now, ""); got != "ns/cooling" {
 		t.Fatalf("expired backoff: got %q, want ns/cooling", got)
+	}
+
+	// Round-2 ghost rule: a member-less cohort is unpickable through anyone
+	// else's check (it may be a ghost whose slices are gone) — but its OWN
+	// check may still claim the slot (cohort creation + first-member
+	// registration happen in that same check, so live gangs self-revive).
+	gate.backoff = map[string]time.Time{}
+	gate.cohorts = map[string]*gangCohort{
+		"ns/ghost": {gangSize: 2, priority: 9, createdAt: now.Add(-time.Minute)}, // no members
+		"ns/live":  {gangSize: 2, priority: 1, createdAt: now, members: m()},
+	}
+	if got := gate.pickAdmissionHeadLocked(now, "ns/live"); got != "ns/live" {
+		t.Fatalf("member-less ghost must be skipped for other callers: got %q, want ns/live", got)
+	}
+	if got := gate.pickAdmissionHeadLocked(now, "ns/ghost"); got != "ns/ghost" {
+		t.Fatalf("a cohort's own check may claim the slot from 0 members: got %q, want ns/ghost", got)
 	}
 }
 

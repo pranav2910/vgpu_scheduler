@@ -301,7 +301,7 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 		g.admitting = ""
 	}
 	if g.admitting == "" {
-		if head := g.pickAdmissionHeadLocked(now); head != "" {
+		if head := g.pickAdmissionHeadLocked(now, cohortKey); head != "" {
 			g.admitting = head
 			g.admittingSince = now
 		}
@@ -356,12 +356,25 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 // admission slot, ordered priority desc → age asc → name asc. Released cohorts
 // and cohorts in active backoff are skipped. Returns "" if none are eligible.
 // Caller must hold g.mu.
-func (g *GangBindingGate) pickAdmissionHeadLocked(now time.Time) string {
+//
+// callerKey is the cohort of the slice whose check is running. A cohort with
+// ZERO members may claim the slot only through its OWN slice's check (battery
+// 2.7 starvation, round 2): cohort creation and first-member registration
+// happen inside the same check, so any OTHER member-less cohort is either a
+// freshly-wiped staller (in backoff — skipped anyway) or a GHOST whose slices
+// no longer exist. The stall path alone cost 20s per ghost SERIALLY — with two
+// dead tests' cohorts queued, a feasible gang's whole 60s reservation deadline
+// burned before it ever held the slot. Live gangs self-revive via their own
+// checks; ghosts can't, and the 90s reaper collects them.
+func (g *GangBindingGate) pickAdmissionHeadLocked(now time.Time, callerKey string) string {
 	best := ""
 	var bestCohort *gangCohort
 	for key, cohort := range g.cohorts {
 		if cohort.released {
 			continue
+		}
+		if key != callerKey && len(cohort.members) == 0 {
+			continue // possible ghost: only its own slice's check may revive it
 		}
 		if until, backed := g.backoff[key]; backed {
 			if now.Before(until) {
