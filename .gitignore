@@ -97,3 +97,4 @@ add_test_2_4*.sh
 __pycache__/
 *.pyc
 artifacts/
+deployments/prometheus-kubeconfig.yaml

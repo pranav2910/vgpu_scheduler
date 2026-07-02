@@ -5,8 +5,11 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      # kubeconfig for kubernetes_sd pod discovery (user-owned copy, mode 600)
-      - ${HOME}/.kube/config:/etc/prometheus/kubeconfig:ro
+      # DEDICATED least-privilege discovery credential (pods+nodes read-only),
+      # minted by scripts/gen-prometheus-kubeconfig.sh. Never mount your admin
+      # kubeconfig into a container — and mode-600 admin files are unreadable
+      # by the container's non-root user anyway.
+      - ./prometheus-kubeconfig.yaml:/etc/prometheus/kubeconfig:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
     # 🚀 THE LINUX FIX: Tells the container how to reach your host machine

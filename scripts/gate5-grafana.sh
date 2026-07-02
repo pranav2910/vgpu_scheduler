@@ -38,15 +38,17 @@ $SSH "$KC
 grep -q "PLANTED=yes" "$EVID/00b-workload.txt" && ok "workload planted (8000 MiB annotated)" || bad "workload plant failed"
 
 say "1. docker compose up (prometheus + grafana; password injected, never committed)"
-$SSH 'cd $HOME/vgpu_scheduler/deployments
-  # sudo resets HOME to /root — but the compose file mounts ${HOME}/.kube/config
-  # for prometheus pod-discovery. Pin the real HOME through sudo or the mount
-  # points at a nonexistent path and prometheus dies after "Started".
-  sudo env HOME=$HOME GRAFANA_ADMIN_PASSWORD=gate5-receipt docker compose up -d 2>&1 | tail -3
-  sleep 25
-  sudo env HOME=$HOME docker compose ps 2>/dev/null | tail -3' | tee "$EVID/01-compose.txt"
-grep -qi "grafana.*Up" "$EVID/01-compose.txt" && ok "grafana container up" || bad "grafana not up"
-grep -qi "prometheus.*Up" "$EVID/01-compose.txt" && ok "prometheus container up" || bad "prometheus not up"
+$SSH "$KC
+  bash scripts/gen-prometheus-kubeconfig.sh
+  cd deployments
+  sudo GRAFANA_ADMIN_PASSWORD=gate5-receipt docker compose up -d 2>&1 | tail -3
+  # functional health checks, not container-listing greps
+  for i in \$(seq 1 10); do curl -sf http://localhost:9090/-/ready >/dev/null && break; sleep 5; done
+  curl -sf http://localhost:9090/-/ready >/dev/null && echo PROM_READY=yes
+  for i in \$(seq 1 10); do curl -sf http://localhost:3000/api/health >/dev/null && break; sleep 5; done
+  curl -sf http://localhost:3000/api/health >/dev/null && echo GRAFANA_READY=yes" | tee "$EVID/01-compose.txt"
+grep -q "GRAFANA_READY=yes" "$EVID/01-compose.txt" && ok "grafana healthy (API)" || bad "grafana not healthy"
+grep -q "PROM_READY=yes" "$EVID/01-compose.txt" && ok "prometheus healthy (API)" || bad "prometheus not healthy"
 
 say "2. prometheus discovered the monitor pod and scraped vgpu metrics"
 $SSH 'for i in $(seq 1 12); do
@@ -81,13 +83,13 @@ print('NUMBERS_MATCH=yes' if (r>0 and abs(p-r)/r <= 0.01) else ('NUMBERS_MATCH=v
 grep -q "NUMBERS_MATCH=yes" "$EVID/05-match.txt" && ok "dashboard numbers == vgpu report (±1%)" || bad "dashboard diverges from the report"
 
 say "6. dashboard survives a grafana restart"
-$SSH 'cd $HOME/vgpu_scheduler/deployments && sudo env HOME=$HOME GRAFANA_ADMIN_PASSWORD=gate5-receipt docker compose restart grafana >/dev/null 2>&1 && sleep 15
+$SSH 'cd $HOME/vgpu_scheduler/deployments && sudo GRAFANA_ADMIN_PASSWORD=gate5-receipt docker compose restart grafana >/dev/null 2>&1 && sleep 15
   curl -s -u admin:gate5-receipt http://localhost:3000/api/dashboards/uid/vgpu-waste | grep -o "\"uid\":\"vgpu-waste\"" | head -1' | tee "$EVID/06-restart.txt"
 grep -q '"uid":"vgpu-waste"' "$EVID/06-restart.txt" && ok "dashboard survives restart (provisioned, not clicked-together)" || bad "dashboard lost on restart"
 
 say "7. teardown compose + planted workload (leave the box clean)"
 $SSH "$KC; kubectl delete pod g5-waste --ignore-not-found --wait=false" >/dev/null 2>&1
-$SSH 'cd $HOME/vgpu_scheduler/deployments && sudo env HOME=$HOME GRAFANA_ADMIN_PASSWORD=x docker compose down >/dev/null 2>&1; echo down' >/dev/null 2>&1
+$SSH 'cd $HOME/vgpu_scheduler/deployments && sudo GRAFANA_ADMIN_PASSWORD=x docker compose down >/dev/null 2>&1; echo down' >/dev/null 2>&1
 ok "compose torn down"
 
 echo
