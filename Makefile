@@ -53,18 +53,41 @@ install-crds: ## Install CRDs into the current cluster
 uninstall-crds: ## Remove CRDs (will delete all custom resources)
 	kubectl delete -f $(MANIFESTS)/crds/
 
-.PHONY: install
-install: install-crds ## Full install: namespace, RBAC, CRDs, webhooks, workloads
+# Shared control-plane apply, WITHOUT the node agent. Backends (scheduler,
+# controller) go up BEFORE the webhooks: the mutating/validating configs are
+# failurePolicy=Fail, so registering them before their backend exists — or on a
+# cluster without cert-manager, where certificate.yaml fails and make aborts —
+# would leave fail-closed webhooks with no server, rejecting every vGPU create
+# cluster-wide (scan finding). Webhooks last means a partial failure still
+# leaves a working control plane.
+.PHONY: install-base
+install-base: install-crds
 	kubectl apply -f $(MANIFESTS)/namespace.yaml
 	kubectl apply -f $(MANIFESTS)/rbac/
-	kubectl apply -f $(MANIFESTS)/webhooks/
 	kubectl apply -f $(MANIFESTS)/scheduler_deployment.yaml
 	kubectl apply -f $(MANIFESTS)/controller_deployment.yaml
+	@echo ""
+	@echo ">> Applying admission webhooks (requires cert-manager for the CA)."
+	@echo ">> If this step fails, the webhooks are fail-closed — remove them with:"
+	@echo ">>   kubectl delete -f $(MANIFESTS)/webhooks/   (until cert-manager is installed)"
+	kubectl apply -f $(MANIFESTS)/webhooks/
+
+.PHONY: install
+install: install-base ## Full install with the FAKE GPU agent (kind/CI/dev ONLY — fabricates GPUs)
+	@echo ""
+	@echo ">> WARNING: deploying the FAKE-GPU node agent (nodeagent_daemonset.yaml)."
+	@echo ">> It fabricates an 80GiB GPU on every node and does NOT touch real hardware."
+	@echo ">> On a real GPU cluster use:  make install-nvml"
 	kubectl apply -f $(MANIFESTS)/nodeagent_daemonset.yaml
+
+.PHONY: install-nvml
+install-nvml: install-base ## Full install with the REAL NVML node agent (real GPU nodes)
+	kubectl apply -f $(MANIFESTS)/nodeagent_daemonset_nvml.yaml
 
 .PHONY: uninstall
 uninstall: ## Tear down the control plane (keeps namespace and CRDs)
 	-kubectl delete -f $(MANIFESTS)/nodeagent_daemonset.yaml
+	-kubectl delete -f $(MANIFESTS)/nodeagent_daemonset_nvml.yaml
 	-kubectl delete -f $(MANIFESTS)/controller_deployment.yaml
 	-kubectl delete -f $(MANIFESTS)/scheduler_deployment.yaml
 	-kubectl delete -f $(MANIFESTS)/webhooks/

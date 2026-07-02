@@ -83,6 +83,12 @@ spec:
           mountPath: /var/lib/vgpu-state
         - name: dev-dir
           mountPath: /dev
+      # Land on tainted GPU nodes (gpu-operator sets nvidia.com/gpu:NoSchedule
+      # by default). Without this the agent never schedules onto the very nodes
+      # it must manage, and slices silently never become Ready (scan finding —
+      # the monitor DaemonSet already tolerated; the agent did not).
+      tolerations:
+        - operator: Exists
       volumes:
       - name: cdi-dir
         hostPath:
