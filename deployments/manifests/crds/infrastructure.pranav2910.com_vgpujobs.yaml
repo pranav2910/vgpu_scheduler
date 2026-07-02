@@ -60,6 +60,11 @@ spec:
                           type: integer
                           format: int64
                           minimum: 1
+                          # Mirror of the vgpuclaims CRD max (sweep S6): without
+                          # it a 10TiB job is ACCEPTED here, then its claim is
+                          # rejected by the claims CRD -> the job wedges in
+                          # silent infinite backoff with empty status.
+                          maximum: 85899345920
                         serviceTier:
                           type: string
                           enum:
