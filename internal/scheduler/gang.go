@@ -45,6 +45,7 @@ type gangCohort struct {
 	members   map[string]gangMember // sliceUID -> registration
 	released  bool                  // true once quorum reached; sticky
 	createdAt time.Time             // first time the gate observed this gang (≈ age)
+	rsvUID    types.UID             // which INCARNATION of the reservation this cohort belongs to
 }
 
 // GangBindingGate decides whether a slice may bind based on whether enough
@@ -239,12 +240,30 @@ func (g *GangBindingGate) CheckSliceWithCohort(
 	now := time.Now()
 
 	cohort, exists := g.cohorts[cohortKey]
+	if exists && cohort.rsvUID != rsv.UID {
+		// Same gang NAME, different reservation object: a previous incarnation's
+		// cohort. A successful gang's cohort is released=true and deliberately
+		// never reaped, and its reservation is cascade-deleted without a
+		// terminal-phase observation — so without this check a re-created gang
+		// (CI re-runs the same manifest) hit the stale released fast-path below
+		// and every member bound SOLO, no quorum, no all-or-nothing (scan S1).
+		// A stale cohort also carries the OLD gangSize. Purge and start fresh.
+		log.Printf("[gang] cohort %s belongs to a previous incarnation of the reservation (cohort uid=%s, live uid=%s) — forgetting it",
+			cohortKey, cohort.rsvUID, rsv.UID)
+		delete(g.cohorts, cohortKey)
+		delete(g.backoff, cohortKey)
+		if g.admitting == cohortKey {
+			g.admitting = ""
+		}
+		exists = false
+	}
 	if !exists {
 		cohort = &gangCohort{
 			gangSize:  gangSize,
 			priority:  priority,
 			members:   make(map[string]gangMember, gangSize),
 			createdAt: now,
+			rsvUID:    rsv.UID,
 		}
 		g.cohorts[cohortKey] = cohort
 	} else {

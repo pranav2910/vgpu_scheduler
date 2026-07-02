@@ -308,3 +308,82 @@ func TestGate_TerminalReservationFreesSlot(t *testing.T) {
 		t.Fatalf("g2-0 after g1 fail: got %v, want Deferred (admitted)", res)
 	}
 }
+
+// TestGate_RecreatedGangDoesNotInheritReleasedCohort is the regression test
+// for scan finding S1: a successful gang's cohort is released=true, is
+// deliberately never reaped, and its reservation is cascade-deleted WITHOUT a
+// terminal-phase observation — so the cohort outlived the gang. Re-creating a
+// same-named gang (CI re-applies the same manifest) hit the stale released
+// fast-path and every member bound SOLO: no quorum, no all-or-nothing, exactly
+// the partial-admission fragmentation the gate exists to prevent. The cohort
+// now records its reservation's UID and a mismatch purges it on the spot —
+// which also drops the stale cohort's OLD gangSize.
+func TestGate_RecreatedGangDoesNotInheritReleasedCohort(t *testing.T) {
+	ctx := context.Background()
+	rsvA := reservingRsv("rsv-gg", 2)
+	rsvA.UID = types.UID("uid-incarnation-A")
+	c := fake.NewClientBuilder().
+		WithScheme(gangTestScheme(t)).
+		WithObjects(rsvA).
+		Build()
+	gate := NewGangBindingGate(c)
+
+	check := func(s *vgpuv1alpha1.VGPUSlice) GangCheckResult {
+		res, _, err := gate.CheckSliceWithCohort(ctx, s, "node-a", 10)
+		if err != nil {
+			t.Fatalf("gate error for %s: %v", s.Name, err)
+		}
+		return res
+	}
+
+	// Incarnation A reaches quorum → cohort released (sticky, never reaped).
+	if got := check(gangSlice("a-0", "rsv-gg", 1, "u-a0")); got != GangBindDeferred {
+		t.Fatalf("a-0: got %v, want Deferred", got)
+	}
+	if got := check(gangSlice("a-1", "rsv-gg", 1, "u-a1")); got != GangBindAllowed {
+		t.Fatalf("a-1: got %v, want Allowed (quorum)", got)
+	}
+
+	// Gang completes: reservation cascade-deleted, SAME name re-created with a
+	// new UID and a DIFFERENT gangSize (3).
+	if err := c.Delete(ctx, rsvA); err != nil {
+		t.Fatal(err)
+	}
+	rsvB := reservingRsv("rsv-gg", 3)
+	rsvB.UID = types.UID("uid-incarnation-B")
+	if err := c.Create(ctx, rsvB); err != nil {
+		t.Fatal(err)
+	}
+
+	// First member of incarnation B: before the fix this returned Allowed via
+	// the stale released cohort (solo bind). It must be Deferred — a FRESH
+	// cohort holding the admission slot at 1/3.
+	if got := check(gangSlice("b-0", "rsv-gg", 1, "u-b0")); got != GangBindAllowed {
+		cohort := gate.cohorts["default/rsv-gg"]
+		if cohort == nil {
+			t.Fatalf("b-0: fresh cohort missing after incarnation change")
+		}
+		if cohort.rsvUID != types.UID("uid-incarnation-B") {
+			t.Fatalf("cohort still bound to old incarnation: uid=%s", cohort.rsvUID)
+		}
+		if cohort.gangSize != 3 {
+			t.Fatalf("cohort kept STALE gangSize %d, want 3", cohort.gangSize)
+		}
+		if cohort.released {
+			t.Fatalf("fresh cohort must not inherit released=true")
+		}
+		if got != GangBindDeferred {
+			t.Fatalf("b-0: got %v, want Deferred (fresh cohort, 1/3)", got)
+		}
+	} else {
+		t.Fatalf("b-0: got Allowed — recreated gang inherited the released cohort (solo bind, all-or-nothing broken)")
+	}
+
+	// The new incarnation still assembles normally at its NEW size.
+	if got := check(gangSlice("b-1", "rsv-gg", 1, "u-b1")); got != GangBindDeferred {
+		t.Fatalf("b-1: got %v, want Deferred (2/3)", got)
+	}
+	if got := check(gangSlice("b-2", "rsv-gg", 1, "u-b2")); got != GangBindAllowed {
+		t.Fatalf("b-2: got %v, want Allowed (3/3 quorum)", got)
+	}
+}
