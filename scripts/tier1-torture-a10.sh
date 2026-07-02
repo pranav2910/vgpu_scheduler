@@ -48,6 +48,9 @@ $SSH "$KC
   kubectl rollout status deploy/vgpu-controller -n vgpu-system --timeout=240s
   kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=240s
   kubectl delete vgpujobs --all -A --wait=false 2>/dev/null; sleep 5
+  # pre-pull the burner image into k3s containerd: its first pull is ~5GB and
+  # silently ate step-1's wait budget (receipt round-1 lesson)
+  sudo k3s ctr images pull docker.io/$PYTORCH >/dev/null 2>&1 || sudo k3s ctr images pull docker.io/library/$PYTORCH >/dev/null 2>&1 || true
   echo FRESH_IMAGES=yes" > "$EVID/00-rebuild.log" 2>&1
 grep -q "FRESH_IMAGES=yes" "$EVID/00-rebuild.log" && ok "fresh images at THIS commit" \
     || { bad "rebuild failed (see $EVID/00-rebuild.log)"; exit 1; }
@@ -55,20 +58,22 @@ grep -q "FRESH_IMAGES=yes" "$EVID/00-rebuild.log" && ok "fresh images at THIS co
 say "1. OVER-USAGE detect→softwarn: grant 4Gi, actually use ~8Gi (default mode never destroys)"
 submit_burner overuser 4Gi 8 "" | tee "$EVID/01-submit.txt"
 $SSH "$KC
-  sleep 100   # detection needs a sustained streak of observe cycles
-  kubectl get vgpuslices overuser-claim-slice -o jsonpath='{.status.phase} {.status.observedVramBytes}'; echo
-  kubectl get pod overuser-workload -o jsonpath='{.metadata.labels}'; echo
-  kubectl get events --field-selector involvedObject.name=overuser-claim-slice -o jsonpath='{range .items[*]}{.reason} {end}'; echo
-  kubectl get pod overuser-workload -o jsonpath='{.status.phase}'; echo" | tee "$EVID/01-overuse.txt"
-grep -qiE "violat" "$EVID/01-overuse.txt" && ok "over-use DETECTED (violation label/event present)" || bad "over-use not detected"
-grep -q "Running" "$EVID/01-overuse.txt" && ok "softwarn mode: violating pod NOT evicted (non-destructive default)" || bad "pod gone in softwarn mode?!"
+  # detection = 3 consecutive 30s cycles; poll the CONDITION, don't guess sleeps
+  kubectl wait vgpuslice/overuser-claim-slice --for=condition=MemoryViolation --timeout=300s >/dev/null 2>&1 \
+    && echo VIOLATION_CONDITION=yes || echo VIOLATION_CONDITION=no
+  kubectl get vgpuslices overuser-claim-slice -o jsonpath='{.status.phase} observed={.status.observedVramBytes}'; echo
+  kubectl get pod overuser-workload -o jsonpath='pod={.status.phase}'; echo" | tee "$EVID/01-overuse.txt"
+grep -q "VIOLATION_CONDITION=yes" "$EVID/01-overuse.txt" && ok "over-use DETECTED (MemoryViolation condition on the slice)" || bad "over-use not detected"
+grep -q "pod=Running" "$EVID/01-overuse.txt" && ok "softwarn mode: violating pod NOT evicted (non-destructive default)" || bad "pod gone in softwarn mode?!"
 
 say "2. EVICT mode: same violation must now evict — and a labeled-exempt namespace must NOT be"
 $SSH "$KC
   kubectl set env ds/vgpu-nodeagent -n vgpu-system VGPU_ENFORCEMENT_MODE=evict
   kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=120s >/dev/null
-  # let the agent re-observe the still-running overuser past its deadline
-  for i in \$(seq 1 40); do
+  # The mode-flip rollout RESTARTS the agent, which resets streak counters:
+  # detection re-accumulates (3x30s) + 60s enforcement grace + cycle slack.
+  # Round-1 receipt used 240s and lost to cycle alignment — budget 420s.
+  for i in \$(seq 1 70); do
     ph=\$(kubectl get pod overuser-workload -o jsonpath='{.status.phase}' 2>/dev/null || echo GONE)
     [ \"\$ph\" = GONE ] && break; sleep 6
   done
@@ -80,7 +85,7 @@ $SSH "$KC
   true" >/dev/null 2>&1
 submit_burner exemptuser 4Gi 8 "-n exempt-zone" >/dev/null 2>&1
 $SSH "$KC
-  sleep 150
+  sleep 300   # full streak + grace window: if it survives THIS, exemption held
   kubectl get pod exemptuser-workload -n exempt-zone -o jsonpath='{.status.phase}' 2>/dev/null || echo GONE" | tee "$EVID/02-exempt.txt"
 grep -q "Running" "$EVID/02-exempt.txt" && ok "exempt namespace honored even in evict mode (violating pod alive)" || bad "exempt namespace pod evicted"
 $SSH "$KC
