@@ -34,6 +34,11 @@ $SSH 'set -e
     sudo install -m 0755 /tmp/kind /usr/local/bin/kind
   fi
   sudo usermod -aG docker "$USER" 2>/dev/null || true
+  # multi-node kind exhausts default inotify limits ("Preparing nodes" fails
+  # at ~13 nodes: every kind node runs a kubelet in a container) — the
+  # documented kind fix:
+  sudo sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null
+  sudo sysctl -w fs.inotify.max_user_instances=8192 >/dev/null
   kind version' | tee "$EVID/00a-prereqs.txt"
 grep -q "kind v" "$EVID/00a-prereqs.txt" && ok "kind installed" || { bad "kind install failed"; exit 1; }
 
