@@ -54,7 +54,7 @@ $SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/mai
   PERNODE=\$(( $GPUS_PER_NODE * 85899345920 ))
   for n in \$(kubectl get nodes --no-headers -o custom-columns=:metadata.name | grep worker); do
     kubectl patch node \$n --subresource=status --type=merge \
-      -p '{"status":{"capacity":{"infrastructure.pranav2910.com/vgpu-bytes":"'\$PERNODE'"},"allocatable":{"infrastructure.pranav2910.com/vgpu-bytes":"'\$PERNODE'"}}}' >/dev/null
+      -p '{\"status\":{\"capacity\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"'\$PERNODE'\"},\"allocatable\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"'\$PERNODE'\"}}}' >/dev/null
   done
   sleep 15   # scheduler's node reconciler picks up the new capacity
   TOTAL=\$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}{\"\n\"}{end}' | awk '{s+=\$1} END{print s}')
@@ -138,8 +138,12 @@ $SSH "$KC
               else if (r==total[g] && r==8) full++
               else { part++; print \"PARTIAL\", g, r\"/\"total[g] } }
             print \"full=\"full, \"zero=\"zero, \"partial=\"part }'" | tee "$EVID/04-gang-settle.txt"
-grep -q "partial=0" "$EVID/04-gang-settle.txt" && ok "gang all-or-nothing held at scale: $(grep -oE 'full=[0-9]+ zero=[0-9]+' "$EVID/04-gang-settle.txt")" \
-    || bad "PARTIAL gang admission detected at scale"
+GF=$(grep -oE "full=[0-9]+" "$EVID/04-gang-settle.txt" | cut -d= -f2); GZ=$(grep -oE "zero=[0-9]+" "$EVID/04-gang-settle.txt" | cut -d= -f2)
+if grep -q "partial=0" "$EVID/04-gang-settle.txt" && [ "$(( ${GF:-0} + ${GZ:-0} ))" -ge 1 ] && [ "${GF:-0}" -ge 1 ]; then
+    ok "gang all-or-nothing held at scale (full=$GF zero=$GZ partial=0; at least one gang fully admitted)"
+else
+    bad "gang settle: partial admission, or vacuous (full=${GF:-0} zero=${GZ:-0} — round-6 'passed' with zero gangs visible)"
+fi
 check_invariant wave2 "$JOBS"
 
 say "5. CHURN: delete $CHURN random solos, submit $CHURN replacements"
