@@ -54,12 +54,12 @@ $SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/mai
   PERNODE=\$(( $GPUS_PER_NODE * 85899345920 ))
   for n in \$(kubectl get nodes --no-headers -o custom-columns=:metadata.name | grep worker); do
     kubectl patch node \$n --subresource=status --type=merge \
-      -p "{\"status\":{\"capacity\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"\$PERNODE\"},\"allocatable\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"\$PERNODE\"}}}" >/dev/null
+      -p '{"status":{"capacity":{"infrastructure.pranav2910.com/vgpu-bytes":"'\$PERNODE'"},"allocatable":{"infrastructure.pranav2910.com/vgpu-bytes":"'\$PERNODE'"}}}' >/dev/null
   done
   sleep 15   # scheduler's node reconciler picks up the new capacity
   TOTAL=\$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}{\"\n\"}{end}' | awk '{s+=\$1} END{print s}')
   echo CLUSTER_CAPACITY_BYTES=\$TOTAL" > "$EVID/00-bringup.log" 2>&1
-CAP=$(grep -oE "CLUSTER_CAPACITY_BYTES=[0-9]+" "$EVID/00-bringup.log" | cut -d= -f2)
+CAP=$(grep -oE "CLUSTER_CAPACITY_BYTES=[0-9]+" "$EVID/00-bringup.log" | tail -1 | cut -d= -f2)
 if [ -n "${CAP:-}" ] && [ "$CAP" -ge 1000000000000 ]; then
   ok "storm cluster up: capacity $((CAP/1073741824)) GiB across $WORKERS workers"
 else
