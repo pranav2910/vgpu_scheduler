@@ -39,6 +39,10 @@ to_bytes() {
     [[ "$q" =~ ^([0-9]+)([KkMmGgTt]i?|[Bb])?$ ]] \
         || die "invalid VRAM quantity '$q' (use e.g. 16Gi, 512Mi, 8G, or a raw byte count)"
     num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    # Overflow guard: bash arithmetic wraps silently at 2^64 (a 2^64+1 input
+    # wrapped to 1 and sailed past validation — scan finding). 15 digits
+    # (~900 TiB as raw bytes, absurdly high with any unit) is a safe ceiling.
+    [[ ${#num} -le 15 ]] || die "VRAM quantity '$q' is beyond any plausible value"
     case "$unit" in
         ""|B|b)        echo  "$num" ;;
         Ki|ki)         echo "$(( num * 1024 ))" ;;
@@ -148,8 +152,10 @@ cmd_submit() {
     [[ -n "$image" ]] || die "submit requires --image"
 
     local bytes; bytes="$(to_bytes "$vram")"
-    (( bytes >= 1 && bytes <= 85899345920 )) \
-        || die "VRAM $vram ($bytes bytes) out of range (1 .. 85899345920 / 80Gi)"
+    # No upper bound HERE: card sizes grow (H100 NVL 94G, H200 141G, B200 192G)
+    # and the fleet's real ceiling is enforced server-side by the validating
+    # webhook. The client only rejects the nonsensical.
+    (( bytes >= 1 )) || die "VRAM $vram must be at least 1 byte"
 
     # Deterministic names mirror the controller exactly:
     #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice -> pod=NAME-workload
@@ -318,6 +324,11 @@ cmd_status() {
         [[ "$capd" == "True" ]] && \
             printf '    (capped at fleet max — workload may need a larger GPU class or model parallelism)\n'
     fi
+    # Trailing `[[ ]] &&` chains above return 1 when their condition is false —
+    # under set -e that made `vgpu status` EXIT 1 for perfectly healthy jobs
+    # (every autoresized-but-not-capped job; scan finding). Status reporting
+    # succeeded if we got here.
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,11 +387,12 @@ cmd_profile() {
             '{.status.conditions[?(@.type=="Underprovisioned")].message}')"
         printf '  VERDICT      UNDERPROVISIONED — %s\n' "${msg:-request is below the observed peak}"
         printf '  next time    request %s  —  or keep this size and add --override\n' "$(human "${recommended:-0}")"
-        [[ "$pmode" == "requireOverride" ]] && \
-            printf '               (this cluster enforces requireOverride: an undersized re-submit is rejected without --override)\n'
+        { [[ "$pmode" == "requireOverride" ]] && \
+            printf '               (this cluster enforces requireOverride: an undersized re-submit is rejected without --override)\n'; } || true
     elif [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
         printf '  VERDICT      OK — request covers the observed peak (with headroom)\n'
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,7 +403,10 @@ cmd_profile() {
 # ─────────────────────────────────────────────────────────────────────────────
 report_scrape() { # namespace — scrape every monitor agent's :8083/metrics via API proxy
     local ns="$1" pods p
-    pods="$(kubectl get pods -n "$ns" -l app=vgpu-monitor -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    # Running only: during a DaemonSet rollout the Terminating pod still answers
+    # /proxy/metrics, and duplicated series double `used` (waste collapsed to 0
+    # mid-upgrade — scan finding).
+    pods="$(kubectl get pods -n "$ns" -l app=vgpu-monitor --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
     [[ -n "$pods" ]] || die "no monitor agents (label app=vgpu-monitor) in namespace '$ns' — install: kubectl apply -f deployments/monitor/"
     for p in $pods; do
         kubectl get --raw "/api/v1/namespaces/${ns}/pods/${p}:8083/proxy/metrics" 2>/dev/null
