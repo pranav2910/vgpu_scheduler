@@ -15,7 +15,7 @@
 # ============================================================================
 set -euo pipefail
 
-CLUSTER="vgpu-multinode"
+CLUSTER="${CLUSTER:-vgpu-multinode}"
 NAMESPACE="vgpu-system"
 MANIFESTS="deployments/manifests"
 VGPU_RESOURCE="infrastructure.pranav2910.com/vgpu-bytes"

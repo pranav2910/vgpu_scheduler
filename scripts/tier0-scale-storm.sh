@@ -26,7 +26,18 @@ bad(){ echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 say(){ echo; echo "── $* ──"; }
 KC='export KUBECONFIG=$HOME/.kube/config-storm; cd vgpu_scheduler'
 
-say "0. bring up ${WORKERS}-worker kind storm cluster (${GPUS_PER_NODE} fake 80Gi GPUs per worker)"
+say "0a. prereqs: kind binary + docker group (fresh ssh sessions pick the group up)"
+$SSH 'set -e
+  if ! command -v kind >/dev/null 2>&1; then
+    ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64) A=arm64;; *) A=amd64;; esac
+    curl -sLo /tmp/kind "https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-$A"
+    sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+  fi
+  sudo usermod -aG docker "$USER" 2>/dev/null || true
+  kind version' | tee "$EVID/00a-prereqs.txt"
+grep -q "kind v" "$EVID/00a-prereqs.txt" && ok "kind installed" || { bad "kind install failed"; exit 1; }
+
+say "0b. bring up ${WORKERS}-worker kind storm cluster (${GPUS_PER_NODE} fake 80Gi GPUs per worker)"
 $SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/main
   export KUBECONFIG=\$HOME/.kube/config-storm
   kind delete cluster --name vgpu-storm >/dev/null 2>&1
@@ -36,19 +47,32 @@ $SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/mai
   sleep 20   # agents re-advertise multi-GPU capacity
   TOTAL=\$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.capacity.vgpu\.pranav2910\.com/vram}{\"\n\"}{end}' | awk '{s+=\$1} END{print s}')
   echo CLUSTER_CAPACITY_BYTES=\$TOTAL" > "$EVID/00-bringup.log" 2>&1
-grep -q "CLUSTER_CAPACITY_BYTES" "$EVID/00-bringup.log" && ok "storm cluster up: $(grep CLUSTER_CAPACITY_BYTES "$EVID/00-bringup.log")" \
-    || { bad "storm cluster bring-up failed (see $EVID/00-bringup.log)"; exit 1; }
+CAP=$(grep -oE "CLUSTER_CAPACITY_BYTES=[0-9]+" "$EVID/00-bringup.log" | cut -d= -f2)
+if [ -n "${CAP:-}" ] && [ "$CAP" -ge 1000000000000 ]; then
+  ok "storm cluster up: capacity $((CAP/1073741824)) GiB across $WORKERS workers"
+else
+  bad "storm cluster has no capacity (CAP='${CAP:-empty}') — vacuous-pass guard (round-1: kind was missing and this check passed on an empty label)"
+  exit 1
+fi
 
-# invariant checker: for every node, sum(Ready-slice allocatedBytes) <= capacity
+# invariant checker: for every node, sum(Ready-slice allocatedBytes) <= capacity.
+# min_ready guards against vacuous passes: an empty cluster trivially "holds".
 check_invariant() {
-    local tag="$1"
+    local tag="$1" min_ready="${2:-1}"
     $SSH "$KC
       kubectl get vgpuslices -A -o jsonpath='{range .items[?(@.status.phase==\"Ready\")]}{.spec.nodeName}{\" \"}{.status.allocatedBytes}{\"\n\"}{end}' \
         | awk 'NF==2 {a[\$1]+=\$2} END {for (n in a) print n, a[n]}' > /tmp/alloc.txt
       kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.capacity.vgpu\.pranav2910\.com/vram}{\"\n\"}{end}' > /tmp/cap.txt
+      READY=\$(kubectl get vgpuslices -A --no-headers 2>/dev/null | grep -c ' Ready' || true)
+      echo READY_COUNT=\$READY
       awk 'NR==FNR {cap[\$1]=\$2; next} {if (\$2 > cap[\$1]) {print \"OVERCOMMIT\", \$1, \$2, cap[\$1]; bad=1}} END {exit bad}' /tmp/cap.txt /tmp/alloc.txt \
         && echo INVARIANT_OK || echo INVARIANT_VIOLATED" | tee "$EVID/invariant-$tag.txt"
-    grep -q "INVARIANT_OK" "$EVID/invariant-$tag.txt" && ok "no-over-admission invariant holds ($tag)" || bad "OVER-ADMISSION detected ($tag)"
+    RC=$(grep -oE "READY_COUNT=[0-9]+" "$EVID/invariant-$tag.txt" | cut -d= -f2)
+    if grep -q "INVARIANT_OK" "$EVID/invariant-$tag.txt" && [ "${RC:-0}" -ge "$min_ready" ]; then
+        ok "no-over-admission invariant holds ($tag, ready=$RC ≥ $min_ready)"
+    else
+        bad "invariant check failed ($tag): ready=${RC:-0} (min $min_ready) or over-admission"
+    fi
 }
 
 say "1. WAVE 1: $JOBS solo jobs (8Gi) in one burst"
@@ -70,7 +94,7 @@ T1=$(date +%s)
 READY1=$(grep -oE "ready=[0-9]+" "$EVID/01-wave1.txt" | tail -1 | cut -d= -f2)
 [ "${READY1:-0}" -ge "$JOBS" ] && ok "wave 1: all $JOBS jobs Ready in $((T1-T0))s (includes bring-up of namespaces)" \
     || bad "wave 1 incomplete: $READY1/$JOBS Ready"
-check_invariant wave1
+check_invariant wave1 "$JOBS"
 $SSH "$KC; kubectl get pods -n vgpu-system -l control-plane=vgpu-scheduler -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{\" \"}{end}'" > "$EVID/01-restarts.txt"
 grep -qE "^0 0 ?$" "$EVID/01-restarts.txt" && ok "scheduler survived wave 1 (0 restarts)" || bad "scheduler restarted under wave 1: $(cat "$EVID/01-restarts.txt")"
 
@@ -104,7 +128,7 @@ $SSH "$KC
             print \"full=\"full, \"zero=\"zero, \"partial=\"part }'" | tee "$EVID/04-gang-settle.txt"
 grep -q "partial=0" "$EVID/04-gang-settle.txt" && ok "gang all-or-nothing held at scale: $(grep -oE 'full=[0-9]+ zero=[0-9]+' "$EVID/04-gang-settle.txt")" \
     || bad "PARTIAL gang admission detected at scale"
-check_invariant wave2
+check_invariant wave2 "$JOBS"
 
 say "5. CHURN: delete $CHURN random solos, submit $CHURN replacements"
 $SSH "$KC
@@ -117,7 +141,7 @@ $SSH "$KC
   sleep 150
   kubectl get vgpuslices -A --no-headers 2>/dev/null | grep -c ' Ready' | sed 's/^/ready_after_churn=/'" | tee "$EVID/05-churn.txt" | tail -2
 grep -q "CHURNED=$CHURN" "$EVID/05-churn.txt" && ok "churn wave executed" || bad "churn failed"
-check_invariant churn
+check_invariant churn "$(( JOBS - CHURN ))"
 $SSH "$KC; kubectl get pods -n vgpu-system -l control-plane=vgpu-scheduler -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{\" \"}{end}'; echo" > "$EVID/05-restarts.txt"
 ok "final scheduler restart counts: $(cat "$EVID/05-restarts.txt" | tr -d '\n') (1 expected: the deliberate leader kill)"
 
