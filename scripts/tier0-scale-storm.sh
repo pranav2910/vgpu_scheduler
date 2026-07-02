@@ -49,8 +49,15 @@ $SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/mai
   CLUSTER=vgpu-storm WORKERS=$WORKERS bash scripts/kind-multinode-up.sh
   kubectl set env ds/vgpu-nodeagent -n vgpu-system VGPU_FAKE_GPU_COUNT=$GPUS_PER_NODE
   kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=300s >/dev/null
-  sleep 20   # agents re-advertise multi-GPU capacity
-  TOTAL=\$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.capacity.vgpu\.pranav2910\.com/vram}{\"\n\"}{end}' | awk '{s+=\$1} END{print s}')
+  # node capacity on kind is a STATIC status patch (agents don't drive it):
+  # advertise count x 80Gi per worker — the D4-validated multi-fake-GPU recipe
+  PERNODE=\$(( $GPUS_PER_NODE * 85899345920 ))
+  for n in \$(kubectl get nodes --no-headers -o custom-columns=:metadata.name | grep worker); do
+    kubectl patch node \$n --subresource=status --type=merge \
+      -p "{\"status\":{\"capacity\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"\$PERNODE\"},\"allocatable\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"\$PERNODE\"}}}" >/dev/null
+  done
+  sleep 15   # scheduler's node reconciler picks up the new capacity
+  TOTAL=\$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}{\"\n\"}{end}' | awk '{s+=\$1} END{print s}')
   echo CLUSTER_CAPACITY_BYTES=\$TOTAL" > "$EVID/00-bringup.log" 2>&1
 CAP=$(grep -oE "CLUSTER_CAPACITY_BYTES=[0-9]+" "$EVID/00-bringup.log" | cut -d= -f2)
 if [ -n "${CAP:-}" ] && [ "$CAP" -ge 1000000000000 ]; then
@@ -67,7 +74,7 @@ check_invariant() {
     $SSH "$KC
       kubectl get vgpuslices -A -o jsonpath='{range .items[?(@.status.phase==\"Ready\")]}{.spec.nodeName}{\" \"}{.status.allocatedBytes}{\"\n\"}{end}' \
         | awk 'NF==2 {a[\$1]+=\$2} END {for (n in a) print n, a[n]}' > /tmp/alloc.txt
-      kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.capacity.vgpu\.pranav2910\.com/vram}{\"\n\"}{end}' > /tmp/cap.txt
+      kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}{\"\n\"}{end}' > /tmp/cap.txt
       READY=\$(kubectl get vgpuslices -A --no-headers 2>/dev/null | grep -c ' Ready' || true)
       echo READY_COUNT=\$READY
       awk 'NR==FNR {cap[\$1]=\$2; next} {if (\$2 > cap[\$1]) {print \"OVERCOMMIT\", \$1, \$2, cap[\$1]; bad=1}} END {exit bad}' /tmp/cap.txt /tmp/alloc.txt \
