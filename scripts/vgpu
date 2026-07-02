@@ -653,10 +653,14 @@ cmd_doctor() {
     else
         local comp
         for comp in vgpu-scheduler vgpu-controller; do
+            if ! kubectl get deploy "$comp" -n vgpu-system >/dev/null 2>&1; then
+                warnc "$comp not installed (agent-only setup — fine for monitor/enforcement without scheduling)"
+                continue
+            fi
             local r a
-            r="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
-            a="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)"
-            [[ "${r:-0}" == "$a" && -n "$r" ]] && okc "$comp ready ($r/$a)" || badc "$comp not ready (${r:-0}/$a) — kubectl logs -n vgpu-system deploy/$comp"
+            r="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
+            a="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.spec.replicas}' 2>/dev/null)"
+            [[ -n "$r" && "$r" == "$a" ]] && okc "$comp ready ($r/$a)" || badc "$comp not ready (${r:-0}/${a:-?}) — kubectl logs -n vgpu-system deploy/$comp"
         done
         local crds
         crds="$(kubectl get crd -o name 2>/dev/null | grep -c 'infrastructure.pranav2910.com' || true)"
