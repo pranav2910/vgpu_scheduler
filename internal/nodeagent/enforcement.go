@@ -431,10 +431,23 @@ func (d *SliceViolationDetector) evictViaAPI(ctx context.Context, nn types.Names
 // correct authority for an enforcement carve-out.
 func (d *SliceViolationDetector) isExempt(ctx context.Context, nn types.NamespacedName) bool {
 	var ns corev1.Namespace
-	if err := d.apiReader.Get(ctx, types.NamespacedName{Name: nn.Namespace}, &ns); err == nil && ns.Labels[enforcementExemptLabel] == "true" {
+	err := d.apiReader.Get(ctx, types.NamespacedName{Name: nn.Namespace}, &ns)
+	switch {
+	case err == nil:
+		return ns.Labels[enforcementExemptLabel] == "true"
+	case apierrors.IsNotFound(err):
+		// Namespace genuinely gone (its pods are terminating anyway): no
+		// namespace means no exemption label — not-exempt is correct.
+		return false
+	default:
+		// FAIL CLOSED (scan finding): this gates a DESTRUCTIVE step. A
+		// transient Get error (throttle, timeout, RBAC blip) must read as
+		// "couldn't verify the exemption — do NOT evict this cycle", not as
+		// "not exempt". The violation stays marked; eviction retries next
+		// cycle once the API answers.
+		log.Printf("[enforce] exemption check for ns %s failed (%v) — treating as EXEMPT this cycle (fail closed)", nn.Namespace, err)
 		return true
 	}
-	return false
 }
 
 // evictionAllowed reports whether the per-node eviction budget has headroom,

@@ -256,6 +256,59 @@ func TestEnforce_ExemptNamespaceNotEvicted(t *testing.T) {
 	}
 }
 
+// nsErroringClient wraps a client.Client but fails every Namespace Get with a
+// transient server error — simulating an API throttle/timeout exactly when the
+// eviction gate checks the exemption label.
+type nsErroringClient struct{ client.Client }
+
+func (n nsErroringClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Namespace); ok {
+		return apierrors.NewInternalError(context.DeadlineExceeded)
+	}
+	return n.Client.Get(ctx, key, obj, opts...)
+}
+
+// Regression (scan finding): the exemption check gates a DESTRUCTIVE step, so
+// it must FAIL CLOSED — a transient error verifying the namespace label means
+// "do not evict this cycle", never "not exempt". Before the fix, an API blip
+// during the check evicted an explicitly protected pod.
+func TestEnforce_ExemptionCheckErrorFailsClosed(t *testing.T) {
+	d, c := fixture(t, 12*giB)
+	d.apiReader = nsErroringClient{c} // namespace Gets error transiently
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	evictCalled := false
+	d.evictFn = func(context.Context, types.NamespacedName) error { evictCalled = true; return nil }
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if evictCalled {
+		t.Fatalf("eviction proceeded while the exemption check was erroring — must fail closed")
+	}
+}
+
+// The flip side: a genuinely ABSENT namespace (NotFound) is not an error state
+// — no namespace, no label, not exempt — eviction proceeds. Guards against
+// over-correcting fail-closed into never-evict.
+func TestEnforce_MissingNamespaceIsNotExempt(t *testing.T) {
+	d, _ := fixture(t, 12*giB)
+	// fixture's fake client contains no Namespace object → Get returns NotFound.
+	d.enforceMode = EnforcementEvict
+	clock := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return clock }
+	evictCalled := false
+	d.evictFn = func(context.Context, types.NamespacedName) error { evictCalled = true; return nil }
+	ctx := context.Background()
+
+	driveToEviction(t, ctx, d, &clock)
+
+	if !evictCalled {
+		t.Fatalf("NotFound namespace must read as not-exempt — eviction should proceed")
+	}
+}
+
 // Regression (audit security fix): a pod labeling ITSELF exempt must NOT dodge
 // eviction — self-exemption was a hole that let any workload owner opt out of
 // the only hard VRAM-reclamation mechanism. Only the namespace label counts.
