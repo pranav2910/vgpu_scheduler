@@ -85,3 +85,43 @@ func TestMutatePodPinsDeviceEnvOverAnyExistingValue(t *testing.T) {
 		t.Fatalf("CDI annotation = %q, want it to reference alloc-abc-123", got)
 	}
 }
+
+// Regression (Gate-3 receipt finding): the webhook must stamp the granted VRAM
+// onto the pod. Monitor mode is pods-RBAC-only — it cannot read VGPUClaims — so
+// without this annotation a VGPUJob pod that isn't actively using VRAM was
+// entirely invisible to the waste report (source=vgpu_claim never fired live).
+func TestMutatePodStampsRequestedVRAMForMonitor(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := vgpuv1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	slice := &vgpuv1alpha1.VGPUSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "job1-claim-slice", Namespace: "ns1"},
+		Spec:       vgpuv1alpha1.VGPUSliceSpec{RequestedVRAMBytes: 17179869184}, // 16 GiB
+		Status: vgpuv1alpha1.VGPUSliceStatus{
+			Phase:        "Ready",
+			AllocationID: "alloc-abc-123",
+			DeviceUUID:   "GPU-CARD-SEVEN",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(slice).Build()
+	m := &PodMutator{Client: cl}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "w", Namespace: "ns1",
+			Annotations: map[string]string{VGPUClaimAnnotation: "job1-claim"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+	}
+	if err := m.MutatePod(context.Background(), pod); err != nil {
+		t.Fatalf("MutatePod: %v", err)
+	}
+	got := pod.Annotations["infrastructure.pranav2910.com/requested-vram-bytes"]
+	if got != "17179869184" {
+		t.Fatalf("requested-vram-bytes annotation = %q, want 17179869184 (the monitor's vgpu_claim source reads exactly this key)", got)
+	}
+}

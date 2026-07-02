@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -93,6 +94,14 @@ func (m *PodMutator) MutatePod(ctx context.Context, pod *corev1.Pod) error {
 		"sliceName":    slice.Name,
 	})
 	pod.Annotations["infrastructure.pranav2910.com/allocation-info"] = string(payload)
+
+	// Stamp the pod's granted VRAM so MONITOR MODE can attribute it (source=
+	// vgpu_claim). The monitor is deliberately pods-RBAC-only — it cannot read
+	// VGPUClaims — so the request must live ON the pod. Gate-3 receipt finding:
+	// without this stamp, a VGPUJob pod that isn't actively using VRAM was
+	// entirely invisible to the waste report ("works on VGPUJob pods" DoD).
+	pod.Annotations["infrastructure.pranav2910.com/requested-vram-bytes"] =
+		strconv.FormatInt(slice.Spec.RequestedVRAMBytes, 10)
 
 	log.Printf("Pod %s/%s mutated for vGPU claim %s (alloc=%s)",
 		pod.Namespace, pod.Name, claimName, slice.Status.AllocationID)
