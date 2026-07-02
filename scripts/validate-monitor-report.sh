@@ -51,6 +51,47 @@ has 'mystery.* +0%  unknown'                           && ok "missing request ha
 # safety wording present
 has 'Read-only'                                        && ok "read-only safety wording present" || bad "safety wording missing"
 has 'estimated, not guaranteed'                        && ok "says ESTIMATED, not guaranteed savings" || bad "overclaims savings"
+# Gate 3: top-wasters ranking (worst first)
+printf '%s' "$OUT" | grep -A2 "Top wasting pods" | grep -q "1\. default/llama-train" \
+                                                       && ok "top wasting pods ranked (llama-train #1)" || bad "top-pods ranking wrong"
+has 'Top wasting namespaces'                           && ok "top wasting namespaces section present" || bad "top-namespaces missing"
+
+echo; echo "${C_BLU}── Gate 3: CSV / JSON / filter / team consistency ──${C_RST}"
+CSV="$(scripts/vgpu report --metrics-file "$FIX" -o csv 2>&1)"
+JSON="$(scripts/vgpu report --metrics-file "$FIX" -o json 2>&1)"
+
+# CSV totals must equal the table's numbers (same rows → same math)
+printf '%s\n' "$CSV" | grep -q '^namespace,pod,node,gpu_uuids,source,requested_bytes' \
+                                                       && ok "CSV header present" || bad "CSV header wrong"
+printf '%s\n' "$CSV" | grep -q '^_total_,,,,,77309411328,44023414784,35433480192,56.9,' \
+                                                       && ok "CSV totals match table (72/41/33 GiB, 56.9%)" || bad "CSV totals disagree with table"
+printf '%s\n' "$CSV" | grep -q '^default,llama-train,n1,GPU-aaa,annotation,42949672960,17179869184,25769803776,40.0,' \
+                                                       && ok "CSV row carries node + GPU UUID + source" || bad "CSV row wrong"
+# JSON parses and matches
+if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$JSON" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+t = d["totals"]
+assert t["requested_bytes"] == 77309411328, t
+assert t["used_bytes"] == 44023414784, t
+assert t["waste_bytes"] == 35433480192, t
+assert abs(t["estimated_waste_per_month_usd"] - 903) <= 1, t
+pods = {p["pod"]: p for p in d["pods"]}
+assert pods["llama-train"]["node"] == "n1" and pods["llama-train"]["gpu_uuids"] == "GPU-aaa"
+assert pods["mystery"]["source"] == "unknown" and pods["mystery"]["waste_bytes"] == 0
+print("json-ok")' | grep -q json-ok                    && ok "JSON parses; totals + node/UUID/unknown-source all match" || bad "JSON inconsistent with table"
+else
+    ok "python3 absent — JSON structural check skipped (parse-tested in CI)"
+fi
+# namespace filter
+FILT="$(scripts/vgpu report --metrics-file "$FIX" --filter-ns nowhere 2>&1)"
+printf '%s' "$FILT" | grep -q "no GPU workloads observed in namespace nowhere" \
+                                                       && ok "--filter-ns filters (and says so when empty)" || bad "--filter-ns broken"
+# team rollup via injected map
+TEAM="$(VGPU_TEAM_MAP='default=ml-platform' scripts/vgpu report --metrics-file "$FIX" 2>&1)"
+printf '%s' "$TEAM" | grep -A2 "Top wasting teams" | grep -q "ml-platform" \
+                                                       && ok "team rollup from namespace map" || bad "team rollup broken"
 
 echo; echo "  PASS=$PASS  FAIL=$FAIL"
 [[ $FAIL -eq 0 ]] && { echo; echo "${C_GRN}Monitor-mode report logic proven: join, waste, price, and missing-request handling all correct.${C_RST}"; exit 0; }

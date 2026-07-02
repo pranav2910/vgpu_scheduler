@@ -80,7 +80,11 @@ USAGE:
   vgpu submit --name NAME --vram SIZE --image IMAGE [options]
   vgpu status  NAME [-n NAMESPACE]
   vgpu profile NAME [-n NAMESPACE]
-  vgpu report  [-n NAMESPACE] [--price-per-gpu-hour N]   # read-only GPU waste report (monitor mode)
+  vgpu report  [--price-per-gpu-hour N] [-o table|csv|json]
+               [--filter-ns NS] [--top N] [-n MONITOR_NS]  # read-only GPU waste report: per-pod
+                                                           # requested-vs-used + node + GPU UUID,
+                                                           # top wasting pods/namespaces/teams
+                                                           # (teams: namespace label, VGPU_TEAM_LABEL)
   vgpu install monitor [--no-wait] [--manifest PATH]     # install the read-only monitor DaemonSet
   vgpu uninstall monitor                                 # remove it COMPLETELY (verified; incl. cluster-scoped RBAC)
   vgpu doctor                                            # diagnose the cluster: every missing dependency, with a fix
@@ -394,16 +398,24 @@ report_scrape() { # namespace — scrape every monitor agent's :8083/metrics via
 }
 
 cmd_report() {
-    local ns="vgpu-monitor" price="3.00" metrics_file=""
+    # Gate 3: the report as a product. One scrape → one awk that joins
+    # requested/used per pod (with node + GPU UUIDs), then renders table, CSV,
+    # or JSON from the SAME rows so the three outputs can never disagree.
+    set +e
+    local ns="vgpu-monitor" price="3.00" metrics_file="" output="table" filter_ns="" top=5
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n|--namespace)        ns="$2"; shift 2 ;;
+            -n|--namespace|--monitor-ns) ns="$2"; shift 2 ;;   # where the monitor DaemonSet lives
             --price-per-gpu-hour)  price="$2"; shift 2 ;;
             --metrics-file)        metrics_file="$2"; shift 2 ;;  # read metrics from a file (testing)
+            -o|--output)           output="$2"; shift 2 ;;        # table | csv | json
+            --filter-ns)           filter_ns="$2"; shift 2 ;;     # only workloads in this namespace
+            --top)                 top="$2"; shift 2 ;;           # size of the top-wasters lists
             -h|--help)             usage; exit 0 ;;
             *)                     die "unknown report flag: $1" ;;
         esac
     done
+    case "$output" in table|csv|json) ;; *) die "--output must be table, csv, or json" ;; esac
 
     local metrics
     if [[ -n "$metrics_file" ]]; then
@@ -415,7 +427,17 @@ cmd_report() {
     fi
     [[ -n "$metrics" ]] || die "no vgpu_monitor_* metrics found (is the monitor DaemonSet installed in ns '$ns'? see docs/monitor-mode.md)"
 
-    printf '%s\n' "$metrics" | awk -v price="$price" '
+    # Optional team map: "ns=team,ns2=team2". Live clusters derive it from the
+    # namespace label (VGPU_TEAM_LABEL, default "team"); tests inject VGPU_TEAM_MAP.
+    local team_map="${VGPU_TEAM_MAP:-}"
+    if [[ -z "$team_map" && -z "$metrics_file" ]]; then
+        local tl="${VGPU_TEAM_LABEL:-team}"
+        team_map="$(kubectl get namespaces -o jsonpath="{range .items[*]}{.metadata.name}={.metadata.labels.$tl},{end}" 2>/dev/null \
+            | tr ',' '\n' | grep -vE '=$|^$' | paste -sd, - 2>/dev/null)"
+    fi
+
+    printf '%s\n' "$metrics" | awk -v price="$price" -v output="$output" -v filter_ns="$filter_ns" \
+                                   -v topn="$top" -v team_map="$team_map" '
         function lbl(line, name,   re, m) {
             re = name "=\"[^\"]*\""
             if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub(name "=\"", "", m); sub("\"$", "", m); return m }
@@ -423,30 +445,132 @@ cmd_report() {
         }
         function val(line,   n) { n = line; sub(/^[^ ]+ /, "", n); return n + 0 }
         function gib(b) { return sprintf("%.1f", b / 1073741824) }
-        /^vgpu_monitor_pod_requested_vram_bytes\{/ { k = lbl($0,"namespace") "/" lbl($0,"pod"); req[k] = val($0); src[k] = lbl($0,"source"); seen[k] = 1 }
-        /^vgpu_monitor_pod_used_vram_bytes\{/      { k = lbl($0,"namespace") "/" lbl($0,"pod"); used[k] += val($0); seen[k] = 1 }
-        /^vgpu_monitor_gpu_total_vram_bytes\{/     { v = val($0); gtotal += v; if (v > card) card = v }
+        BEGIN {
+            nteams = split(team_map, tm_pairs, ",")
+            for (i = 1; i <= nteams; i++) {
+                split(tm_pairs[i], kv, "=")
+                if (kv[1] != "") team_of[kv[1]] = kv[2]
+            }
+        }
+        /^vgpu_monitor_pod_requested_vram_bytes\{/ {
+            k = lbl($0,"namespace") "/" lbl($0,"pod")
+            req[k] = val($0); src[k] = lbl($0,"source"); nodeof[k] = lbl($0,"node"); seen[k] = 1
+        }
+        /^vgpu_monitor_pod_used_vram_bytes\{/ {
+            k = lbl($0,"namespace") "/" lbl($0,"pod")
+            used[k] += val($0); seen[k] = 1
+            if (nodeof[k] == "") nodeof[k] = lbl($0,"node")
+            u = lbl($0,"gpu_uuid")
+            if (u != "" && index(uuids[k], u) == 0) uuids[k] = (uuids[k] == "" ? u : uuids[k] ";" u)
+        }
+        /^vgpu_monitor_gpu_total_vram_bytes\{/ { v = val($0); gtotal += v; if (v > card) card = v }
         END {
-            print ""
-            print "Cluster GPU Waste Report  (read-only — no scheduling, no mutation, no eviction)"
-            print ""
-            printf "  %-26s %12s %12s %12s %6s  %s\n", "WORKLOAD (ns/pod)", "REQUESTED", "USED", "WASTE", "UTIL", "SOURCE"
+            # ── one pass: rows + aggregates (identical for every output mode) ──
             n = 0
             for (k in seen) {
+                split(k, parts, "/"); kns = parts[1]
+                if (filter_ns != "" && kns != filter_ns) continue
                 r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
                 ut = (r > 0) ? (u * 100.0 / r) : 0
-                treq += r; tused += u; twaste += w; n++
+                treq += r; tused += u; twaste += w
+                n++; key[n] = k; kw[n] = w
+                nsreq[kns] += r; nsused[kns] += u; nswaste[kns] += w
+                t = (kns in team_of) ? team_of[kns] : ""
+                if (t != "") { teamreq[t] += r; teamused[t] += u; teamwaste[t] += w; have_teams = 1 }
+            }
+            # order row indices by waste desc (simple selection sort; n is small)
+            for (i = 1; i <= n; i++) order[i] = i
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
+                if (kw[order[j]] > kw[order[i]]) { tmp = order[i]; order[i] = order[j]; order[j] = tmp }
+            ut_all = (treq > 0) ? (tused * 100.0 / treq) : 0
+            cards  = (card > 0) ? (twaste / card) : 0
+            permo  = cards * price * 730.0
+
+            # ── CSV ──────────────────────────────────────────────────────────
+            if (output == "csv") {
+                print "namespace,pod,node,gpu_uuids,source,requested_bytes,used_bytes,waste_bytes,utilization_pct,team"
+                for (i = 1; i <= n; i++) {
+                    k = key[order[i]]; split(k, parts, "/")
+                    r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                    ut = (r > 0) ? (u * 100.0 / r) : 0
+                    t = (parts[1] in team_of) ? team_of[parts[1]] : ""
+                    printf "%s,%s,%s,%s,%s,%.0f,%.0f,%.0f,%.1f,%s\n", parts[1], parts[2], nodeof[k], uuids[k], (src[k]==""?"unknown":src[k]), r, u, w, ut, t
+                }
+                printf "_total_,,,,,%.0f,%.0f,%.0f,%.1f,\n", treq, tused, twaste, ut_all
+                exit
+            }
+            # ── JSON ─────────────────────────────────────────────────────────
+            if (output == "json") {
+                printf "{\n  \"price_per_gpu_hour\": %s,\n  \"pods\": [", price
+                for (i = 1; i <= n; i++) {
+                    k = key[order[i]]; split(k, parts, "/")
+                    r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                    ut = (r > 0) ? (u * 100.0 / r) : 0
+                    t = (parts[1] in team_of) ? team_of[parts[1]] : ""
+                    printf "%s\n    {\"namespace\": \"%s\", \"pod\": \"%s\", \"node\": \"%s\", \"gpu_uuids\": \"%s\", \"source\": \"%s\", \"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"team\": \"%s\"}", (i>1?",":""), parts[1], parts[2], nodeof[k], uuids[k], (src[k]==""?"unknown":src[k]), r, u, w, ut, t
+                }
+                printf "\n  ],\n  \"namespaces\": ["
+                first = 1
+                for (kns in nsreq) {
+                    printf "%s\n    {\"namespace\": \"%s\", \"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f}", (first?"":","), kns, nsreq[kns], nsused[kns], nswaste[kns]
+                    first = 0
+                }
+                printf "\n  ],\n  \"totals\": {\"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"estimated_waste_per_month_usd\": %.0f, \"cards_idle_equivalent\": %.2f}\n}\n", treq, tused, twaste, ut_all, permo, cards
+                exit
+            }
+            # ── table (default) ──────────────────────────────────────────────
+            print ""
+            print "Cluster GPU Waste Report  (read-only — no scheduling, no mutation, no eviction)"
+            if (filter_ns != "") printf "  [filtered to namespace: %s]\n", filter_ns
+            print ""
+            printf "  %-26s %12s %12s %12s %6s  %s\n", "WORKLOAD (ns/pod)", "REQUESTED", "USED", "WASTE", "UTIL", "SOURCE"
+            for (i = 1; i <= n; i++) {
+                k = key[order[i]]
+                r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                ut = (r > 0) ? (u * 100.0 / r) : 0
                 printf "  %-26s %9s GiB %9s GiB %9s GiB %5.0f%%  %s\n", k, gib(r), gib(u), gib(w), ut, (src[k] == "" ? "unknown" : src[k])
             }
-            if (n == 0) print "  (no GPU workloads observed yet)"
-            ut = (treq > 0) ? (tused * 100.0 / treq) : 0
-            cards = (card > 0) ? (twaste / card) : 0
-            permo = cards * price * 730.0
+            if (n == 0) print "  (no GPU workloads observed" (filter_ns != "" ? " in namespace " filter_ns : "") " yet)"
+            print ""
+            # top wasting pods
+            shown = 0
+            for (i = 1; i <= n && shown < topn; i++) {
+                k = key[order[i]]
+                if (kw[order[i]] <= 0) break
+                if (shown == 0) print "  Top wasting pods:"
+                shown++
+                printf "    %d. %-30s %8s GiB wasted\n", shown, k, gib(kw[order[i]])
+            }
+            # top wasting namespaces
+            m = 0
+            for (kns in nsreq) { m++; nk[m] = kns }
+            for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++)
+                if (nswaste[nk[j]] > nswaste[nk[i]]) { tmp = nk[i]; nk[i] = nk[j]; nk[j] = tmp }
+            shown = 0
+            for (i = 1; i <= m && shown < topn; i++) {
+                if (nswaste[nk[i]] <= 0) break
+                if (shown == 0) print "  Top wasting namespaces:"
+                shown++
+                printf "    %d. %-30s %8s GiB wasted\n", shown, nk[i], gib(nswaste[nk[i]])
+            }
+            if (have_teams) {
+                tn = 0
+                for (t in teamwaste) { tn++; tk[tn] = t }
+                for (i = 1; i <= tn; i++) for (j = i + 1; j <= tn; j++)
+                    if (teamwaste[tk[j]] > teamwaste[tk[i]]) { tmp = tk[i]; tk[i] = tk[j]; tk[j] = tmp }
+                shown = 0
+                for (i = 1; i <= tn && shown < topn; i++) {
+                    if (teamwaste[tk[i]] <= 0) break
+                    if (shown == 0) print "  Top wasting teams (namespace label):"
+                    shown++
+                    printf "    %d. %-30s %8s GiB wasted\n", shown, tk[i], gib(teamwaste[tk[i]])
+                }
+            }
             print ""
             printf "  GPU memory requested:     %s GiB\n", gib(treq)
             printf "  GPU memory actually used: %s GiB\n", gib(tused)
             printf "  Estimated waste:          %s GiB\n", gib(twaste)
-            printf "  Utilization:              %.1f%%\n", ut
+            printf "  Utilization:              %.1f%%\n", ut_all
             printf "  Estimated waste/month:    $%.0f   (at $%.2f/GPU-hr, ~%.2f cards idle)\n", permo, price, cards
             print ""
             print "  Estimated, not guaranteed savings. Read-only; runs alongside Kubernetes, KAI, Volcano, or Slurm-on-K8s."
