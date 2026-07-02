@@ -13,7 +13,12 @@ import (
 var ErrCorruptCheckpoint = errors.New("checkpoint file is corrupt")
 
 const (
-	defaultCheckpointDir = "/var/run/vgpu-state"
+	// /var/lib (persistent), NOT /var/run (tmpfs): the checkpoint is the
+	// allocator's restart-survival memory — it must outlive the container AND
+	// the node reboot, and it only can if the DaemonSet hostPath-mounts this
+	// exact path (scan finding: it never was mounted, so every checkpoint died
+	// with the container and a restarted agent over-committed real VRAM).
+	defaultCheckpointDir = "/var/lib/vgpu-state"
 	CheckpointDir        = defaultCheckpointDir
 	CheckpointFile       = "allocations.json"
 )

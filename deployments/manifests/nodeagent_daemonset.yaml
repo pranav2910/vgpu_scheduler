@@ -40,12 +40,20 @@ spec:
         volumeMounts:
         - name: cdi-dir
           mountPath: /var/run/cdi
+        # Checkpoint persistence (scan fix): without this mount the allocator's
+        # restart-survival file dies with the container -> over-commit on restart.
+        - name: checkpoint-dir
+          mountPath: /var/lib/vgpu-state
         - name: dev-dir
           mountPath: /dev
       volumes:
       - name: cdi-dir
         hostPath:
           path: /var/run/cdi
+      - name: checkpoint-dir
+        hostPath:
+          path: /var/lib/vgpu-state
+          type: DirectoryOrCreate
           type: DirectoryOrCreate
       - name: dev-dir
         hostPath:

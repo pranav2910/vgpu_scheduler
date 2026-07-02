@@ -91,7 +91,7 @@ func allocatedVRAM(t *testing.T, c *scheduler.VRAMCache, node string) int64 {
 }
 
 // tempCheckpointStore creates a checkpoint.Store that writes to a temp dir
-// so tests are hermetic and don't touch /var/run/vgpu-state.
+// so tests are hermetic and don't touch /var/lib/vgpu-state.
 func tempCheckpointStore(t *testing.T) *checkpoint.Store {
 	t.Helper()
 	dir := t.TempDir()
