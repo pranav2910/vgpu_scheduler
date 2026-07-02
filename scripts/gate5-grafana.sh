@@ -75,6 +75,15 @@ $SSH 'for i in $(seq 1 6); do
   done; echo "$out" | head -c 160; echo' | tee "$EVID/04-dash.txt"
 grep -q "DASH_SERVED=yes" "$EVID/04-dash.txt" && ok "dashboard provisioned + served" || bad "dashboard not found in grafana"
 
+say "4b. panels can RESOLVE their pinned datasource (scan-fix #4 receipt)"
+# The v0.18 bug: panels pin uid "prometheus" but provisioning never assigned it
+# — dashboard loaded, every panel errored. Assert the uid resolves AND a query
+# THROUGH grafana's proxy returns data (what a panel actually does).
+$SSH 'curl -s -u admin:gate5-receipt http://localhost:3000/api/datasources/uid/prometheus | head -c 120; echo
+  curl -s -u admin:gate5-receipt "http://localhost:3000/api/datasources/proxy/uid/prometheus/api/v1/query?query=count(vgpu_monitor_gpu_total_vram_bytes)" | grep -c "\"value\"" | sed "s/^/PROXY_RESULTS=/"' | tee "$EVID/04b-datasource.txt"
+grep -q '"uid":"prometheus"' "$EVID/04b-datasource.txt" && ok "datasource uid 'prometheus' resolves in grafana" || bad "pinned datasource uid does NOT resolve (panels would all error)"
+grep -qE "PROXY_RESULTS=[1-9]" "$EVID/04b-datasource.txt" && ok "query THROUGH grafana's datasource proxy returns data (panels render)" || bad "grafana->prometheus proxy query empty"
+
 say "5. numbers match: prometheus requested-total vs vgpu report (±1%)"
 $SSH "$KC
   P=\$(curl -s 'http://localhost:9090/api/v1/query?query=sum(vgpu_monitor_pod_requested_vram_bytes)' | grep -oE '\"[0-9.e+]+\"\]' | tr -d '\"]')
