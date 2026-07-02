@@ -45,6 +45,24 @@ PYEOF
 [[ -f deployments/grafana/provisioning/datasources/prometheus.yaml ]] && ok "datasource provisioning present" || bad "datasource provisioning missing"
 [[ -f deployments/grafana/provisioning/dashboards/provider.yaml ]] && ok "dashboard provider present" || bad "dashboard provider missing"
 grep -q "kubeconfig" deployments/prometheus.yml && ok "prometheus uses kubeconfig pod discovery" || bad "prometheus config stale"
+# scan finding: panels pin a datasource uid — provisioning MUST assign that uid
+DUID=$(python3 -c 'import json;d=json.load(open("deployments/grafana/dashboards/vgpu-waste.json"));ps=[p for p in d["panels"] if p.get("type")!="row"];print(ps[0]["datasource"]["uid"])')
+grep -q "uid: $DUID" deployments/grafana/provisioning/datasources/prometheus.yaml \
+  && ok "provisioned datasource uid matches the panels' pin ($DUID)" \
+  || bad "datasource uid $DUID pinned by panels but NOT provisioned — every panel errors"
+# scan finding: waste exprs must tolerate absent used-series (100%-waste pods)
+python3 - <<'PYEOF'
+import json, sys
+d = json.load(open("deployments/grafana/dashboards/vgpu-waste.json"))
+bad = []
+for p in d["panels"]:
+    for t in p.get("targets", []):
+        e = t.get("expr", "")
+        if "pod_used_vram_bytes" in e and "-" in e and " or " not in e:
+            bad.append(p["title"])
+sys.exit(1 if bad else 0)
+PYEOF
+[[ $? -eq 0 ]] && ok "all waste subtractions tolerate absent used-series (or-fallback)" || bad "a waste expr still drops idle pods"
 grep -q "grafana/dashboards" deployments/docker-compose.yaml && ok "compose mounts the dashboards dir" || bad "compose mount missing"
 
 echo; echo "  PASS=$PASS FAIL=$FAIL"

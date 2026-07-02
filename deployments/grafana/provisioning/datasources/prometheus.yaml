@@ -2,6 +2,9 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    # Panels pin datasource uid "prometheus"; without this line Grafana assigns
+    # a random uid and EVERY panel errors "datasource not found" (scan finding).
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true

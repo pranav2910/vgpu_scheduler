@@ -101,7 +101,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(vgpu_monitor_pod_used_vram_bytes)",
+          "expr": "sum(vgpu_monitor_pod_used_vram_bytes) or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -140,7 +140,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "clamp_min(sum(vgpu_monitor_pod_requested_vram_bytes) - sum(vgpu_monitor_pod_used_vram_bytes), 0)",
+          "expr": "clamp_min(sum(vgpu_monitor_pod_requested_vram_bytes) - (sum(vgpu_monitor_pod_used_vram_bytes) or vector(0)), 0)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -179,7 +179,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "clamp_min(sum(vgpu_monitor_pod_requested_vram_bytes) - sum(vgpu_monitor_pod_used_vram_bytes), 0) / max(vgpu_monitor_gpu_total_vram_bytes) * $price * 730",
+          "expr": "clamp_min(sum(vgpu_monitor_pod_requested_vram_bytes) - (sum(vgpu_monitor_pod_used_vram_bytes) or vector(0)), 0) / max(vgpu_monitor_gpu_total_vram_bytes) * $price * 730",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -218,7 +218,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(vgpu_monitor_pod_used_vram_bytes) / sum(vgpu_monitor_pod_requested_vram_bytes)",
+          "expr": "100 * (sum(vgpu_monitor_pod_used_vram_bytes) or vector(0)) / sum(vgpu_monitor_pod_requested_vram_bytes)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -267,7 +267,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum(vgpu_monitor_pod_used_vram_bytes)",
+          "expr": "sum(vgpu_monitor_pod_used_vram_bytes) or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -333,7 +333,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (namespace, pod) (vgpu_monitor_pod_requested_vram_bytes) - sum by (namespace, pod) (vgpu_monitor_pod_used_vram_bytes))",
+          "expr": "topk(10, sum by (namespace, pod) (vgpu_monitor_pod_requested_vram_bytes) - (sum by (namespace, pod) (vgpu_monitor_pod_used_vram_bytes) or sum by (namespace, pod) (vgpu_monitor_pod_requested_vram_bytes) * 0))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -374,7 +374,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (namespace) (vgpu_monitor_pod_requested_vram_bytes) - sum by (namespace) (vgpu_monitor_pod_used_vram_bytes))",
+          "expr": "topk(10, sum by (namespace) (vgpu_monitor_pod_requested_vram_bytes) - (sum by (namespace) (vgpu_monitor_pod_used_vram_bytes) or sum by (namespace) (vgpu_monitor_pod_requested_vram_bytes) * 0))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
