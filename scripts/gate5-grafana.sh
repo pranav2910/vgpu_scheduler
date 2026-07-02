@@ -31,10 +31,13 @@ grep -q "MONITOR_READY=yes" "$EVID/00-setup.txt" && ok "monitor ready" || bad "m
 say "0b. plant a GPU workload so pod-level panels have data"
 $SSH "$KC
   kubectl delete pod g5-waste --ignore-not-found >/dev/null 2>&1
-  kubectl run g5-waste --image=nvidia/cuda:12.4.1-base-ubuntu22.04 --restart=Never \
+  kubectl run g5-waste --image=pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime --restart=Never \
     --annotations=gpu-memory=8000 --overrides='{\"spec\":{\"runtimeClassName\":\"nvidia\"}}' \
-    -- sleep 600 >/dev/null 2>&1
-  sleep 45; echo PLANTED=yes" | tee "$EVID/00b-workload.txt"
+    -- python -c 'import torch,time; x=torch.empty(int(3*1024**3)//2, dtype=torch.float16, device=\"cuda\").normal_(); torch.cuda.synchronize(); print(\"holding ~3GiB\", flush=True); time.sleep(900)' >/dev/null 2>&1
+  for i in \$(seq 1 40); do
+    [ \"\$(kubectl get pod g5-waste -o jsonpath='{.status.phase}' 2>/dev/null)\" = Running ] && break; sleep 4
+  done
+  sleep 70; echo PLANTED=yes" | tee "$EVID/00b-workload.txt"
 grep -q "PLANTED=yes" "$EVID/00b-workload.txt" && ok "workload planted (8000 MiB annotated)" || bad "workload plant failed"
 
 say "1. docker compose up (prometheus + grafana; password injected, never committed)"
@@ -68,9 +71,9 @@ $SSH 'for q in "sum(vgpu_monitor_pod_requested_vram_bytes)" "sum(vgpu_monitor_po
 say "4. grafana serves the provisioned dashboard (uid vgpu-waste)"
 $SSH 'for i in $(seq 1 6); do
     out=$(curl -s -u admin:gate5-receipt http://localhost:3000/api/dashboards/uid/vgpu-waste)
-    case "$out" in *vgpu-waste*) break;; esac; sleep 10
-  done; echo "$out" | head -c 200; echo' | tee "$EVID/04-dash.txt"
-grep -q '"uid":"vgpu-waste"' "$EVID/04-dash.txt" && ok "dashboard provisioned + served" || bad "dashboard not found in grafana"
+    case "$out" in *\"uid\":\"vgpu-waste\"*) echo DASH_SERVED=yes; break;; esac; sleep 10
+  done; echo "$out" | head -c 160; echo' | tee "$EVID/04-dash.txt"
+grep -q "DASH_SERVED=yes" "$EVID/04-dash.txt" && ok "dashboard provisioned + served" || bad "dashboard not found in grafana"
 
 say "5. numbers match: prometheus requested-total vs vgpu report (±1%)"
 $SSH "$KC
