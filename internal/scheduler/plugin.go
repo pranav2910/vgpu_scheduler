@@ -340,6 +340,8 @@ func (s *SliceScheduler) SyncCacheFromSlice(sliceUID, nodeName, phase string, al
 		}
 	case "Released":
 		s.Cache.ReleaseSliceOnce(sliceUID, nodeName)
+	case "Failed":
+		s.Cache.FailSliceOnce(sliceUID, nodeName)
 	}
 }
 

@@ -152,3 +152,45 @@ func TestSetNodeHealthGatesPlacement(t *testing.T) {
 		t.Fatalf("recovered node still rejected")
 	}
 }
+
+// TestFailedSliceReleasesConfirmedHold is the regression test for sweep S2: a
+// slice that binds (assume→confirm) and then FAILS hardware allocation
+// (fragmentation) left its bytes in confirmedBySlice forever — confirmed holds
+// are deliberately not TTL-reaped, the janitor forgets only object-gone UIDs,
+// and SyncCacheFromSlice handled only Ready/Released. The node lost that
+// capacity until a scheduler restart.
+func TestFailedSliceReleasesConfirmedHold(t *testing.T) {
+	c := NewVRAMCache()
+	c.UpdateNode("n1", 80*testGiB, 0)
+
+	// A 60Gi slice binds: assume, then confirm (the post-bind hold).
+	if err := c.AssumeSlice("uid-fail", "default", "n1", 60*testGiB, 30*time.Second); err != nil {
+		t.Fatalf("assume: %v", err)
+	}
+	c.ConfirmSliceOrRearm("uid-fail", "default", "n1", 60*testGiB)
+	if ok, _, _ := c.CanFit("n1", 30*testGiB); ok {
+		t.Fatalf("confirm must charge the node (80-60=20 free; 30 must not fit)")
+	}
+
+	// NodeAgent fails the allocation → slice phase Failed → reconciler syncs.
+	c.FailSliceOnce("uid-fail", "n1")
+	if ok, _, _ := c.CanFit("n1", 30*testGiB); !ok {
+		t.Fatalf("Failed slice must release its confirmed hold — node still charged")
+	}
+
+	// Idempotent: a re-reconcile of the same Failed slice releases nothing new.
+	c.FailSliceOnce("uid-fail", "n1")
+	if ok, _, _ := c.CanFit("n1", 79*testGiB); !ok {
+		t.Fatalf("double-fail must not double-release (free should be exactly 80GiB)")
+	}
+
+	// A Ready slice that later fails (drift) releases its ALLOCATED bytes too.
+	_ = c.PromoteSliceToAllocatedOnce("uid-drift", "n1", 40*testGiB)
+	if ok, _, _ := c.CanFit("n1", 50*testGiB); ok {
+		t.Fatalf("allocated slice must charge the node")
+	}
+	c.FailSliceOnce("uid-drift", "n1")
+	if ok, _, _ := c.CanFit("n1", 79*testGiB); !ok {
+		t.Fatalf("Ready->Failed must release allocated bytes")
+	}
+}

@@ -415,7 +415,7 @@ func (r *sliceSchedulingReconciler) Reconcile(ctx context.Context, req reconcile
 	phase := string(slice.Status.Phase)
 
 	// Bug B fix: bridge NodeAgent hardware events into the scheduler cache.
-	if slice.Spec.NodeName != "" && (phase == "Ready" || phase == "Released") {
+	if slice.Spec.NodeName != "" && (phase == "Ready" || phase == "Released" || phase == "Failed") {
 		r.sched.SyncCacheFromSlice(
 			string(slice.UID),
 			slice.Spec.NodeName,

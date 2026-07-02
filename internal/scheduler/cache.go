@@ -285,6 +285,31 @@ func (c *VRAMCache) ReleaseSliceOnce(sliceUID, nodeName string) {
 	c.ReleaseAllocated(nodeName, bytes)
 }
 
+// FailSliceOnce releases every hold a FAILED slice still has, exactly once.
+// A slice that binds and then fails hardware allocation (fragmentation, NVML
+// error) sits in confirmedBySlice — which is deliberately never TTL-reaped —
+// and its object still exists, so the janitor (objects-gone only) never
+// forgets it either (sweep S2: a solo job's failed 60Gi slice made 60Gi of
+// the node unschedulable until scheduler restart). Failed is terminal for a
+// slice, so releasing here is safe: the phase machine never resurrects it.
+// The speculative (assumed) hold, if any, is left to the TTL reaper.
+func (c *VRAMCache) FailSliceOnce(sliceUID, nodeName string) {
+	c.mu.Lock()
+	if p := c.syncedPhaseBySlice[sliceUID]; p == "Failed" || p == "Released" {
+		c.mu.Unlock()
+		return
+	}
+	bytes := c.allocatedBytesBySlice[sliceUID]
+	c.syncedPhaseBySlice[sliceUID] = "Failed"
+	delete(c.allocatedBytesBySlice, sliceUID)
+	delete(c.allocatedNodeBySlice, sliceUID)
+	c.mu.Unlock()
+	if bytes > 0 {
+		c.ReleaseAllocated(nodeName, bytes)
+	}
+	c.ReleaseConfirmedSlice(sliceUID) // post-bind, pre-Ready hold — the leak
+}
+
 // TrackedSliceUIDs returns every slice UID the cache currently accounts
 // capacity for (assumed, confirmed, or allocated), mapped to its node. This is
 // the janitor's working set: every release path in the system is EDGE-
