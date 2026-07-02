@@ -96,3 +96,4 @@ add_test_2_4*.sh
 # Python bytecode
 __pycache__/
 *.pyc
+artifacts/
