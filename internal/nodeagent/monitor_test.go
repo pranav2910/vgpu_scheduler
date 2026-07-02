@@ -78,9 +78,10 @@ func TestRequestedVRAM(t *testing.T) {
 	ours := pod("default", "ours", func(p *corev1.Pod) {
 		p.Annotations = map[string]string{"infrastructure.pranav2910.com/requested-vram-bytes": "17179869184"}
 	})
-	// 17179869184 is all-digits → MiB by our rule
-	if b, src := requestedVRAM(ours, card, keys); src != "vgpu_claim" || b == 0 {
-		t.Errorf("ours: got (%d,%s), want (>0,vgpu_claim)", b, src)
+	// RAW BYTES for our key — it must NOT hit the bare-integer-is-MiB
+	// convention (Gate-3 receipt regression: 16 GiB rendered as 16 EiB).
+	if b, src := requestedVRAM(ours, card, keys); src != "vgpu_claim" || b != 16*GiB {
+		t.Errorf("ours: got (%d,%s), want (%d,vgpu_claim)", b, src, 16*GiB)
 	}
 
 	// claim-ref only (no size) → vgpu_claim, 0 bytes (size lives in the CRD)

@@ -88,7 +88,9 @@ grep -q "FORMATS_AGREE=yes" "$EVID/05-formats.txt" && ok "table = CSV = JSON (re
 say "6. --filter-ns live + node/UUID columns populated"
 $SSH "$KC
   scripts/vgpu report -o csv --filter-ns default | tee /tmp/f.csv | head -4
-  awk -F, 'NR==2 { print (\$3!=\"\" && \$4~/^GPU-/) ? \"NODE_UUID_OK=yes\" : \"NODE_UUID_OK=no\" }' /tmp/f.csv" | tee "$EVID/06-filter.txt"
+  # assert node+UUID on the row that HAS GPU usage (rows are waste-sorted, so
+  # position varies; an idle pod legitimately has no UUID yet)
+  awk -F, '\$2==\"vanilla-burn\" { print (\$3!=\"\" && \$4~/^GPU-/) ? \"NODE_UUID_OK=yes\" : \"NODE_UUID_OK=no\" }' /tmp/f.csv" | tee "$EVID/06-filter.txt"
 grep -q "NODE_UUID_OK=yes" "$EVID/06-filter.txt" && ok "rows carry real node + GPU-UUID" || bad "node/UUID missing in live rows"
 
 say "7. teardown workloads; uninstall monitor; workloads untouched"

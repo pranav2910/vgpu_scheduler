@@ -217,13 +217,21 @@ func requestedVRAM(p *corev1.Pod, cardTotal int64, annKeys []string) (int64, str
 	if gpus > 0 && cardTotal > 0 {
 		return gpus * cardTotal, "nvidia_gpu_limit"
 	}
-	// 2. Annotation-based memory request (KAI / Run:ai / ours / configured).
+	// 2a. Our own stamp is RAW BYTES by definition — the key name says so, and
+	// the webhook writes strconv.FormatInt(bytes). It must NOT go through the
+	// bare-integer-is-MiB convention below (Gate-3 receipt on the A10: a 16 GiB
+	// grant rendered as "16777216.0 GiB" — bytes re-multiplied as MiB).
+	if v, ok := p.Annotations["infrastructure.pranav2910.com/requested-vram-bytes"]; ok {
+		if b, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && b > 0 {
+			return b, "vgpu_claim"
+		}
+	}
+	// 2b. Annotation-based memory request (KAI / Run:ai / configured keys):
+	// bare integers are MiB (their convention), unit-suffixed values are
+	// Kubernetes quantities.
 	for _, k := range annKeys {
 		if v, ok := p.Annotations[k]; ok {
 			if b := parseRequestedMem(v); b > 0 {
-				if k == "infrastructure.pranav2910.com/requested-vram-bytes" {
-					return b, "vgpu_claim"
-				}
 				return b, "annotation"
 			}
 		}
