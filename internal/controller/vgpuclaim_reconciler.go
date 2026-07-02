@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/state"
@@ -77,6 +78,10 @@ func (r *VGPUClaimReconciler) reconcileClaim(ctx context.Context, claim *vgpuv1a
 	if err != nil {
 		return fmt.Errorf("ensuring slice exists: %w", err)
 	}
+	if slice == nil {
+		// Owning job is terminal — no slice was (re)created (sweep S9).
+		return nil
+	}
 
 	return r.syncClaimStatusFromSlice(ctx, claim, slice)
 }
@@ -91,6 +96,26 @@ func (r *VGPUClaimReconciler) ensureSliceExists(ctx context.Context, claim *vgpu
 	}
 	if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("fetching existing slice: %w", err)
+	}
+
+	// About to CREATE a slice. If the owning job is terminal (Failed/Completed
+	// — including preempted), creating one re-consumes capacity for a dead job
+	// (sweep S9: an externally deleted Released slice was recreated Pending
+	// here with no job-phase guard at all, resurrecting a preempted job's
+	// claim). Skip creation; the claim just sits, owned, until GC'd.
+	if claim.Spec.JobRef != "" {
+		var owner vgpuv1alpha1.VGPUJob
+		if jerr := r.Client.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: claim.Spec.JobRef}, &owner); jerr == nil {
+			if owner.Status.Phase == vgpuv1alpha1.JobPhaseFailed ||
+				owner.Status.Phase == vgpuv1alpha1.JobPhaseCompleted ||
+				jobPreempted(&owner) {
+				log.Printf("[claim] %s/%s: not creating a slice — owning job %s is terminal (phase=%s)",
+					claim.Namespace, claim.Name, owner.Name, owner.Status.Phase)
+				return nil, nil
+			}
+		} else if !errors.IsNotFound(jerr) {
+			return nil, fmt.Errorf("checking owning job before slice create: %w", jerr)
+		}
 	}
 
 	// Bug #7 fix: include Controller=true and BlockOwnerDeletion=true on the

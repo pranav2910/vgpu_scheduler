@@ -277,7 +277,14 @@ func (c *VRAMCache) ReleaseSliceOnce(sliceUID, nodeName string) {
 		c.mu.Unlock()
 		return
 	}
-	bytes := c.allocatedBytesBySlice[sliceUID]
+	bytes, tracked := c.allocatedBytesBySlice[sliceUID]
+	if !tracked && c.syncedPhaseBySlice[sliceUID] == "" {
+		// Never tracked: nothing to release, and writing a tombstone for every
+		// UID ever observed grows the map unboundedly on a long-lived leader
+		// (sweep S8). A later duplicate event also finds nothing — safe.
+		c.mu.Unlock()
+		return
+	}
 	c.syncedPhaseBySlice[sliceUID] = "Released"
 	delete(c.allocatedBytesBySlice, sliceUID)
 	delete(c.allocatedNodeBySlice, sliceUID)
@@ -308,6 +315,12 @@ func (c *VRAMCache) FailSliceOnce(sliceUID, nodeName string) {
 	if p := c.syncedPhaseBySlice[sliceUID]; p == "Failed" || p == "Released" {
 		c.mu.Unlock()
 		return
+	}
+	if _, confirmed := c.confirmedBySlice[sliceUID]; !confirmed {
+		if _, alloc := c.allocatedBytesBySlice[sliceUID]; !alloc && c.syncedPhaseBySlice[sliceUID] == "" {
+			c.mu.Unlock() // never tracked → nothing to release, no tombstone (S8)
+			return
+		}
 	}
 	bytes := c.allocatedBytesBySlice[sliceUID]
 	c.syncedPhaseBySlice[sliceUID] = "Failed"
@@ -401,6 +414,11 @@ func (c *VRAMCache) ForgetSlice(sliceUID, nodeName string) {
 	if nodeName != "" {
 		c.ReleaseSliceOnce(sliceUID, nodeName) // allocated, if any
 	}
+	// Forget = the OBJECT is gone; UIDs are never reused, so no future event
+	// needs the once-guard. Drop the tombstone or it lives forever (sweep S8).
+	c.mu.Lock()
+	delete(c.syncedPhaseBySlice, sliceUID)
+	c.mu.Unlock()
 }
 
 func (c *VRAMCache) ReleaseConfirmedSlice(sliceUID string) {

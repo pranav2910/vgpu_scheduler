@@ -7,6 +7,7 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -87,7 +88,15 @@ func (s *SliceScheduler) Schedule(ctx context.Context, nn types.NamespacedName, 
 	// gang member, the whole gang's demand is weighed against the quota so a gang
 	// is admitted all-or-none (never partially past quota).
 	if s.QuotaChecker != nil {
-		gangRef, gangTotal := s.gangQuotaContext(ctx, nn, reqBytes)
+		gangRef, gangTotal, gqErr := s.gangQuotaContext(ctx, nn, reqBytes)
+		if gqErr != nil {
+			// Fail CLOSED (sweep S7): a transient reservation read must not
+			// downgrade a gang member to per-slice quota — one member could
+			// pass a quota the gang as a whole exceeds, hold capacity in the
+			// admitting cohort, and starve the quota-compliant work until the
+			// reservation deadline. Retry the cycle instead.
+			return "", fmt.Errorf("resolving gang quota context: %w", gqErr)
+		}
 		if ok, reason, msg := s.QuotaChecker.Check(ctx, nn.Namespace, reqBytes, gangRef, gangTotal); !ok {
 			log.Printf("Scheduling rejected for Slice %s by quota: %s — %s",
 				nn, reason, msg)
@@ -350,24 +359,39 @@ func (s *SliceScheduler) SyncCacheFromSlice(sliceUID, nodeName, phase string, al
 // lookup failure — a safe fall-back to per-slice quota). gangTotal = gangSize ×
 // this slice's request; gang members are built from one pod template and share
 // an identical request.
-func (s *SliceScheduler) gangQuotaContext(ctx context.Context, nn types.NamespacedName, reqBytes int64) (string, int64) {
+func (s *SliceScheduler) gangQuotaContext(ctx context.Context, nn types.NamespacedName, reqBytes int64) (string, int64, error) {
 	var slice vgpuv1alpha1.VGPUSlice
-	if err := s.K8sClient.Get(ctx, nn, &slice); err != nil || slice.Annotations == nil {
-		return "", 0
+	if err := s.K8sClient.Get(ctx, nn, &slice); err != nil {
+		// NotFound: the slice vanished mid-cycle — solo semantics are fine,
+		// the cycle will fail on its own Get. Anything else fails closed.
+		if apierrors.IsNotFound(err) {
+			return "", 0, nil
+		}
+		return "", 0, err
+	}
+	if slice.Annotations == nil {
+		return "", 0, nil
 	}
 	gangRef := slice.Annotations[vgpuv1alpha1.AnnotationGangRef]
 	rsvName := slice.Annotations[vgpuv1alpha1.AnnotationReservationRef]
 	if gangRef == "" || rsvName == "" {
-		return "", 0
+		return "", 0, nil
 	}
 	var rsv vgpuv1alpha1.VGPUGangReservation
 	if err := s.K8sClient.Get(ctx, types.NamespacedName{Namespace: nn.Namespace, Name: rsvName}, &rsv); err != nil {
-		return "", 0
+		// A gang member whose reservation can't be read: NotFound means the
+		// gang is being torn down (member will fail soon anyway) — but a
+		// TRANSIENT error must not silently demote gang-atomic quota to
+		// per-slice quota (sweep S7).
+		if apierrors.IsNotFound(err) {
+			return "", 0, nil
+		}
+		return "", 0, err
 	}
 	if rsv.Spec.GangSize <= 0 {
-		return "", 0
+		return "", 0, nil
 	}
-	return gangRef, int64(rsv.Spec.GangSize) * reqBytes
+	return gangRef, int64(rsv.Spec.GangSize) * reqBytes, nil
 }
 
 // SetQuotaChecker wires a quota checker into the scheduler. nil disables

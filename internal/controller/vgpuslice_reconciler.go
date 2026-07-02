@@ -63,7 +63,20 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 			}
 		}
 		if since.IsZero() {
-			since = time.Now()
+			// No Preempting condition on a Preempting slice (partial/manual
+			// status write). Falling back to Now() every pass made the grace
+			// deadline recede forever (sweep S10). Stamp the anchor ONCE so
+			// the deadline becomes real, then re-enter.
+			apimeta.SetStatusCondition(&slice.Status.Conditions, metav1.Condition{
+				Type:    "Preempting",
+				Status:  metav1.ConditionTrue,
+				Reason:  "PreemptingAnchorSelfHealed",
+				Message: "Preempting condition was missing; grace period anchored at first observation.",
+			})
+			if err := r.Client.Status().Update(ctx, &slice); err != nil {
+				return reconcile.Result{}, err
+			}
+			return reconcile.Result{Requeue: true}, nil
 		}
 		elapsed := time.Since(since)
 		if elapsed < grace {

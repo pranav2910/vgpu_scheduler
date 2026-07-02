@@ -168,6 +168,20 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return res, nil
 	}
 
+	// Pure-resource jobs must honor Preempted too (sweep S9): the slice
+	// reconciler stamps the condition, but only the podTemplate path consumed
+	// it — a preempted resource-only job kept reporting Scheduled forever
+	// while its slice was Released.
+	if jobPreempted(&job) {
+		if job.Status.Phase != vgpuv1alpha1.JobPhaseFailed {
+			if _, err := r.updatePhase(ctx, &job, vgpuv1alpha1.JobPhaseFailed,
+				"Preempted for higher-priority work."); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+		return reconcile.Result{}, nil
+	}
+
 	if job.Status.Phase != desired || job.Status.ClaimRef != claimName {
 		if _, err := r.updatePhase(ctx, &job, desired, msg); err != nil {
 			return reconcile.Result{}, err
