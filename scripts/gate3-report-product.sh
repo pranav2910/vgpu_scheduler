@@ -25,6 +25,18 @@ say "0. sync repo + full control plane (scheduler+controller+webhooks for the VG
 $SSH "$KC; git fetch -q origin && git reset -q --hard origin/main && git log --oneline -1" | tee "$EVID/00-repo.txt"
 $SSH "$KC; bash scripts/h100-control-plane.sh" > "$EVID/00-bringup.log" 2>&1 \
     && ok "control plane up" || { bad "bring-up failed (see $EVID/00-bringup.log)"; echo "VERDICT: FAIL"; exit 1; }
+# The bring-up SKIPS rebuilds when the stack already exists (found via a stale
+# monitor binary greenwashing a wrong value). Receipts must test THIS commit:
+# force-rebuild all three images, reimport into k3s, restart every consumer.
+$SSH "$KC
+  make docker-build docker-build-nodeagent-nvml >/dev/null 2>&1 || exit 1
+  docker save vgpu-scheduler:latest vgpu-controller:latest vgpu-nodeagent:latest vgpu-nodeagent:nvml | sudo k3s ctr images import - >/dev/null 2>&1
+  kubectl rollout restart deploy/vgpu-scheduler deploy/vgpu-controller -n vgpu-system >/dev/null 2>&1
+  kubectl rollout restart ds/vgpu-nodeagent -n vgpu-system >/dev/null 2>&1
+  kubectl rollout status deploy/vgpu-controller -n vgpu-system --timeout=180s >/dev/null 2>&1 && echo FRESH_IMAGES=yes" \
+  > "$EVID/00-rebuild.log" 2>&1
+grep -q "FRESH_IMAGES=yes" "$EVID/00-rebuild.log" && ok "images rebuilt at THIS commit + all components restarted" \
+    || { bad "image rebuild/redeploy failed (see $EVID/00-rebuild.log)"; echo "VERDICT: FAIL"; exit 1; }
 
 say "1. install monitor beside the full stack"
 $SSH "$KC; scripts/vgpu uninstall monitor >/dev/null 2>&1; scripts/vgpu install monitor" | tee "$EVID/01-install.txt"
@@ -63,6 +75,8 @@ say "3. table: both pods attributed, with the right SOURCE for each path"
 $SSH "$KC; scripts/vgpu report --price-per-gpu-hour 3.00" | tee "$EVID/03-table.txt"
 grep -qE "default/vanilla-burn .* annotation" "$EVID/03-table.txt" && ok "vanilla pod attributed (source=annotation)" || bad "vanilla pod missing/wrong source"
 grep -qE "default/viaclaim-workload .* vgpu_claim" "$EVID/03-table.txt" && ok "VGPUJob pod attributed (source=vgpu_claim)" || bad "VGPUJob pod missing/wrong source"
+# VALUE assertion — presence-only greenwashed a stale binary showing 16777216 GiB:
+grep -qE "default/viaclaim-workload +16\.0 GiB" "$EVID/03-table.txt" && ok "VGPUJob requested value CORRECT (16.0 GiB, bytes parsed as bytes)" || bad "VGPUJob requested value WRONG (unit bug or stale binary)"
 grep -q  "Top wasting pods" "$EVID/03-table.txt" && ok "top-wasters rendered" || bad "top-wasters missing"
 
 say "4. NVML cross-check: report's used-bytes vs nvidia-smi ground truth (±1 GiB)"
