@@ -184,6 +184,17 @@ func (p *Preemptor) TryPreempt(
 		if !job.Spec.Preemptible {
 			continue
 		}
+		// Gang members are NOT eligible victims (sweep S5): the sort below
+		// prices a victim as ONE slice, but preempting a single member trips
+		// the reservation's committed-gang child-loss tally -> the WHOLE gang
+		// is torn down, siblings get zero grace, and the real eviction damage
+		// is N x bytes. A 15Gi member of an 8x15Gi gang would out-rank a 16Gi
+		// solo victim and destroy 120Gi of workload. Until victims are priced
+		// at gang cost, exclude them.
+		if s.Annotations[vgpuv1alpha1.AnnotationReservationRef] != "" ||
+			s.Annotations[vgpuv1alpha1.AnnotationGangRef] != "" {
+			continue
+		}
 		if requesterPriority-job.Spec.Priority < PreemptionPriorityGap {
 			continue
 		}
@@ -293,7 +304,12 @@ func (p *Preemptor) TryPreempt(
 	p.mu.Lock()
 	until := time.Now().Add(PreemptionCooldown)
 	for _, v := range plan.Victims {
-		p.cooldown[v.Slice.Namespace+"/"+v.Job.Name+"-claim"] = until
+		// Key on the victim's REAL claim name (sweep S11): the candidate check
+		// reads ns/<claim.Name>, but this wrote ns/<jobName>-claim — correct
+		// only for controller-minted names. A hand-created claim named
+		// differently defeated its own cooldown and was re-preempted every
+		// cycle.
+		p.cooldown[v.Slice.Namespace+"/"+v.Slice.Spec.ClaimRef] = until
 	}
 	p.mu.Unlock()
 
