@@ -175,8 +175,15 @@ $SSH "$KC
   kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=240s >/dev/null 2>&1
   echo '--- checkpoint file (must have survived the REBOOT — /var/lib not tmpfs) ---'
   sudo cat /var/lib/vgpu-state/allocations.json 2>/dev/null | head -3
-  AGENT=\$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}')
-  kubectl logs -n vgpu-system \$AGENT 2>/dev/null | grep -m1 're-seeded from'
+  # the agent may restart once as the driver settles post-boot — poll the log
+  # line across container instances (round-2 receipt raced this boundary)
+  for i in \$(seq 1 12); do
+    AGENT=\$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    L=\$(kubectl logs -n vgpu-system \$AGENT 2>/dev/null | grep -m1 're-seeded from')
+    [ -z \"\$L\" ] && L=\$(kubectl logs -n vgpu-system \$AGENT --previous 2>/dev/null | grep -m1 're-seeded from')
+    [ -n \"\$L\" ] && { echo \"\$L\"; break; }
+    sleep 5
+  done
   # THE over-commit assertion: survivor holds 6Gi of 24GB. A 20Gi request must
   # be REFUSED — it only fits if the reboot leaked the old allocation.
   scripts/vgpu submit --name toolarge --vram 20Gi --image nvidia/cuda:12.4.1-base-ubuntu22.04 \
