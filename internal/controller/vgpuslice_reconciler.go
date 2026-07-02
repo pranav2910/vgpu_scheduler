@@ -43,8 +43,12 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	// then transition to Released so existing cleanup runs.
 	if string(slice.Status.Phase) == "Preempting" {
 		// Resolve the owning Job ONCE: needed both for the grace period and, on
-		// expiry, to evict its workload pod and mark it terminal.
-		job := r.resolveOwnerJob(ctx, &slice)
+		// expiry, to evict its workload pod and mark it terminal. A transient
+		// lookup failure retries — it must not read as "no owner" (sweep S4).
+		job, jerr := r.resolveOwnerJob(ctx, &slice)
+		if jerr != nil {
+			return reconcile.Result{}, fmt.Errorf("resolving preempted slice's owner job: %w", jerr)
+		}
 		grace := 30 * time.Second
 		if job != nil && job.Spec.PreemptionGraceSeconds != nil && *job.Spec.PreemptionGraceSeconds > 0 {
 			grace = time.Duration(*job.Spec.PreemptionGraceSeconds) * time.Second
@@ -75,10 +79,13 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 		// Mirrors the enforcement-evict contract in vgpujob_reconciler.go.
 		if job != nil {
 			if err := r.evictPreemptedWorkload(ctx, job, preemptMsg); err != nil {
-				// Best-effort: log and still release the slice. The Job
-				// reconciler's jobPreempted guard prevents recreation once the
-				// condition lands; a transient error here just delays pod cleanup.
-				log.Printf("[preempting] %s/%s: evict preempted workload: %v", slice.Namespace, slice.Name, err)
+				// Do NOT fall through to Releasing (sweep S4): once the slice
+				// leaves Preempting this branch never runs again, so a one-shot
+				// failure here left the victim pod running on VRAM the
+				// scheduler was already re-selling (double-booked GPU), with
+				// the Preempted condition possibly never stamped. Eviction is
+				// idempotent — return the error and retry until it lands.
+				return reconcile.Result{}, fmt.Errorf("evicting preempted workload (will retry; slice stays Preempting): %w", err)
 			}
 		}
 		// Releasing, NOT Released: stamping Released directly skipped the node
@@ -111,24 +118,30 @@ func (r *VGPUSliceReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	return reconcile.Result{}, nil
 }
 
-// resolveOwnerJob walks slice → claim → job. Returns nil if any link is missing
-// (e.g. a standalone slice, or claim/job already gone).
-func (r *VGPUSliceReconciler) resolveOwnerJob(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) *vgpuv1alpha1.VGPUJob {
+// resolveOwnerJob walks slice → claim → job.
+// It returns (nil, nil) when the slice genuinely has no owning
+// job (no refs, or the chain's objects are gone) and (nil, err) on a TRANSIENT
+// lookup failure. The distinction matters (sweep S4): the Preempting path used
+// a nil-only signature, so a throttled Get at grace expiry read as "no owner"
+// — the victim pod was never evicted, never retried, and its Preempted
+// condition was never stamped, while the slice released and the scheduler
+// re-sold VRAM the pod was still using.
+func (r *VGPUSliceReconciler) resolveOwnerJob(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) (*vgpuv1alpha1.VGPUJob, error) {
 	if slice.Spec.ClaimRef == "" {
-		return nil
+		return nil, nil
 	}
 	var claim vgpuv1alpha1.VGPUClaim
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: slice.Spec.ClaimRef}, &claim); err != nil {
-		return nil
+		return nil, client.IgnoreNotFound(err)
 	}
 	if claim.Spec.JobRef == "" {
-		return nil
+		return nil, nil
 	}
 	var job vgpuv1alpha1.VGPUJob
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: claim.Spec.JobRef}, &job); err != nil {
-		return nil
+		return nil, client.IgnoreNotFound(err)
 	}
-	return &job
+	return &job, nil
 }
 
 // evictPreemptedWorkload completes a preemption: it stamps the Preempted
