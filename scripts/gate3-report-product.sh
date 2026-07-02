@@ -29,11 +29,18 @@ $SSH "$KC; bash scripts/h100-control-plane.sh" > "$EVID/00-bringup.log" 2>&1 \
 # monitor binary greenwashing a wrong value). Receipts must test THIS commit:
 # force-rebuild all three images, reimport into k3s, restart every consumer.
 $SSH "$KC
-  make docker-build docker-build-nodeagent-nvml >/dev/null 2>&1 || exit 1
-  docker save vgpu-scheduler:latest vgpu-controller:latest vgpu-nodeagent:latest vgpu-nodeagent:nvml | sudo k3s ctr images import - >/dev/null 2>&1
-  kubectl rollout restart deploy/vgpu-scheduler deploy/vgpu-controller -n vgpu-system >/dev/null 2>&1
-  kubectl rollout restart ds/vgpu-nodeagent -n vgpu-system >/dev/null 2>&1
-  kubectl rollout status deploy/vgpu-controller -n vgpu-system --timeout=180s >/dev/null 2>&1 && echo FRESH_IMAGES=yes" \
+  set -e
+  # sudo: the box user may not be in the docker group; NEVER silence output —
+  # an empty failure log cost a debugging round-trip.
+  sudo docker build -t vgpu-scheduler:latest  -f Dockerfile.scheduler  . | tail -1
+  sudo docker build -t vgpu-controller:latest -f Dockerfile.controller . | tail -1
+  sudo docker build --build-arg GOTAGS=nvml -t vgpu-nodeagent:nvml -f Dockerfile.nodeagent . | tail -1
+  sudo docker save vgpu-scheduler:latest vgpu-controller:latest vgpu-nodeagent:nvml | sudo k3s ctr images import - | tail -3
+  kubectl rollout restart deploy/vgpu-scheduler deploy/vgpu-controller -n vgpu-system
+  kubectl rollout restart ds/vgpu-nodeagent -n vgpu-system
+  kubectl rollout status deploy/vgpu-controller -n vgpu-system --timeout=240s
+  kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=240s
+  echo FRESH_IMAGES=yes" \
   > "$EVID/00-rebuild.log" 2>&1
 grep -q "FRESH_IMAGES=yes" "$EVID/00-rebuild.log" && ok "images rebuilt at THIS commit + all components restarted" \
     || { bad "image rebuild/redeploy failed (see $EVID/00-rebuild.log)"; echo "VERDICT: FAIL"; exit 1; }
