@@ -121,6 +121,7 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
+- [docs/PILOT.md](docs/PILOT.md) — **pilot in 15 minutes**: install the read-only monitor, see your waste number, tell us if it matches your suspicion
 - [docs/monitor-mode.md](docs/monitor-mode.md) — **start here, zero-risk**: a read-only GPU **waste report** (`vgpu report`) you drop in beside *any* scheduler (KAI/Volcano/vanilla) — no scheduling, no mutation, no CRDs
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — **for ML engineers, in 5 minutes**: install the CLI, run a workload on a shared GPU, right-size it (copy-paste)
 - [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: the full manual — `vgpu submit / status / profile`, right-sizing, gang jobs, troubleshooting
