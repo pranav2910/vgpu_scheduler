@@ -76,7 +76,7 @@ $SSH "$KC
 grep -q "EVICTED=yes" "$EVID/02-evict.txt" && ok "evict mode: sustained violator EVICTED" || bad "violator survived evict mode"
 $SSH "$KC
   kubectl create ns exempt-zone --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  kubectl label ns exempt-zone vgpu.pranav2910.com/enforcement-exempt=true --overwrite >/dev/null
+  kubectl label ns exempt-zone infrastructure.pranav2910.com/enforcement-exempt=true --overwrite >/dev/null
   true" >/dev/null 2>&1
 submit_burner exemptuser 4Gi 8 "-n exempt-zone" >/dev/null 2>&1
 $SSH "$KC
