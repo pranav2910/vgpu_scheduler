@@ -33,10 +33,24 @@ spec:
               labelSelector:
                 matchLabels:
                   control-plane: vgpu-scheduler
+      # Declared restricted profile (the image is distroless nonroot already —
+      # this makes the manifest SAY so, so PodSecurity admission can verify it
+      # instead of warning on every apply).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: manager
         image: vgpu-scheduler:latest
         imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         ports:
         - name: metrics
           containerPort: 8081

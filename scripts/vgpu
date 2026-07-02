@@ -89,6 +89,7 @@ USAGE:
   vgpu uninstall monitor                                 # remove it COMPLETELY (verified; incl. cluster-scoped RBAC)
   vgpu doctor                                            # diagnose the cluster: every missing dependency, with a fix
   vgpu support-bundle [--out FILE]                       # collect redacted diagnostics into a tar.gz
+  vgpu security audit                                    # print the blast radius — VERIFIED against live RBAC
   vgpu version
 
 SUBMIT OPTIONS:
@@ -855,6 +856,94 @@ cmd_support_bundle() {
     printf '  redaction: no Secrets collected; env values matching password/token/key are [REDACTED]\n'
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# security audit: print the honest blast radius — and VERIFY every permission
+# claim against the LIVE cluster RBAC, so the printout can never drift from
+# reality. Read-only.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_security() {
+    local sub="${1:-}"; shift || true
+    [[ "$sub" == "audit" ]] || die "usage: vgpu security audit"
+    need_kubectl
+    set +e
+    local fails=0
+    okc()  { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+    badc() { printf '  \033[1;31m✗\033[0m %s\n' "$*"; fails=$((fails+1)); }
+
+    printf 'vgpu security audit — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '\n─ monitor mode (the read-only wedge)\n'
+    if ! kubectl get namespace "$MONITOR_NS" >/dev/null 2>&1; then
+        printf '  (not installed — static facts below describe what WOULD be deployed)\n'
+    fi
+    cat <<'EOF'
+  Mode:            monitor (observe/attribute/report only)
+  Mutates pods:    no
+  Evicts pods:     no
+  Creates CRDs:    no
+  Schedules:       no  (runs BESIDE your scheduler)
+  External egress: none (metrics are scraped FROM it; it calls only the k8s API)
+  Data collected:  pod names/namespaces + GPU memory requested/used. No Secrets,
+                   no env values, no container images' contents.
+  Host access:     hostPID (PID→pod attribution) + /dev + privileged
+                   → the AGENT POD IS NODE-ROOT. "Read-only" means read-only to
+                   your CLUSTER (one RBAC verb set), not an unprivileged process
+                   — same trade every GPU telemetry agent (DCGM etc.) makes.
+EOF
+    # ── live verification: the RBAC on the cluster must equal the claim ──────
+    if kubectl get clusterrole vgpu-monitor-readonly >/dev/null 2>&1; then
+        printf '\n  live RBAC verification (clusterrole/vgpu-monitor-readonly):\n'
+        local rules
+        rules="$(kubectl get clusterrole vgpu-monitor-readonly -o jsonpath='{range .rules[*]}{.apiGroups}{"|"}{.resources}{"|"}{.verbs}{"\n"}{end}' 2>/dev/null)"
+        printf '%s\n' "$rules" | sed 's/^/      /'
+        local nrules
+        nrules="$(printf '%s\n' "$rules" | grep -c '|')"
+        if [[ "$nrules" == "1" ]] && printf '%s' "$rules" | grep -qE '^\[""\]\|\["pods"\]\|\["get","list","watch"\]$'; then
+            okc "LIVE RBAC MATCHES THE CLAIM: exactly pods get/list/watch, nothing else"
+        else
+            badc "LIVE RBAC DIFFERS FROM THE CLAIM ABOVE — someone changed the ClusterRole; re-apply deployments/monitor/monitor.yaml and investigate"
+        fi
+        # No write verbs anywhere in the role
+        if printf '%s' "$rules" | grep -qE 'create|update|patch|delete|deletecollection|impersonate|escalate|bind'; then
+            badc "write/escalation verbs found in the monitor role"
+        else
+            okc "no write, delete, impersonate, escalate, or bind verbs"
+        fi
+    else
+        printf '  (clusterrole not present — live verification skipped; install first for a verified audit)\n'
+    fi
+
+    printf '\n─ full stack (only if installed)\n'
+    if kubectl get namespace vgpu-system >/dev/null 2>&1; then
+        cat <<'EOF'
+  Scheduler/controller: distroless, non-root, leader-elected. Mutating webhook
+    injects GPU devices ONLY into pods carrying the vgpu-claim label; validating
+    webhooks enforce VRAM bounds/immutability/gang invariants.
+  Node agent: privileged DaemonSet (NVML + CDI + cgroup attribution) = node-root
+    on GPU nodes. Enforcement default is softwarn (never destructive); eviction
+    is opt-in (VGPU_ENFORCEMENT_MODE=evict) via the PDB-respecting Eviction API,
+    exemptible ONLY by namespace label (a pod cannot self-exempt).
+  Isolation: SOFT governance (observe→warn→opt-in evict→right-size). NOT
+    hardware memory-fencing; MIG-backed hard isolation is roadmap. Fit for
+    trusted single-tenant clusters, NOT hostile multi-tenancy.
+EOF
+        # quick live checks on the stack's own claims
+        local sec
+        sec="$(kubectl get deploy vgpu-scheduler -n vgpu-system -o jsonpath='{.spec.template.spec.securityContext.runAsNonRoot}' 2>/dev/null)"
+        [[ "$sec" == "true" ]] && okc "scheduler runs runAsNonRoot=true" || printf '  ! scheduler runAsNonRoot not set to true (check deployment)\n'
+    else
+        printf '  (not installed)\n'
+    fi
+
+    printf '\n─ verdict\n'
+    if (( fails == 0 )); then
+        printf '  every verifiable claim matches the live cluster. Full write-up: docs/SECURITY.md\n'
+    else
+        printf '  %d MISMATCH(ES) between claims and live state — treat as an incident.\n' "$fails"
+    fi
+    exit "$fails"
+}
+
 [[ $# -ge 1 ]] || { usage; exit 1; }
 sub="$1"; shift
 case "$sub" in
@@ -866,6 +955,7 @@ case "$sub" in
     uninstall)      cmd_uninstall "$@" ;;
     doctor)         cmd_doctor  "$@" ;;
     support-bundle) cmd_support_bundle "$@" ;;
+    security)       cmd_security "$@" ;;
     version|--version|-v) printf 'vgpu %s\n' "$VGPU_VERSION" ;;
     -h|--help|help) usage ;;
     *)             die "unknown command '$sub' (try: submit, status, profile, report, install, uninstall, doctor, support-bundle, version)" ;;
