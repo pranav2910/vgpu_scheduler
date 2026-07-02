@@ -285,6 +285,16 @@ func (c *VRAMCache) ReleaseSliceOnce(sliceUID, nodeName string) {
 	c.ReleaseAllocated(nodeName, bytes)
 }
 
+// HasNode reports whether the node is currently in the candidate set. The
+// node reconciler uses it to detect a (re-)registration and trigger the
+// slice re-walk that re-charges live allocations (sweep S3).
+func (c *VRAMCache) HasNode(nodeName string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.nodes[nodeName]
+	return ok
+}
+
 // FailSliceOnce releases every hold a FAILED slice still has, exactly once.
 // A slice that binds and then fails hardware allocation (fragmentation, NVML
 // error) sits in confirmedBySlice — which is deliberately never TTL-reaped —

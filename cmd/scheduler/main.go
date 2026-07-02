@@ -534,7 +534,34 @@ func (r *nodeCapacityReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	}
 
 	consumed := consumedVRAMOnNode(&node)
+	isNewToCache := !r.cache.HasNode(node.Name)
 	r.cache.UpdateNode(node.Name, totalVRAM.Value(), consumed)
+	// Sweep S3: a node (re-)entering the candidate set arrives with allocated=0
+	// (no kubelet bookkeeping for the extended resource) while its Ready slices
+	// still physically hold VRAM. A node FLAP generates zero slice events, so
+	// nothing re-promoted them — the node sat at free=total (over-admission
+	// window) until an incidental slice write, minutes or unbounded. Re-walk
+	// this node's Ready slices NOW and re-charge each exactly once.
+	if isNewToCache {
+		var slices vgpuv1alpha1.VGPUSliceList
+		if err := r.client.List(ctx, &slices); err != nil {
+			// The node is registered but not yet re-charged — retry the whole
+			// reconcile rather than leave the over-admission window open.
+			return reconcile.Result{}, fmt.Errorf("listing slices to re-charge node %s: %w", node.Name, err)
+		}
+		recharged := 0
+		for i := range slices.Items {
+			sl := &slices.Items[i]
+			if sl.Spec.NodeName != node.Name || string(sl.Status.Phase) != "Ready" || sl.Status.AllocatedBytes <= 0 {
+				continue
+			}
+			_ = r.cache.PromoteSliceToAllocatedOnce(string(sl.UID), node.Name, sl.Status.AllocatedBytes)
+			recharged++
+		}
+		if recharged > 0 {
+			log.Printf("Cache updated: node %s (re-)registered — re-charged %d Ready slice(s)", node.Name, recharged)
+		}
+	}
 	// Gate NEW placements on node readiness: a NotReady node keeps its existing
 	// accounting (workloads may still be running) but stops being a candidate
 	// (CanFit/AssumeSlice refuse unhealthy nodes). Without this, the Healthy
