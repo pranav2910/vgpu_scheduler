@@ -212,8 +212,10 @@ VCARD=$(kubectl get vgpuslice victim-claim-slice -n "$NS" -o jsonpath='{.status.
 # fits any OTHER card without preemption — so to force preemption ask for a size that
 # fits NOWHERE free: fill ALL other cards' 6Gi first, then contend for the victim's card.
 for i in $(seq 1 $((CARDS-1))); do submit "filler-$i" $((6*GiB)) 50; done
-wait_for 240 "fillers Ready ($((CARDS-1)) x 6Gi)" '
-    n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | grep -c Ready); [[ "$n" -ge "'"$((CARDS+CARDS))"'" ]]' >/dev/null || true
+# STRICT: every filler must be Ready or the preemption scenario is vacuous —
+# round-1 left one hole open and vip landed WITHOUT preempting anyone.
+wait_for 300 "ALL $((CARDS-1)) fillers Ready (node fully packed)" '
+    n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | grep -c "filler.*Ready"); [[ "$n" == "'"$((CARDS-1))"'" ]]'     || { echo "  slice map at failure:"; kubectl get vgpuslice -n "$NS" -o custom-columns=N:.metadata.name,P:.status.phase,C:.status.deviceUuid --no-headers | sed "s/^/    /"; }
 submit vip $((5*GiB)) 200        # gap 190 >= 100 over victim(10) -> may preempt it
 wait_for 300 "vip Ready via preemption" '
     ph=$(kubectl get vgpuslice vip-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null); [[ "$ph" == "Ready" ]]' \
