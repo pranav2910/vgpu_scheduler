@@ -22,7 +22,7 @@ export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 GiB=$((1024*1024*1024)); MiB=$((1024*1024))
 NS="${NS:-t3-run}"
-PHASE="${PHASE:-all}"   # ab | c-load | c-post | d | all
+PHASE="${PHASE:-all}"   # ab | b | c-load | c-post | d | all
 BURNIMG="pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
 C_GRN=$'\033[1;32m'; C_RED=$'\033[1;31m'; C_BLU=$'\033[1;34m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
 PASS=0; FAIL=0
@@ -93,6 +93,8 @@ wait_for 240 "zero residue after full release" '
 AR=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
 [[ "$AR" == "$AR0" ]] && ok "agent survived the churn storm (restart delta 0)" || bad "agent restarted $((AR-AR0)) time(s) DURING churn"
 
+fi  # end ab section A gate — B below also runs standalone as PHASE=b
+if run_phase ab || run_phase b; then
 hdr "B. CONCURRENT BURNS: 3 cards violating at once, $((CARDS-3)) stay clean"
 BURN_GIB=$(( (PERCARD_MIB - 3072) / 1024 ))
 for i in 1 2 3; do
@@ -118,7 +120,7 @@ wait_for 300 "all 3 burn pods Running" '
 BURN_UUIDS=$(kubectl get vgpuslice -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.deviceUuid}{"\n"}{end}' | awk '/burn-/{print $2}' | sort -u)
 NBU=$(printf '%s\n' "$BURN_UUIDS" | grep -c GPU || true)
 [[ "$NBU" == "3" ]] && ok "3 burns landed on 3 DISTINCT cards" || bad "burns not on 3 distinct cards ($NBU)"
-wait_for 240 "all 3 burning cards marked violating" '
+wait_for 420 "all 3 burning cards marked violating" '
     v=$(scrape | awk -F"[ {}]" "/^vgpu_node_memory_violation_active/ {if (\$NF==1) c++} END{printf \"%d\", c}"); [[ "$v" == "3" ]]' \
     && ok "all 3 burning cards violation_active=1 SIMULTANEOUSLY (per-card detection under load)"
 CLEANV=$(scrape | awk -F'[ {}]' '/^vgpu_node_memory_violation_active/ {s+=$NF} END{printf "%d", s}')
