@@ -391,6 +391,19 @@ var (
 		Help: "VRAM a pod is actually using (NVML process-used, attributed PID→cgroup→pod).",
 	}, []string{"namespace", "pod", "node", "gpu_uuid"})
 
+	// NodeObservationStale flips to 1 when the violation detector is consuming
+	// a stale/errored GPU snapshot (fail-LOUD: a blind detector must be visible;
+	// silent skips froze all overuse gauges at pre-blindness values on an
+	// 8xV100 — found by the tier-3 torture suite).
+	NodeObservationStale = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_node_observation_stale",
+		Help: "1 when the over-use detector's GPU snapshot is stale or errored (detector blind; overuse gauges frozen).",
+	}, []string{"node"})
+	NodeObservationAgeSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "vgpu_node_observation_age_seconds",
+		Help: "Age of the GPU snapshot consumed by the over-use detector.",
+	}, []string{"node"})
+
 	MonitorGPUTotalVRAMBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "vgpu_monitor_gpu_total_vram_bytes",
 		Help: "Total VRAM of a physical GPU (monitor mode).",
@@ -443,6 +456,7 @@ func init() {
 		// data plane
 		HardwareAllocations, DriftEvents,
 		// monitor mode (read-only wedge)
+		NodeObservationStale, NodeObservationAgeSeconds,
 		MonitorPodRequestedVRAMBytes, MonitorPodUsedVRAMBytes,
 		MonitorGPUTotalVRAMBytes, MonitorGPUUsedVRAMBytes, MonitorGPUFreeVRAMBytes,
 	)

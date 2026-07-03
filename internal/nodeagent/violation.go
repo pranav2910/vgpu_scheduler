@@ -1,10 +1,10 @@
 package nodeagent
 
 import (
-	"os"
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
@@ -45,6 +45,9 @@ type ViolationDetector struct {
 	// per-GPU hysteresis state, keyed by GPU UUID.
 	streak map[string]int
 	active map[string]bool
+
+	// now is a clock hook for tests (defaults to time.Now).
+	now func() time.Time
 }
 
 // NewViolationDetector builds the detector. interval <= 0 defaults to 30s.
@@ -60,6 +63,7 @@ func NewViolationDetector(c client.Client, nodeName string, inv *gpu.Inventory, 
 		interval: interval,
 		streak:   map[string]int{},
 		active:   map[string]bool{},
+		now:      time.Now,
 	}
 }
 
@@ -82,10 +86,22 @@ func (d *ViolationDetector) Start(ctx context.Context) error {
 }
 
 func (d *ViolationDetector) detectOnce(ctx context.Context) error {
-	devices, _, errStr := d.inv.Snapshot()
-	if errStr != "" || len(devices) == 0 {
-		return nil // no fresh observation to act on
+	devices, observedAt, errStr := d.inv.Snapshot()
+	// Fail LOUD on stale/errored snapshots. A silent skip froze every overuse
+	// gauge at its pre-blindness value for minutes on an 8xV100 (tier-3 torture
+	// finding): the detector was blind and NOTHING said so. Skipping evaluation
+	// is still correct — garbage in must not flag violations — but the skip must
+	// be visible on metrics and in logs.
+	age := d.now().Sub(observedAt)
+	telemetry.NodeObservationAgeSeconds.WithLabelValues(d.nodeName).Set(age.Seconds())
+	stale := errStr != "" || len(devices) == 0 || age > 3*d.interval
+	if stale {
+		telemetry.NodeObservationStale.WithLabelValues(d.nodeName).Set(1)
+		log.Printf("[violation] BLIND CYCLE: snapshot stale (age=%s, err=%q, devices=%d) — over-use detection skipped; gauges may be frozen",
+			age.Round(time.Second), errStr, len(devices))
+		return nil
 	}
+	telemetry.NodeObservationStale.WithLabelValues(d.nodeName).Set(0)
 	grantedByCard, err := d.grantedBytesByCard(ctx)
 	if err != nil {
 		return fmt.Errorf("computing granted bytes: %w", err)

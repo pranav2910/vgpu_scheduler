@@ -6,6 +6,7 @@ import (
 	"time"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/gpu"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -147,5 +148,46 @@ func TestGrantedBytesByCard_MultiGPU_PerCardIsolatesOveruse(t *testing.T) {
 	}
 	if _, _, viol := d.evaluate(cardB, 4*giB, byCard[cardB]); viol {
 		t.Fatal("card B under its per-card grant must NOT violate")
+	}
+}
+
+// Tier-3 torture finding: the detector consumed stale/errored snapshots as a
+// SILENT nil — gauges froze at pre-blindness values for minutes with nothing
+// on metrics or logs. Staleness must skip evaluation AND be loudly visible.
+func TestDetectOnce_StaleSnapshotSkipsLoudly(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(nodeAgentScheme(t)).WithObjects(
+		mkSliceOnCard("a", "node-a", "Ready", 10*giB, "GPU-x"),
+	).Build()
+	inv := gpu.NewInventory()
+	d := NewViolationDetector(c, "node-a", inv, nil, 30*time.Second)
+	base := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return base }
+
+	// 1. errored snapshot (MarkError retains stale devices) → skip, no streak
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base.Add(-10*time.Second))
+	inv.MarkError(base, "nvml exploded")
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 0 {
+		t.Fatalf("errored snapshot must not advance streaks (got %d)", d.streak["GPU-x"])
+	}
+
+	// 2. old-but-error-free snapshot (age > 3x interval) → also skip
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base.Add(-5*time.Minute))
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 0 {
+		t.Fatalf("stale snapshot must not advance streaks (got %d)", d.streak["GPU-x"])
+	}
+
+	// 3. fresh snapshot → evaluation resumes and the streak builds
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base)
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 1 {
+		t.Fatalf("fresh snapshot must evaluate (streak got %d, want 1)", d.streak["GPU-x"])
 	}
 }
