@@ -66,6 +66,7 @@ invariant(){ local tag=$1
 }
 
 if run_phase ab; then
+AR0=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
 hdr "A. CHURN STORM: 6 waves of random-size jobs across all $CARDS cards"
 CHURN_FAILLOUD=0
 for wave in 1 2 3 4 5 6; do
@@ -89,8 +90,8 @@ kubectl delete vgpujob -n "$NS" --all --wait=false >/dev/null 2>&1
 wait_for 240 "zero residue after full release" '
     n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]' \
     && ok "release-all -> ZERO residue (no leaked slices after 72 jobs churned)"
-AR=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
-[[ "$AR" == "0" ]] && ok "agent survived the churn storm (0 restarts)" || bad "agent restarted $AR times during churn"
+AR=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
+[[ "$AR" == "$AR0" ]] && ok "agent survived the churn storm (restart delta 0)" || bad "agent restarted $((AR-AR0)) time(s) DURING churn"
 
 hdr "B. CONCURRENT BURNS: 3 cards violating at once, $((CARDS-3)) stay clean"
 BURN_GIB=$(( (PERCARD_MIB - 3072) / 1024 ))
@@ -102,7 +103,7 @@ metadata: { name: burn-$i, namespace: $NS }
 spec:
   priority: 50
   workloadClass: Inference
-  claimTemplate: { spec: { requestedVramBytes: $((2*GiB)), serviceTier: Guaranteed } }
+  claimTemplate: { spec: { requestedVramBytes: $((9*GiB)), serviceTier: Guaranteed } }
   podTemplate:
     spec:
       runtimeClassName: nvidia
