@@ -1,6 +1,7 @@
 package nodeagent
 
 import (
+	"os"
 	"context"
 	"fmt"
 	"log"
@@ -100,6 +101,10 @@ func (d *ViolationDetector) detectOnce(ctx context.Context) error {
 		// no-op on exactly the 8×GPU nodes it most needed to watch).
 		granted := grantedByCard[dev.UUID]
 		onset, overuse, violating := d.evaluate(dev.UUID, dev.UsedMemoryBytes, granted)
+		if os.Getenv("VGPU_VIOLATION_DEBUG") == "1" {
+			log.Printf("[violation-debug] card=%s used=%d granted=%d overuse=%d streak=%d violating=%v",
+				dev.UUID, dev.UsedMemoryBytes, granted, overuse, d.streak[dev.UUID], violating)
+		}
 		telemetry.NodeMemoryOveruseBytes.WithLabelValues(d.nodeName, dev.UUID).Set(float64(overuse))
 		telemetry.NodeMemoryViolationActive.WithLabelValues(d.nodeName, dev.UUID).Set(boolToFloat01(violating))
 		if onset {
