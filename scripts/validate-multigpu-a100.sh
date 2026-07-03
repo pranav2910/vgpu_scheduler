@@ -138,6 +138,37 @@ LB=$(kubectl logs mgb-workload -n "$NS" 2>/dev/null | grep -o 'GPU-[0-9a-f-]*' |
 [[ "$LA" == "$UA" ]] && ok "pod A sees ITS card inside the container ($LA)" || bad "pod A in-container UUID $LA != slice $UA"
 [[ "$LB" == "$UB" ]] && ok "pod B sees ITS card inside the container ($LB)" || bad "pod B in-container UUID $LB != slice $UB"
 
+hdr "5. scan #15: PER-CARD over-use detection on a multi-GPU node"
+# The node-overuse detector once compared each card's usage to the NODE-WIDE
+# grant sum → on an 8-GPU node one card's use vs the whole node's grant is
+# always hugely negative, so it NEVER fired. Fixed to per-card (Status.DeviceUUID).
+# Prove it fires: grant pod A a SMALL slice, then have it allocate WAY past that
+# slice on its own card. Only per-card accounting flags this; node-wide hides it.
+SMALL_MIB=2048                                   # 2 GiB grant
+BURN_GIB=$(( (PERCARD_MIB - 2048) / 1024 ))      # burn ~most of the 16 GiB card → ≫ 2 GiB grant
+kubectl delete vgpujob -n "$NS" --all --wait=false >/dev/null 2>&1
+wait_for 240 "cards released before #15 probe" '
+    n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]' || true
+scripts/vgpu submit --name overcard -n "$NS" --vram "${SMALL_MIB}Mi" --image pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime \
+    --runtime-class nvidia \
+    --command "python -c 'import torch,time; x=torch.empty(int(${BURN_GIB}*1024**3)//2, dtype=torch.float16, device=\"cuda\").normal_(); torch.cuda.synchronize(); print(\"burning ${BURN_GIB}GiB on a ${SMALL_MIB}Mi grant\", flush=True); time.sleep(600)'" >/dev/null \
+    || bad "overcard submit failed"
+wait_for 240 "overcard pod Running" '
+    [[ "$(kubectl get pod overcard-workload -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null)" == "Running" ]]' || kubectl get pods -n "$NS"
+OVER_UUID=$(kubectl get vgpuslice overcard-claim-slice -n "$NS" -o jsonpath='{.status.deviceUuid}')
+dim "overcard on card $OVER_UUID: granted ${SMALL_MIB}Mi, burning ~${BURN_GIB}GiB — waiting for the per-card detector (streak×interval)"
+AGENT=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if wait_for 180 "per-card overuse metric > 0 for the burning card" '
+    v=$(kubectl exec -n vgpu-system '"$AGENT"' -- wget -qO- localhost:8083/metrics 2>/dev/null | awk -F"[ {}]" "/^vgpu_node_memory_overuse_bytes.*'"$OVER_UUID"'/ {print \$NF}" | tail -1);
+    [[ -n "$v" && "${v%.*}" -gt 1073741824 ]]'; then
+    OB=$(kubectl exec -n vgpu-system "$AGENT" -- wget -qO- localhost:8083/metrics 2>/dev/null | awk -F'[ {}]' "/^vgpu_node_memory_overuse_bytes.*$OVER_UUID/ {print \$NF}" | tail -1)
+    ok "PER-CARD over-use detected on card $OVER_UUID (overuse≈$(( ${OB%.*} >> 30 ))GiB > grant) — node-wide accounting would report 0"
+    ACTIVE=$(kubectl exec -n vgpu-system "$AGENT" -- wget -qO- localhost:8083/metrics 2>/dev/null | awk -F'[ {}]' "/^vgpu_node_memory_violation_active.*$OVER_UUID/ {print \$NF}" | tail -1)
+    [[ "${ACTIVE%.*}" == "1" ]] && ok "card marked violating (vgpu_node_memory_violation_active=1)" || bad "overuse seen but card not marked violating (active=$ACTIVE)"
+else
+    bad "scan #15: per-card over-use NOT detected — detector still node-wide?"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [[ $FAIL -eq 0 ]]; then
