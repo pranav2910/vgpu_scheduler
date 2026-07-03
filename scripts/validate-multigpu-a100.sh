@@ -170,8 +170,11 @@ if wait_for 180 "per-card overuse metric > 1GiB for the burning card" '
     g=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/'"$AGENT"':8083/proxy/metrics" 2>/dev/null | awk -F"[ {}]" "/^vgpu_node_memory_overuse_bytes.*'"$OVER_UUID"'/ {v=\$NF} END{printf \"%d\", v/1073741824}");
     [[ -n "$g" && "$g" -ge 1 ]]'; then
     ok "PER-CARD over-use detected on card $OVER_UUID (overuse=$(overuse_gib)GiB > its own 2Gi grant) — node-wide accounting would report 0"
-    ACTIVE=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active.*$OVER_UUID/ {v=\$NF} END{printf \"%d\", v}")
-    [[ "$ACTIVE" == "1" ]] && ok "card marked violating (vgpu_node_memory_violation_active=1)" || bad "overuse seen but card not marked violating (active=$ACTIVE)"
+    # violating needs the full 3-cycle streak (~90s) — overuse appears on cycle 1,
+    # active flips on cycle 3. Round-3 read it instantly and caught streak=1.
+    wait_for 150 "violation_active=1 for the burning card (streak completes)" '
+      a=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/'"$AGENT"':8083/proxy/metrics" 2>/dev/null | awk -F"[ {}]" "/^vgpu_node_memory_violation_active.*'"$OVER_UUID"'/ {v=\$NF} END{printf \"%d\", v}");
+      [[ "$a" == "1" ]]'       && ok "card marked violating (vgpu_node_memory_violation_active=1 after the sustained streak)"       || bad "overuse seen but card never marked violating within the streak window"
     CLEAN=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active\{/ && !/$OVER_UUID/ {s+=\$NF} END{printf \"%d\", s}")
     [[ "${CLEAN:-0}" == "0" ]] && ok "all $((CARDS-1)) OTHER cards stay clean (violation isolated to the burning card)" || bad "other cards wrongly flagged (sum=$CLEAN)"
 else
