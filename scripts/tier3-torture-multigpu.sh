@@ -21,7 +21,8 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 
 GiB=$((1024*1024*1024)); MiB=$((1024*1024))
-NS="t3-$(date +%s)"
+NS="${NS:-t3-run}"
+PHASE="${PHASE:-all}"   # ab | c-load | c-post | d | all
 BURNIMG="pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
 C_GRN=$'\033[1;32m'; C_RED=$'\033[1;31m'; C_BLU=$'\033[1;34m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
 PASS=0; FAIL=0
@@ -37,9 +38,10 @@ PERCARD_BYTES=$((PERCARD_MIB * MiB))
 AGENT=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}')
 scrape(){ AGENT=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${AGENT}:8083/proxy/metrics" 2>/dev/null; }
-kubectl create namespace "$NS" >/dev/null
+kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 cleanup(){ hdr cleanup; kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1; dim "ns $NS deleted"; }
-trap cleanup EXIT
+case "$PHASE" in d|all) trap cleanup EXIT ;; esac
+run_phase(){ case "$PHASE" in all) return 0 ;; *) [[ "$PHASE" == "$1" ]] ;; esac; }
 dim "$CARDS × ${PERCARD_MIB}MiB · ns=$NS"
 
 submit(){ # name bytes [priority] [preemptible]
@@ -63,6 +65,7 @@ invariant(){ local tag=$1
     [[ -z "$badline" ]] && ok "per-card ledger invariant holds ($tag)" || bad "PER-CARD OVER-COMMIT ($tag): $badline"
 }
 
+if run_phase ab; then
 hdr "A. CHURN STORM: 6 waves of random-size jobs across all $CARDS cards"
 CHURN_FAILLOUD=0
 for wave in 1 2 3 4 5 6; do
@@ -123,6 +126,9 @@ kubectl delete vgpujob burn-1 burn-2 burn-3 -n "$NS" --wait=false >/dev/null 2>&
 wait_for 180 "burns released" '
     n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]' >/dev/null || true
 
+fi  # end ab
+
+if run_phase c-load; then
 hdr "C. LOADED RE-SEED: fill all $CARDS cards, kill agent x2, then FULL REBOOT"
 for i in $(seq 1 "$CARDS"); do submit "hold-$i" $((10*GiB)); done
 wait_for 240 "all $CARDS holders Ready (1 per card at 10Gi)" '
@@ -139,15 +145,13 @@ for k in 1 2; do
         || bad "kill #$k: re-seed saw ${RESEED:-0} records, want >= $CARDS"
 done
 invariant "post-crashloop"
-dim "rebooting the node (sudo reboot) — waiting for it to return..."
-sudo reboot >/dev/null 2>&1 || true
-sleep 20
-BACK=0
-for _ in $(seq 1 60); do
-    if kubectl get nodes >/dev/null 2>&1; then BACK=1; break; fi
-    sleep 10
-done
-[[ "$BACK" == "1" ]] && ok "node back after reboot" || { bad "node did not return"; exit 1; }
+echo " PHASE_RESULT ab_c_load PASS=$PASS FAIL=$FAIL"
+dim "issuing reboot — phase c-post must run after the box returns"
+( sleep 3; sudo reboot ) >/dev/null 2>&1 &
+exit 0
+fi  # end c-load
+
+if run_phase c-post; then
 kubectl rollout status ds/vgpu-nodeagent -n vgpu-system --timeout=300s >/dev/null 2>&1
 # poll re-seed across the possible driver-settling restart (tier-1 lesson)
 RESEED=""
@@ -172,7 +176,9 @@ wait_for 150 "4Gi probe becomes Ready" '
 kubectl delete vgpujob -n "$NS" --all --wait=false >/dev/null 2>&1
 wait_for 240 "loaded-reseed cleanup" '
     n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | wc -l | tr -d " "); [[ "$n" == "0" ]]' >/dev/null || true
+fi  # end c-post
 
+if run_phase d; then
 hdr "D. GANG 1-per-card + PREEMPTION frees the right card"
 cat <<EOF | kubectl apply -f - >/dev/null
 apiVersion: infrastructure.pranav2910.com/v1alpha1
@@ -216,7 +222,9 @@ VIPCARD=$(kubectl get vgpuslice vip-claim-slice -n "$NS" -o jsonpath='{.status.d
     || dim "vip on $VIPCARD, victim was on $VCARD (acceptable if another slot opened)"
 invariant "post-preemption"
 
+fi  # end d
+
 echo
 echo "════════════════════════════════════════"
-echo " TIER-3 MULTI-GPU TORTURE:  PASS=$PASS  FAIL=$FAIL"
+echo " TIER-3 MULTI-GPU TORTURE (phase=$PHASE):  PASS=$PASS  FAIL=$FAIL"
 [[ $FAIL -eq 0 ]] && { echo " FINAL_VERDICT=PASS"; exit 0; } || { echo " FINAL_VERDICT=FAIL"; exit 1; }
