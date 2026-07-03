@@ -162,15 +162,18 @@ dim "overcard on card $OVER_UUID: granted ${SMALL_MIB}Mi, burning ~${BURN_GIB}Gi
 # the detector firing perfectly: "exceeds granted by 12601 MiB (granted=2048 MiB)").
 AGENT=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 scrape() { kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/${AGENT}:8083/proxy/metrics" 2>/dev/null; }
-if wait_for 180 "per-card overuse metric > 0 for the burning card" '
-    v=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/'"$AGENT"':8083/proxy/metrics" 2>/dev/null | awk -F"[ {}]" "/^vgpu_node_memory_overuse_bytes.*'"$OVER_UUID"'/ {print \$NF}" | tail -1);
-    [[ -n "$v" && "${v%.*}" -gt 1073741824 ]]'; then
-    OB=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_overuse_bytes.*$OVER_UUID/ {print \$NF}" | tail -1)
-    ok "PER-CARD over-use detected on card $OVER_UUID (overuse≈$(( ${OB%.*} >> 30 ))GiB > its own 2Gi grant) — node-wide accounting would report 0"
-    ACTIVE=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active.*$OVER_UUID/ {print \$NF}" | tail -1)
-    [[ "${ACTIVE%.*}" == "1" ]] && ok "card marked violating (vgpu_node_memory_violation_active=1)" || bad "overuse seen but card not marked violating (active=$ACTIVE)"
-    CLEAN=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active/ && !/$OVER_UUID/ {s+=\$NF} END{printf \"%d\", s}")
-    [[ "${CLEAN:-0}" == "0" ]] && ok "all 7 OTHER cards stay clean (violation isolated to the burning card)" || bad "other cards wrongly flagged (sum=$CLEAN)"
+# Prometheus emits large gauges in SCIENTIFIC NOTATION (1.32e+10): bash string
+# surgery parsed that as "1" and the comparison never passed (round-2 lesson).
+# Let awk do the numeric work end to end.
+overuse_gib() { scrape | awk -F'[ {}]' "/^vgpu_node_memory_overuse_bytes.*$OVER_UUID/ {v=\$NF} END{printf \"%d\", v/1073741824}"; }
+if wait_for 180 "per-card overuse metric > 1GiB for the burning card" '
+    g=$(kubectl get --raw "/api/v1/namespaces/vgpu-system/pods/'"$AGENT"':8083/proxy/metrics" 2>/dev/null | awk -F"[ {}]" "/^vgpu_node_memory_overuse_bytes.*'"$OVER_UUID"'/ {v=\$NF} END{printf \"%d\", v/1073741824}");
+    [[ -n "$g" && "$g" -ge 1 ]]'; then
+    ok "PER-CARD over-use detected on card $OVER_UUID (overuse=$(overuse_gib)GiB > its own 2Gi grant) — node-wide accounting would report 0"
+    ACTIVE=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active.*$OVER_UUID/ {v=\$NF} END{printf \"%d\", v}")
+    [[ "$ACTIVE" == "1" ]] && ok "card marked violating (vgpu_node_memory_violation_active=1)" || bad "overuse seen but card not marked violating (active=$ACTIVE)"
+    CLEAN=$(scrape | awk -F'[ {}]' "/^vgpu_node_memory_violation_active\{/ && !/$OVER_UUID/ {s+=\$NF} END{printf \"%d\", s}")
+    [[ "${CLEAN:-0}" == "0" ]] && ok "all $((CARDS-1)) OTHER cards stay clean (violation isolated to the burning card)" || bad "other cards wrongly flagged (sum=$CLEAN)"
 else
     bad "scan #15: per-card over-use NOT detected — detector still node-wide?"
 fi
