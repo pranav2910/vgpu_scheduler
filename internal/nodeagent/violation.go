@@ -85,7 +85,7 @@ func (d *ViolationDetector) detectOnce(ctx context.Context) error {
 	if errStr != "" || len(devices) == 0 {
 		return nil // no fresh observation to act on
 	}
-	granted, err := d.grantedBytes(ctx)
+	grantedByCard, err := d.grantedBytesByCard(ctx)
 	if err != nil {
 		return fmt.Errorf("computing granted bytes: %w", err)
 	}
@@ -93,6 +93,12 @@ func (d *ViolationDetector) detectOnce(ctx context.Context) error {
 		if !dev.Healthy {
 			continue
 		}
+		// Scan #15: compare THIS card's usage against THIS card's grant, not the
+		// node-wide sum. On a multi-GPU node the old node-wide grant made every
+		// per-card overuse undetectable (one 16 GiB card's use vs a 128 GiB
+		// node grant is always hugely negative → the detector was a silent
+		// no-op on exactly the 8×GPU nodes it most needed to watch).
+		granted := grantedByCard[dev.UUID]
 		onset, overuse, violating := d.evaluate(dev.UUID, dev.UsedMemoryBytes, granted)
 		telemetry.NodeMemoryOveruseBytes.WithLabelValues(d.nodeName, dev.UUID).Set(float64(overuse))
 		telemetry.NodeMemoryViolationActive.WithLabelValues(d.nodeName, dev.UUID).Set(boolToFloat01(violating))
@@ -126,14 +132,17 @@ func (d *ViolationDetector) evaluate(uuid string, used, granted int64) (onset bo
 	return onset, overuse, violating
 }
 
-// grantedBytes sums RequestedVRAMBytes of slices bound to this node that hold
-// capacity (nodeName set and phase not Pending/Released/Failed).
-func (d *ViolationDetector) grantedBytes(ctx context.Context) (int64, error) {
+// grantedBytesByCard sums RequestedVRAMBytes of capacity-holding slices bound to
+// this node, keyed by the PHYSICAL card each slice landed on (Status.DeviceUUID).
+// A slice not yet placed on a specific card (no DeviceUUID) holds no card's VRAM
+// and is skipped. On a single-GPU node this collapses to one entry equal to the
+// old node-wide total, so single-GPU behavior is unchanged.
+func (d *ViolationDetector) grantedBytesByCard(ctx context.Context) (map[string]int64, error) {
 	var slices vgpuv1alpha1.VGPUSliceList
 	if err := d.client.List(ctx, &slices); err != nil {
-		return 0, err
+		return nil, err
 	}
-	var total int64
+	byCard := make(map[string]int64)
 	for i := range slices.Items {
 		s := &slices.Items[i]
 		if s.Spec.NodeName != d.nodeName {
@@ -143,9 +152,12 @@ func (d *ViolationDetector) grantedBytes(ctx context.Context) (int64, error) {
 		case "", "Pending", "Released", "Failed":
 			continue
 		}
-		total += s.Spec.RequestedVRAMBytes
+		if s.Status.DeviceUUID == "" {
+			continue // not yet assigned a physical card
+		}
+		byCard[s.Status.DeviceUUID] += s.Spec.RequestedVRAMBytes
 	}
-	return total, nil
+	return byCard, nil
 }
 
 func (d *ViolationDetector) emitEvent(uuid string, overuse, granted int64) {

@@ -83,10 +83,14 @@ func nodeAgentScheme(t *testing.T) *runtime.Scheme {
 }
 
 func mkSlice(name, node, phase string, req int64) *vgpuv1alpha1.VGPUSlice {
+	return mkSliceOnCard(name, node, phase, req, "GPU-card-default")
+}
+
+func mkSliceOnCard(name, node, phase string, req int64, uuid string) *vgpuv1alpha1.VGPUSlice {
 	return &vgpuv1alpha1.VGPUSlice{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec:       vgpuv1alpha1.VGPUSliceSpec{NodeName: node, RequestedVRAMBytes: req},
-		Status:     vgpuv1alpha1.VGPUSliceStatus{Phase: vgpuv1alpha1.VGPUSlicePhase(phase)},
+		Status:     vgpuv1alpha1.VGPUSliceStatus{Phase: vgpuv1alpha1.VGPUSlicePhase(phase), DeviceUUID: uuid},
 	}
 }
 
@@ -100,11 +104,48 @@ func TestGrantedBytes_SumsBoundActiveSlicesOnNode(t *testing.T) {
 	).Build()
 	d := NewViolationDetector(c, "node-a", nil, nil, time.Second)
 
-	got, err := d.grantedBytes(context.Background())
+	byCard, err := d.grantedBytesByCard(context.Background())
 	if err != nil {
-		t.Fatalf("grantedBytes: %v", err)
+		t.Fatalf("grantedBytesByCard: %v", err)
 	}
-	if got != 20*giB {
-		t.Fatalf("granted: got %d want %d (a + b only)", got, 20*giB)
+	var total int64
+	for _, v := range byCard {
+		total += v
+	}
+	if total != 20*giB {
+		t.Fatalf("granted total: got %d want %d (a + b only)", total, 20*giB)
+	}
+}
+
+// Scan #15 regression: on a MULTI-GPU node the grant must be per-card. Two 16 GiB
+// cards, each granted 10 GiB. Card A physically uses 12 GiB — 2 GiB over ITS OWN
+// grant. The old node-wide grant (20 GiB) made 12 GiB look 8 GiB UNDER budget, so
+// the detector never fired on any multi-GPU node. Per-card, card A must flag while
+// card B (using 4 GiB, under its 10 GiB) stays clean.
+func TestGrantedBytesByCard_MultiGPU_PerCardIsolatesOveruse(t *testing.T) {
+	const cardA, cardB = "GPU-aaaa", "GPU-bbbb"
+	c := fake.NewClientBuilder().WithScheme(nodeAgentScheme(t)).WithObjects(
+		mkSliceOnCard("a", "node-a", "Ready", 10*giB, cardA),
+		mkSliceOnCard("b", "node-a", "Ready", 10*giB, cardB),
+	).Build()
+	d := NewViolationDetector(c, "node-a", nil, nil, time.Second)
+
+	byCard, err := d.grantedBytesByCard(context.Background())
+	if err != nil {
+		t.Fatalf("grantedBytesByCard: %v", err)
+	}
+	if byCard[cardA] != 10*giB || byCard[cardB] != 10*giB {
+		t.Fatalf("per-card grant: got A=%d B=%d, want 10Gi each (node-wide sum would be 20Gi and hide overuse)", byCard[cardA], byCard[cardB])
+	}
+	// Card A 2 GiB over its own grant → flags after the streak; card B clean.
+	for i := 0; i < overuseStreakThreshold; i++ {
+		d.evaluate(cardA, 12*giB, byCard[cardA])
+		d.evaluate(cardB, 4*giB, byCard[cardB])
+	}
+	if _, _, viol := d.evaluate(cardA, 12*giB, byCard[cardA]); !viol {
+		t.Fatal("card A over its per-card grant must violate (the whole point of scan #15)")
+	}
+	if _, _, viol := d.evaluate(cardB, 4*giB, byCard[cardB]); viol {
+		t.Fatal("card B under its per-card grant must NOT violate")
 	}
 }
