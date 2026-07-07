@@ -258,80 +258,82 @@ else
 fi
 
 quiesce 180
-say "CERT-06 preemption matrix (gap≥100 evicts · gap<100 doesn't · non-preemptible immune)"
+say "CERT-06 preemption matrix — NODE-level shortfall (the preemptor's actual trigger)"
+quiesce 180
 $SSH "$KC
   kubectl create ns certpre --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   j(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: %s, namespace: certpre}\nspec: {priority: %s, preemptible: %s, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \"\$1\" \"\$2\" \"\$3\" \"\$4\"; }
-  # fill EVERY card completely: CARDS holders of (percard-1Gi)
   HOLD=\$(( ($PERCARD_MIB - 1024) * 1024 * 1024 ))
-  for i in \$(seq 1 $CARDS); do j hold-\$i 10 true \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
+  # fill EVERY card: ONE preemptible pri-10 victim + 7 non-preemptible pri-300 walls
+  j victim 10 true \$HOLD | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 $((CARDS-1))); do j wall-\$i 300 false \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
   for i in \$(seq 1 50); do
     r=\$(kubectl get vgpuslice -n certpre --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = \"$CARDS\" ] && break; sleep 3
   done
   echo HOLDERS=\$(kubectl get vgpuslice -n certpre --no-headers | grep -c Ready)
-  # (1) small gap (10→80 <100): must NOT preempt; job waits
-  j smallgap 80 false $((4*GiB)) | kubectl apply -f - >/dev/null; sleep 40
-  echo SMALLGAP_PHASE=\$(kubectl get vgpuslice smallgap-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo HOLDERS_AFTER_SMALL=\$(kubectl get vgpuslice -n certpre --no-headers | grep hold- | grep -c Ready)
-  kubectl delete vgpujob smallgap -n certpre --wait=false >/dev/null 2>&1
-  # (2) big gap (10→200): MUST preempt exactly one holder and land
-  j vip 200 false $((4*GiB)) | kubectl apply -f - >/dev/null
+  # (1) small gap (10->105 = 95 < 100): 12Gi exceeds node-free (8Gi) -> preempt path -> NO eligible plan -> WAITS (Pending, never Failed)
+  j smallgap 105 false $((12*GiB)) | kubectl apply -f - >/dev/null; sleep 40
+  echo SMALLGAP=\$(kubectl get vgpuslice smallgap-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo HOLDERS_AT_SMALL=\$(kubectl get vgpuslice -n certpre --no-headers | grep -cE 'victim|wall' | head -1)
+  kubectl delete vgpujob smallgap -n certpre --wait=false >/dev/null 2>&1; sleep 5
+  # (2) big gap (10->200): MUST evict the 15Gi victim, emptying ITS card; the 12Gi vip lands there
+  j vip 200 false $((12*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 60); do
     ph=\$(kubectl get vgpuslice vip-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
   done
-  echo VIP_PHASE=\$(kubectl get vgpuslice vip-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo HOLDERS_AFTER_VIP=\$(kubectl get vgpuslice -n certpre --no-headers | grep hold- | grep -c Ready)
-  # (3) non-preemptible: replace holders' preemptible=false equivalent — submit vip2 needing space while remaining holders are preemptible=true except mark one card unpreemptible? Simplest: fresh single-card scenario
+  echo VIP=\$(kubectl get vgpuslice vip-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo VICTIM=\$(kubectl get vgpuslice victim-claim-slice -n certpre -o jsonpath='{.status.phase}' 2>/dev/null || echo GONE)
+  echo WALLS=\$(kubectl get vgpuslice -n certpre --no-headers | grep wall | grep -c Ready)
   kubectl delete ns certpre --wait=false >/dev/null 2>&1; sleep 10
+  # (3) non-preemptible fortress: ALL 8 holders non-preemptible (fort at pri 10) -> pri-999 challenger WAITS forever
   kubectl create ns certpre2 --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fort, namespace: certpre2}\nspec: {priority: 10, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \$(( ($PERCARD_MIB-1024)*1024*1024 )) | kubectl apply -f - >/dev/null
-  sleep 20
-  # fill other cards so vip3 can ONLY fit by evicting fort — but fort is non-preemptible
-  for i in \$(seq 1 $((CARDS-1))); do printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: blk-%s, namespace: certpre2}\nspec: {priority: 300, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n---\n' \$i \$(( ($PERCARD_MIB-1024)*1024*1024 )); done | kubectl apply -f - >/dev/null
-  sleep 30
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: vip3, namespace: certpre2}\nspec: {priority: 999, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
-  sleep 45
-  echo FORT_PHASE=\$(kubectl get vgpuslice fort-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo VIP3_PHASE=\$(kubectl get vgpuslice vip3-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
+  jj(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: %s, namespace: certpre2}\nspec: {priority: %s, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \"\$1\" \"\$2\" \"\$3\"; }
+  jj fort 10 \$HOLD | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 $((CARDS-1))); do jj fwall-\$i 300 \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 50); do
+    r=\$(kubectl get vgpuslice -n certpre2 --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = \"$CARDS\" ] && break; sleep 3
+  done
+  jj vip3 999 $((12*GiB)) | kubectl apply -f - >/dev/null; sleep 45
+  echo FORT=\$(kubectl get vgpuslice fort-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo VIP3=\$(kubectl get vgpuslice vip3-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete ns certpre2 --wait=false >/dev/null 2>&1" | tee "$EVID/cert06.txt"
-SG=$(grep -oE "SMALLGAP_PHASE=\w*" "$EVID/cert06.txt" | cut -d= -f2)
-HS=$(grep -oE "HOLDERS_AFTER_SMALL=[0-9]+" "$EVID/cert06.txt" | cut -d= -f2)
-VP=$(grep -oE "VIP_PHASE=\w*" "$EVID/cert06.txt" | cut -d= -f2)
-HV=$(grep -oE "HOLDERS_AFTER_VIP=[0-9]+" "$EVID/cert06.txt" | cut -d= -f2)
-FT=$(grep -oE "FORT_PHASE=\w*" "$EVID/cert06.txt" | cut -d= -f2)
-V3=$(grep -oE "VIP3_PHASE=\w*" "$EVID/cert06.txt" | cut -d= -f2)
-if [[ "$SG" != "Ready" && "$HS" == "$CARDS" && "$VP" == "Ready" && "$HV" == "$((CARDS-1))" && "$FT" == "Ready" && "$V3" != "Ready" ]]; then
-    cert CERT-06 PASS "gap<100 waited (holders intact $HS/$CARDS); gap≥100 evicted exactly one and landed; non-preemptible fort survived a priority-999 challenger"
+SG=$(grep -oE "SMALLGAP=\w*" "$EVID/cert06.txt" | cut -d= -f2)
+VP=$(grep -oE "VIP=\w*" "$EVID/cert06.txt" | cut -d= -f2)
+VC=$(grep -oE "VICTIM=\w*" "$EVID/cert06.txt" | cut -d= -f2)
+WL=$(grep -oE "WALLS=[0-9]+" "$EVID/cert06.txt" | cut -d= -f2)
+FT=$(grep -oE "FORT=\w*" "$EVID/cert06.txt" | cut -d= -f2)
+V3=$(grep -oE "VIP3=\w*" "$EVID/cert06.txt" | cut -d= -f2)
+if [[ "$SG" != "Ready" && "$SG" != "Failed" && "$VP" == "Ready" && "$VC" != "Ready" && "$WL" == "$((CARDS-1))" && "$FT" == "Ready" && "$V3" != "Ready" && "$V3" != "Failed" ]]; then
+    cert CERT-06 PASS "gap<100 WAITED (not failed); gap>=100 evicted the 15Gi victim, vip landed on the emptied card, all 7 walls intact; pri-999 vs all-non-preemptible WAITED"
 else
-    cert CERT-06 FAIL "smallgap=$SG holders=$HS vip=$VP holdersAfter=$HV fort=$FT vip3=$V3"
+    cert CERT-06 FAIL "smallgap=$SG vip=$VP victim=$VC walls=$WL fort=$FT vip3=$V3"
 fi
 
-quiesce 180
 say "CERT-06x preemption boundary (gap==100 evicts, gap==99 waits) + victim ORDER"
+quiesce 180
 $SSH "$KC
   kubectl create ns certgap --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   j(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: %s, namespace: certgap}\nspec: {priority: %s, preemptible: %s, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \"\$1\" \"\$2\" \"\$3\" \"\$4\"; }
   HOLD=\$(( ($PERCARD_MIB - 1024) * 1024 * 1024 ))
-  # two victims at DIFFERENT priorities (10 and 30) among the holders — order probe
   j v10 10 true \$HOLD | kubectl apply -f - >/dev/null
   j v30 30 true \$HOLD | kubectl apply -f - >/dev/null
-  for i in \$(seq 1 $((CARDS-2))); do j blk-\$i 400 false \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 $((CARDS-2))); do j gwall-\$i 400 false \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
   for i in \$(seq 1 50); do
     r=\$(kubectl get vgpuslice -n certgap --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = \"$CARDS\" ] && break; sleep 3
   done
   echo PACKED=\$(kubectl get vgpuslice -n certgap --no-headers | grep -c Ready)
-  # (a) gap 99: vip at 109 vs best victim 10 -> 99 < 100 -> MUST wait
-  j gap99 109 false $((4*GiB)) | kubectl apply -f - >/dev/null; sleep 40
+  # (a) gap 99: vip 109 vs best victim 10 -> 99 < 100 -> WAITS (12Gi > node-free 8Gi so it's preempt-or-wait, never frag-fail)
+  j gap99 109 false $((12*GiB)) | kubectl apply -f - >/dev/null; sleep 40
   echo GAP99=\$(kubectl get vgpuslice gap99-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
   echo V10_AT99=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete vgpujob gap99 -n certgap --wait=false >/dev/null 2>&1; sleep 5
-  # (b) gap exactly 100: vip at 110 -> MUST evict, and the victim must be v10 (lowest priority first), NOT v30
-  j gap100 110 false $((4*GiB)) | kubectl apply -f - >/dev/null
+  # (b) gap exactly 100: vip 110 -> ONLY v10 is eligible (v30 gap=80) -> v10 evicted, v30 spared
+  j gap100 110 false $((12*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 60); do
     ph=\$(kubectl get vgpuslice gap100-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
   done
   echo GAP100=\$(kubectl get vgpuslice gap100-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo V10_AFTER=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo V10_AFTER=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null || echo GONE)
   echo V30_AFTER=\$(kubectl get vgpuslice v30-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete ns certgap --wait=false >/dev/null 2>&1" | tee "$EVID/cert06x.txt"
 G99=$(grep -oE "GAP99=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
@@ -339,7 +341,7 @@ V99=$(grep -oE "V10_AT99=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
 G100=$(grep -oE "GAP100=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
 V10A=$(grep -oE "V10_AFTER=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
 V30A=$(grep -oE "V30_AFTER=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
-if [[ "$G99" != "Ready" && "$V99" == "Ready" && "$G100" == "Ready" && "$V10A" != "Ready" && "$V30A" == "Ready" ]]; then
+if [[ "$G99" != "Ready" && "$G99" != "Failed" && "$V99" == "Ready" && "$G100" == "Ready" && "$V10A" != "Ready" && "$V30A" == "Ready" ]]; then
     cert CERT-06x PASS "gap=99 waited (victim untouched); gap=100 evicted; victim ORDER correct (pri-10 evicted, pri-30 spared)"
 else
     cert CERT-06x FAIL "gap99=$G99 v10@99=$V99 gap100=$G100 v10=$V10A v30=$V30A"

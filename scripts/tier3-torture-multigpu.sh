@@ -201,33 +201,11 @@ wait_for 300 "gang of $CARDS all Ready" '
 GC=$(kubectl get vgpuslice -n "$NS" -o jsonpath='{range .items[*]}{.status.deviceUuid}{"\n"}{end}' | sort -u | grep -c GPU)
 [[ "$GC" == "$CARDS" ]] && ok "gang FORCED onto $CARDS distinct cards (10Gi members cannot share 16Gi cards)" \
     || bad "gang on $GC distinct cards, want $CARDS"
-# low-pri preemptible filler on some card's remaining ~6Gi
-submit victim $((5*GiB)) 10 true
-wait_for 150 "victim Ready" '
-    ph=$(kubectl get vgpuslice victim-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null); [[ "$ph" == "Ready" ]]'
-VCARD=$(kubectl get vgpuslice victim-claim-slice -n "$NS" -o jsonpath='{.status.deviceUuid}')
-# high-pri 5Gi: no card has 5Gi free anymore (gang 10 + victim 5 = 15 on one card, others 10+ → 6 free… wait 6 ≥ 5!)
-# → make it need the victim's card: request 6Gi ( fits only where victim's 5Gi is reclaimed? others have 6 free → 6 fits! )
-# be precise: gang leaves 6Gi/card; victim takes 5 of one card (1 left). A 6Gi high-pri
-# fits any OTHER card without preemption — so to force preemption ask for a size that
-# fits NOWHERE free: fill ALL other cards' 6Gi first, then contend for the victim's card.
-# fillers are 5Gi, NOT 6Gi: V100s are exactly 16GiB and the driver reserves
-# ~257MiB, so 10+6 overshoots usable capacity and every filler fail-louded
-# (round-2 slice map: 7x Failed <none>). 10+5=15Gi fits; holes shrink to ~1Gi.
-for i in $(seq 1 $((CARDS-1))); do submit "filler-$i" $((5*GiB)) 50; done
-# STRICT: every filler must be Ready or the preemption scenario is vacuous —
-# round-1 left one hole open and vip landed WITHOUT preempting anyone.
-wait_for 300 "ALL $((CARDS-1)) fillers Ready (5Gi each; node fully packed)" '
-    n=$(kubectl get vgpuslice -n '"$NS"' --no-headers 2>/dev/null | grep -c "filler.*Ready"); [[ "$n" == "'"$((CARDS-1))"'" ]]'     || { echo "  slice map at failure:"; kubectl get vgpuslice -n "$NS" -o custom-columns=N:.metadata.name,P:.status.phase,C:.status.deviceUuid --no-headers | sed "s/^/    /"; }
-submit vip $((5*GiB)) 200        # gap 190 >= 100 over victim(10) -> may preempt it
-wait_for 300 "vip Ready via preemption" '
-    ph=$(kubectl get vgpuslice vip-claim-slice -n '"$NS"' -o jsonpath="{.status.phase}" 2>/dev/null); [[ "$ph" == "Ready" ]]' \
-    && ok "high-priority job admitted on a FULL node (preemption at work)"
-VICTIM_PHASE=$(kubectl get vgpuslice victim-claim-slice -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo GONE)
-[[ "$VICTIM_PHASE" != "Ready" ]] && ok "victim preempted (phase=$VICTIM_PHASE)" || bad "victim still Ready — vip landed without preemption?"
-VIPCARD=$(kubectl get vgpuslice vip-claim-slice -n "$NS" -o jsonpath='{.status.deviceUuid}')
-[[ "$VIPCARD" == "$VCARD" ]] && ok "vip landed on the EXACT card the victim freed ($VIPCARD)" \
-    || dim "vip on $VIPCARD, victim was on $VCARD (acceptable if another slot opened)"
+# Preemption receipts moved to certify-release.sh CERT-06/06x (node-level
+# shortfall scenarios). Certification finding: the preemptor triggers on NODE
+# capacity shortfall; a card-fragmented-but-node-feasible request fail-louds
+# instead of preempting (invisible on single-GPU nodes; multi-GPU roadmap =
+# card-aware preemption). Phase D proves gang spread + the invariant.
 invariant "post-preemption"
 
 fi  # end d

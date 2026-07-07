@@ -34,6 +34,12 @@ Run: `HOST=user@gpu-box bash scripts/certify-release.sh`
 | **CERT-17** | Dashboard truth | Grafana panels render through the provisioned datasource; numbers match `vgpu report` ±1 %; dashboard survives restart |
 | **CERT-18** | Multi-node failures *(optional: needs ≥2 GPU nodes)* | Cross-node gang; whole-node kill → reschedule onto survivors with real NVML teardown; network partition mid-gang → no split-brain admission |
 
+**Known limitation (found by CERT-06 on 8×V100, 2026-07-07):** the preemptor
+triggers on NODE-level capacity shortfall. A request that fits the node total
+but no single card (card-fragmented) FAILS LOUD rather than preempting — honest
+per the fragmentation contract, invisible on single-GPU nodes, and a roadmap
+item (card-aware preemption) for multi-GPU nodes.
+
 **Verdict rule:** FINAL_VERDICT=PASS requires every non-optional CERT green.
 Evidence lands in `artifacts/certify-<sha>/` (one file per CERT). The suite is
 built from the receipt scripts that already validated v0.16–v0.19, plus the
