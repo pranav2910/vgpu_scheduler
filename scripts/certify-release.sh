@@ -33,6 +33,19 @@ cert(){ # id verdict note
 # (remote-side helper; injected into blocks that need it via $POLL)
 POLL='pollp(){ for _ in $(seq 1 $(($4/4))); do p=$(kubectl get vgpuslice "$2" -n "$1" -o jsonpath="{.status.phase}" 2>/dev/null); [ "$p" = "$3" ] && return 0; sleep 4; done; return 1; };'
 
+# wait until NO slices exist cluster-wide (releases from the previous section
+# must fully drain before exact-fit packing sections, or they block the pack)
+quiesce(){
+    local tmo="${1:-180}"
+    for _ in $(seq 1 $((tmo/5))); do
+        local n
+        n=$($SSH "export KUBECONFIG=\$HOME/.kube/config; kubectl get vgpuslice -A --no-headers 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+        [ "${n:-1}" = "0" ] && return 0
+        sleep 5
+    done
+    echo "  (quiesce timeout — $n slices still present)"
+}
+
 # run a long on-box command disconnect-proof: nohup + poll for a marker file
 run_onbox(){ # name script-body timeout-sec
     local name="$1" body="$2" tmo="${3:-900}"
@@ -101,6 +114,7 @@ SZREADY=$(grep -c " Ready " "$EVID/cert02a.txt" || true)
 [[ "$SZREADY" == "4" ]] && cert CERT-02a PASS "4 size classes allocated (1Gi..13Gi)" \
     || cert CERT-02a FAIL "only $SZREADY/4 sizes Ready"
 
+quiesce 180
 say "CERT-02b/03/04 packing spread + isolation + fragmentation (+#15 live) — multigpu validator"
 if $SSH "$KC; bash scripts/validate-multigpu-a100.sh" > "$EVID/cert02b-04.log" 2>&1; then
     cert CERT-02b PASS "N×4 grants, 4-per-card across all $CARDS real cards, ledger capped"
@@ -110,6 +124,7 @@ else
     for c in CERT-02b CERT-03 CERT-04; do cert $c FAIL "multigpu validator failed — $EVID/cert02b-04.log"; done
 fi
 
+quiesce 180
 say "CERT-04x fragmentation deep-matrix: two-sided boundary + truthful numbers + recovery"
 $SSH "$KC
   kubectl create ns certfrag --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -123,7 +138,7 @@ $SSH "$KC
   done
   echo HOLDERS=\$(kubectl get vgpuslice -n certfrag --no-headers | grep -c Ready)
   # (a) request BIGGER than any hole (6Gi > ~4.7Gi) but far under node-free -> LOUD fail
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fbig, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fbig, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 30); do
     ph=\$(kubectl get vgpuslice fbig-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Failed ] && break; sleep 4
   done
@@ -131,12 +146,12 @@ $SSH "$KC
   MSG=\$(kubectl get vgpuslice fbig-claim-slice -n certfrag -o jsonpath='{.status.lastError}' 2>/dev/null)
   echo \"FBIG_MSG=\$MSG\"
   # (b) request SMALLER than a hole (3Gi < 4.7Gi) -> must SUCCEED (fail-loud is not fail-always)
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fsmall, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((3*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fsmall, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((3*GiB)) | kubectl apply -f - >/dev/null
   sleep 25
   echo FSMALL=\$(kubectl get vgpuslice fsmall-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null)
   # (c) recovery: release ONE holder -> the SAME 6Gi (resubmitted) must now land
   kubectl delete vgpujob fbig fh-1 -n certfrag >/dev/null 2>&1; sleep 15
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fretry, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fretry, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
   sleep 30
   echo FRETRY=\$(kubectl get vgpuslice fretry-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete ns certfrag --wait=false >/dev/null 2>&1" | tee "$EVID/cert04x.txt"
@@ -149,14 +164,15 @@ MSGLINE=$(grep "FBIG_MSG=" "$EVID/cert04x.txt")
 if [[ "$MSGLINE" == *"Fragmented capacity."* ]]; then
     CARDFREE=$(echo "$MSGLINE" | grep -oE "No single GPU has [0-9.]+" | grep -oE "[0-9.]+")
     NODEFREE=$(echo "$MSGLINE" | grep -oE "node has [0-9.]+" | grep -oE "[0-9.]+")
-    awk -v c="$CARDFREE" -v n="$NODEFREE" 'BEGIN{exit !(c<6 && n>=6)}' && NUMS_OK=yes
+    awk -v c="${CARDFREE:-99}" -v n="${NODEFREE:-0}" 'BEGIN{exit !(c<6 && n>=6)}' && NUMS_OK=yes
 fi
 if [[ "$FB" == "Failed" && "$NUMS_OK" == "yes" && "$FS" == "Ready" && "$FR" == "Ready" ]]; then
     cert CERT-04x PASS "boundary two-sided (6Gi>hole FAILED loud, 3Gi<hole landed); message numbers TRUTHFUL (card<6<=node); release->retry recovered"
 else
-    cert CERT-04x FAIL "fbig=$FB nums=$NUMS_OK($CARDFREE/$NODEFREE) fsmall=$FS fretry=$FR"
+    cert CERT-04x FAIL "fbig=$FB nums=$NUMS_OK(${CARDFREE:-?}/${NODEFREE:-?}) fsmall=$FS fretry=$FR"
 fi
 
+quiesce 180
 say "CERT-05 gang atomicity at sizes 2, 4, 8 + infeasible-zero + name-reuse"
 $SSH "$KC
   kubectl create ns certgang --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -198,7 +214,7 @@ $SSH "$KC
   kubectl create ns certg-b --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   g(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: %s, namespace: %s}\nspec: {gangSize: %s, minAvailable: %s, reservationTimeoutSeconds: %s, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \"\$1\" \"\$2\" \"\$3\" \"\$3\" \"\$4\" \"\$5\"; }
   # SAME gang name 'twins' in TWO namespaces, submitted together (cohort keying = ns/name)
-  { g twins certg-a 3 120 \$((2*GiB)); echo ---; g twins certg-b 3 120 \$((2*GiB)); } | kubectl apply -f - >/dev/null
+  { g twins certg-a 3 120 $((2*GiB)); echo ---; g twins certg-b 3 120 $((2*GiB)); } | kubectl apply -f - >/dev/null
   for i in \$(seq 1 40); do
     a=\$(kubectl get vgpuslice -n certg-a --no-headers 2>/dev/null | grep -c Ready)
     b=\$(kubectl get vgpuslice -n certg-b --no-headers 2>/dev/null | grep -c Ready)
@@ -206,12 +222,12 @@ $SSH "$KC
   done
   echo TWINS=\$(kubectl get vgpuslice -n certg-a --no-headers | grep -c Ready)/\$(kubectl get vgpuslice -n certg-b --no-headers | grep -c Ready)
   # timeout reclaim: infeasible gang with a SHORT deadline must clean up FULLY
-  g doomed certg-a 8 45 \$((15*GiB)) | kubectl apply -f - >/dev/null
+  g doomed certg-a 8 45 $((15*GiB)) | kubectl apply -f - >/dev/null
   sleep 75
   echo DOOMED_SLICES=\$(kubectl get vgpuslice -n certg-a --no-headers 2>/dev/null | grep -c doomed || true)
   echo DOOMED_RSV=\$(kubectl get vgpugangreservation -n certg-a --no-headers 2>/dev/null | grep doomed | grep -civ 'Failed\|Released' || true)
   # capacity unharmed after the doomed gang: a normal job still lands
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: after, namespace: certg-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: after, namespace: certg-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
   sleep 30
   echo AFTER=\$(kubectl get vgpuslice after-claim-slice -n certg-a -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete ns certg-a certg-b --wait=false >/dev/null 2>&1" | tee "$EVID/cert05x.txt"
@@ -224,6 +240,7 @@ else
     cert CERT-05x FAIL "twins=$TW doomed_slices=$DS after=$AF"
 fi
 
+quiesce 180
 say "CERT-06 preemption matrix (gap≥100 evicts · gap<100 doesn't · non-preemptible immune)"
 $SSH "$KC
   kubectl create ns certpre --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -255,7 +272,7 @@ $SSH "$KC
   # fill other cards so vip3 can ONLY fit by evicting fort — but fort is non-preemptible
   for i in \$(seq 1 $((CARDS-1))); do printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: blk-%s, namespace: certpre2}\nspec: {priority: 300, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n---\n' \$i \$(( ($PERCARD_MIB-1024)*1024*1024 )); done | kubectl apply -f - >/dev/null
   sleep 30
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: vip3, namespace: certpre2}\nspec: {priority: 999, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: vip3, namespace: certpre2}\nspec: {priority: 999, preemptible: false, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
   sleep 45
   echo FORT_PHASE=\$(kubectl get vgpuslice fort-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
   echo VIP3_PHASE=\$(kubectl get vgpuslice vip3-claim-slice -n certpre2 -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -272,6 +289,7 @@ else
     cert CERT-06 FAIL "smallgap=$SG holders=$HS vip=$VP holdersAfter=$HV fort=$FT vip3=$V3"
 fi
 
+quiesce 180
 say "CERT-06x preemption boundary (gap==100 evicts, gap==99 waits) + victim ORDER"
 $SSH "$KC
   kubectl create ns certgap --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -286,12 +304,12 @@ $SSH "$KC
   done
   echo PACKED=\$(kubectl get vgpuslice -n certgap --no-headers | grep -c Ready)
   # (a) gap 99: vip at 109 vs best victim 10 -> 99 < 100 -> MUST wait
-  j gap99 109 false \$((4*GiB)) | kubectl apply -f - >/dev/null; sleep 40
+  j gap99 109 false $((4*GiB)) | kubectl apply -f - >/dev/null; sleep 40
   echo GAP99=\$(kubectl get vgpuslice gap99-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
   echo V10_AT99=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
   kubectl delete vgpujob gap99 -n certgap --wait=false >/dev/null 2>&1; sleep 5
   # (b) gap exactly 100: vip at 110 -> MUST evict, and the victim must be v10 (lowest priority first), NOT v30
-  j gap100 110 false \$((4*GiB)) | kubectl apply -f - >/dev/null
+  j gap100 110 false $((4*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 60); do
     ph=\$(kubectl get vgpuslice gap100-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
   done
@@ -313,15 +331,15 @@ fi
 say "CERT-07 quota: single-job cap + gang-atomic denial"
 $SSH "$KC
   kubectl create ns certq --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq}\nspec: {maxVramBytes: %s}\n' \$((10*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq}\nspec: {maxVramBytes: %s}\n' $((10*GiB)) | kubectl apply -f - >/dev/null
   sleep 3
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fits, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: busts, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fits, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: busts, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
   sleep 35
   echo FITS=\$(kubectl get vgpuslice fits-claim-slice -n certq -o jsonpath='{.status.phase}' 2>/dev/null)
   echo BUSTS=\$(kubectl get vgpuslice busts-claim-slice -n certq -o jsonpath='{.status.phase}' 2>/dev/null)
   # gang total 4x4=16Gi > remaining 4Gi -> ZERO members admitted
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: qgang, namespace: certq}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 60, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: qgang, namespace: certq}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 60, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
   sleep 45
   echo QGANG_READY=\$(kubectl get vgpuslice -n certq --no-headers 2>/dev/null | grep qgang | grep -c Ready || true)
   kubectl delete ns certq --wait=false >/dev/null 2>&1" | tee "$EVID/cert07.txt"
@@ -334,28 +352,29 @@ else
     cert CERT-07 FAIL "fits=$QF busts=$QB qgang=$QG"
 fi
 
+quiesce 180
 say "CERT-07x quota deep-matrix: exact boundary + live raise + namespace isolation"
 $SSH "$KC
   kubectl create ns certq-a --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl create ns certq-b --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' \$((16*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' $((16*GiB)) | kubectl apply -f - >/dev/null
   sleep 3
   # (a) gang EXACTLY at quota (4x4=16Gi == 16Gi cap) -> must ADMIT (<=, not <)
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: exact, namespace: certq-a}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 90, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: exact, namespace: certq-a}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 90, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 40); do
     r=\$(kubectl get vgpuslice -n certq-a --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = 4 ] && break; sleep 3
   done
   echo EXACT=\$(kubectl get vgpuslice -n certq-a --no-headers | grep -c Ready)
   # (b) +1 byte over: a 1Gi job must now be DENIED (quota full)
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: onemore, namespace: certq-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((1*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: onemore, namespace: certq-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((1*GiB)) | kubectl apply -f - >/dev/null
   sleep 20
   echo ONEMORE=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null)
   # (c) ns ISOLATION: certq-b (no quota) must be unaffected while certq-a is full
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: freejob, namespace: certq-b}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: freejob, namespace: certq-b}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
   sleep 25
   echo FREE=\$(kubectl get vgpuslice freejob-claim-slice -n certq-b -o jsonpath='{.status.phase}' 2>/dev/null)
   # (d) LIVE RAISE: bump quota to 20Gi -> the denied job must admit WITHOUT resubmission
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' \$((20*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' $((20*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 40); do
     ph=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
   done
@@ -371,6 +390,7 @@ else
     cert CERT-07x FAIL "exact=$EX onemore=$OM freens=$FRE after_raise=$ARZ"
 fi
 
+quiesce 180
 say "CERT-09/12/13 enforcement ladder + crash storm + churn (tier3 torture phases)"
 run_onbox t3ab "PHASE=ab NS=certt3 CHURN_WAVES=3 bash scripts/tier3-torture-multigpu.sh" 1200
 AB_FAIL=$(grep -oE "FAIL=[0-9]+" "$EVID/t3ab.log" | tail -1 | cut -d= -f2)
@@ -436,7 +456,7 @@ grep -q "MATCH=yes" "$EVID/cert10.txt" && grep -q "FORMATS=yes" "$EVID/cert10.tx
 say "CERT-11 right-sizing loop: learn → recommend ≈ peak×1.15 → autoResize"
 $SSH "$KC
   kubectl create ns certrs --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: learner, namespace: certrs}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}, podTemplate: {spec: {runtimeClassName: nvidia, containers: [{name: w, image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime, command: [python, -c, \"import torch,time; x=torch.empty(int(6*1024**3)//2, dtype=torch.float16, device='\''cuda'\'').normal_(); torch.cuda.synchronize(); time.sleep(600)\"]}]}}}\n' \$((10*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: learner, namespace: certrs}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}, podTemplate: {spec: {runtimeClassName: nvidia, containers: [{name: w, image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime, command: [python, -c, \"import torch,time; x=torch.empty(int(6*1024**3)//2, dtype=torch.float16, device='\''cuda'\'').normal_(); torch.cuda.synchronize(); time.sleep(600)\"]}]}}}\n' $((10*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 50); do
     p=\$(kubectl get pod learner-workload -n certrs -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$p\" = Running ] && break; sleep 4
   done
@@ -453,6 +473,7 @@ else
     cert CERT-11 FAIL "peak=$PEAK rec=$REC (want rec≈peak×1.15 with peak≈6Gi)"
 fi
 
+quiesce 180
 say "CERT-14 burst admission: 100×1Gi in one apply"
 $SSH "$KC
   kubectl create ns certburst --dry-run=client -o yaml | kubectl apply -f - >/dev/null
