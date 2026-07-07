@@ -20,13 +20,13 @@ EVID="artifacts/certify-${SHA}"; mkdir -p "$EVID"
 KC='export KUBECONFIG=$HOME/.kube/config; cd vgpu_scheduler'
 GiB=$((1024*1024*1024))
 
-declare -A CERT_RESULT CERT_NOTE
+CERTLOG="$EVID/.certlog"; : > "$CERTLOG"
 PASS=0; FAIL=0
 ok(){ echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad(){ echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 say(){ echo; echo "━━ $* ━━"; }
 cert(){ # id verdict note
-    CERT_RESULT[$1]="$2"; CERT_NOTE[$1]="$3"
+    printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$CERTLOG"
     [[ "$2" == "PASS" ]] && ok "$1: $3" || bad "$1 FAILED: $3"
 }
 # poll_slice ns name phase timeout — early-exit wait (replaces fixed sleeps)
@@ -47,7 +47,9 @@ run_onbox(){ # name script-body timeout-sec
 }
 
 say "0. sync repo + full stack + FRESH images at $SHA"
-$SSH "$KC; git fetch -q origin && git reset -q --hard origin/main && git log --oneline -1" | tee "$EVID/00-sync.txt"
+$SSH "git clone -q https://github.com/pranav2910/vgpu_scheduler.git 2>/dev/null; cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/main && git log --oneline -1" | tee "$EVID/00-sync.txt"
+# ensure the control plane exists: bootstrap builds the nvml image + k3s if fresh
+$SSH "$KC; kubectl get ns vgpu-system >/dev/null 2>&1 || bash scripts/a10-bootstrap.sh" > "$EVID/00-prebootstrap.log" 2>&1 || true
 $SSH "$KC; bash scripts/h100-control-plane.sh" > "$EVID/00-bringup.log" 2>&1 \
     || { echo "bring-up failed"; exit 1; }
 $SSH "$KC; set -e
@@ -499,8 +501,8 @@ REPORT="$EVID/CERTIFICATION-REPORT.md"
     echo
     echo "| CERT | Verdict | Evidence |"
     echo "|------|---------|----------|"
-    for id in $(printf '%s\n' "${!CERT_RESULT[@]}" | sort); do
-        echo "| $id | ${CERT_RESULT[$id]} | ${CERT_NOTE[$id]} |"
+    sort "$CERTLOG" | while IFS='|' read -r id v note; do
+        echo "| $id | $v | $note |"
     done
     echo
     echo "CERT-18 (multi-node failures): run separately — scripts/tier4-multinode-failures.sh"
