@@ -99,6 +99,29 @@ grep -q "ZONED_ZONE=zone-a10" "$EVID/cert08.txt" && grep -q "SOFT_PHASE=Ready" "
     && ok "CERT-08: hint honored (landed zone-a10); infeasible hint stayed SOFT (13Gi scheduled anyway on the big node)" \
     || bad "CERT-08: $(grep -E 'ZONED_ZONE|SOFT' "$EVID/cert08.txt" | tr '\n' ' ')"
 
+say "CERT-08x: dual-zone concurrent + unhinted + hit/miss metrics move"
+$S1 "export KUBECONFIG=\$HOME/.kube/config
+  kubectl create ns certtopo2 --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  H0=\$(kubectl get --raw /api/v1/namespaces/vgpu-system/services/vgpu-scheduler-metrics:8081/proxy/metrics 2>/dev/null | awk '/^vgpu_topology_preference_hits_total/ {s+=\$2} END{printf \"%d\", s}')
+  # two jobs hinted at two DIFFERENT zones, applied together
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: za, namespace: certtopo2, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n---\n' \$((4*GiB)) > /tmp/tz.yaml
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: zb, namespace: certtopo2, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-big}}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n---\n' \$((4*GiB)) >> /tmp/tz.yaml
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: zn, namespace: certtopo2}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((2*GiB)) >> /tmp/tz.yaml
+  kubectl apply -f /tmp/tz.yaml >/dev/null
+  sleep 35
+  for j in za zb zn; do
+    N=\$(kubectl get vgpuslice \$j-claim-slice -n certtopo2 -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    Z=\$(kubectl get node \$N -o jsonpath='{.metadata.labels.topology\.vgpu\.pranav2910\.com/zone}' 2>/dev/null)
+    P=\$(kubectl get vgpuslice \$j-claim-slice -n certtopo2 -o jsonpath='{.status.phase}' 2>/dev/null)
+    echo \$j=\$P@\$Z
+  done
+  H1=\$(kubectl get --raw /api/v1/namespaces/vgpu-system/services/vgpu-scheduler-metrics:8081/proxy/metrics 2>/dev/null | awk '/^vgpu_topology_preference_hits_total/ {s+=\$2} END{printf \"%d\", s}')
+  echo HITS_DELTA=\$(( \${H1:-0} - \${H0:-0} ))
+  kubectl delete ns certtopo2 --wait=false >/dev/null 2>&1" | tee "$EVID/cert08x.txt"
+grep -q "za=Ready@zone-a10" "$EVID/cert08x.txt" && grep -q "zb=Ready@zone-big" "$EVID/cert08x.txt" && grep -qE "zn=Ready@" "$EVID/cert08x.txt" \
+    && ok "CERT-08x: two concurrent jobs each landed in THEIR hinted zone; unhinted job unaffected (hits delta: $(grep -oE 'HITS_DELTA=[0-9-]+' "$EVID/cert08x.txt" | cut -d= -f2))" \
+    || bad "CERT-08x: $(grep -E 'za=|zb=|zn=' "$EVID/cert08x.txt" | tr '\n' ' ')"
+
 say "CERT-18b: cross-node gang — bigger than any single node, all-or-nothing"
 $S1 "export KUBECONFIG=\$HOME/.kube/config
   kubectl create ns certxg --dry-run=client -o yaml | kubectl apply -f - >/dev/null

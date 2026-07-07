@@ -14,10 +14,15 @@ Run: `HOST=user@gpu-box bash scripts/certify-release.sh`
 | **CERT-02** | Slicing multi-value pack | Grants at 1 Gi / 3.75 Gi / 7.5 Gi / 13 Gi all allocate, coexist per-card within capacity, and release cleanly — VRAM-byte slicing at four size classes, not one demo value |
 | **CERT-03** | Cross-card isolation | Two pods forced onto different physical cards each see ONLY their own GPU UUID inside the container (CDI + NVIDIA_VISIBLE_DEVICES pin) |
 | **CERT-04** | Fragmentation honesty | With per-card holes smaller than the request but node-total larger: allocation FAILS LOUD with the exact "Fragmented capacity" message — never silent, never over-committed |
+| **CERT-04x** | Fragmentation deep-matrix | Two-sided boundary (bigger-than-hole FAILS loud, smaller-than-hole LANDS); the error message's numbers are arithmetically truthful (cardFree < request ≤ nodeFree); release → retry recovers |
 | **CERT-05** | Gang atomicity multi-size | Gangs of 2, 4, and 8 admit all-or-nothing; an infeasible gang admits ZERO members and reclaims its reservation on timeout; a completed gang's name can be REUSED safely (regression S1) |
+| **CERT-05x** | Gang deep-matrix | Same gang name in TWO namespaces simultaneously — both complete (cohort keying); infeasible gang FULLY reclaimed on timeout; capacity unharmed after |
 | **CERT-06** | Preemption matrix | (victim 10, vip 200) → evicted + vip lands; (victim 50, vip 120: gap < 100) → NOT evicted; non-preemptible victim → immune; **full-pack variant**: vip with zero free holes must go through the preemptor and land on the freed card |
+| **CERT-06x** | Preemption boundary + order | Gap **exactly 100** evicts; gap 99 waits; with victims at priority 10 and 30, the pri-10 one is evicted and pri-30 spared (lowest-first selection) |
 | **CERT-07** | Quota enforcement | Namespace quota rejects the job that would exceed it; a gang whose TOTAL exceeds quota admits zero members (gang-atomic, fail-closed) |
+| **CERT-07x** | Quota deep-matrix | Gang EXACTLY at cap admits (≤ boundary); next 1 Gi denied; other namespaces unaffected; LIVE quota raise unblocks the waiting job without resubmission |
 | **CERT-08** | Topology preference | Zone-hinted job lands in the preferred zone when feasible; still schedules (soft) when not; TopologyPreferenceSatisfied condition truthful |
+| **CERT-08x** | Topology dual-zone | Two concurrent jobs hinted at DIFFERENT zones each land in their own zone; unhinted job unaffected |
 | **CERT-09** | Enforcement ladder | Over-user detected (~90 s streak) → softwarn labels/events, NOT killed; evict mode → killed via Eviction API; exempt namespace → immune even in evict mode; 3 cards violating SIMULTANEOUSLY, others clean |
 | **CERT-10** | Attribution truth | 40-proc CUDA fork-storm on a compliant pod → ZERO false violations; report used-bytes == nvidia-smi ±1 GiB at three different load levels; table = CSV = JSON |
 | **CERT-11** | Right-sizing loop | Workload burning a KNOWN size → profile learns the peak; recommendation ≈ peak×1.15; autoResize raises an undersized re-submit; override annotation respected |

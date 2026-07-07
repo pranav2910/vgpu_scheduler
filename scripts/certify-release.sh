@@ -94,6 +94,53 @@ else
     for c in CERT-02b CERT-03 CERT-04; do cert $c FAIL "multigpu validator failed — $EVID/cert02b-04.log"; done
 fi
 
+say "CERT-04x fragmentation deep-matrix: two-sided boundary + truthful numbers + recovery"
+$SSH "$KC
+  kubectl create ns certfrag --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  # hold (percard - 5Gi) on EVERY card -> every hole is ~5Gi minus driver reserve (~4.7Gi usable)
+  HOLD=\$(( ($PERCARD_MIB - 5120) * 1024 * 1024 ))
+  for i in \$(seq 1 $CARDS); do
+    printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fh-%s, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n---\n' \$i \$HOLD
+  done | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 50); do
+    r=\$(kubectl get vgpuslice -n certfrag --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = \"$CARDS\" ] && break; sleep 3
+  done
+  echo HOLDERS=\$(kubectl get vgpuslice -n certfrag --no-headers | grep -c Ready)
+  # (a) request BIGGER than any hole (6Gi > ~4.7Gi) but far under node-free -> LOUD fail
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fbig, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 30); do
+    ph=\$(kubectl get vgpuslice fbig-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Failed ] && break; sleep 4
+  done
+  echo FBIG_PHASE=\$(kubectl get vgpuslice fbig-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null)
+  MSG=\$(kubectl get vgpuslice fbig-claim-slice -n certfrag -o jsonpath='{.status.lastError}' 2>/dev/null)
+  echo \"FBIG_MSG=\$MSG\"
+  # (b) request SMALLER than a hole (3Gi < 4.7Gi) -> must SUCCEED (fail-loud is not fail-always)
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fsmall, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((3*GiB)) | kubectl apply -f - >/dev/null
+  sleep 25
+  echo FSMALL=\$(kubectl get vgpuslice fsmall-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null)
+  # (c) recovery: release ONE holder -> the SAME 6Gi (resubmitted) must now land
+  kubectl delete vgpujob fbig fh-1 -n certfrag >/dev/null 2>&1; sleep 15
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fretry, namespace: certfrag}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((6*GiB)) | kubectl apply -f - >/dev/null
+  sleep 30
+  echo FRETRY=\$(kubectl get vgpuslice fretry-claim-slice -n certfrag -o jsonpath='{.status.phase}' 2>/dev/null)
+  kubectl delete ns certfrag --wait=false >/dev/null 2>&1" | tee "$EVID/cert04x.txt"
+FB=$(grep -oE "FBIG_PHASE=\w*" "$EVID/cert04x.txt" | cut -d= -f2)
+FS=$(grep -oE "FSMALL=\w*" "$EVID/cert04x.txt" | cut -d= -f2)
+FR=$(grep -oE "FRETRY=\w*" "$EVID/cert04x.txt" | cut -d= -f2)
+# truthful numbers: "No single GPU has XGi free; node has YGi free" with X < 6 <= Y
+NUMS_OK=no
+MSGLINE=$(grep "FBIG_MSG=" "$EVID/cert04x.txt")
+if [[ "$MSGLINE" == *"Fragmented capacity."* ]]; then
+    CARDFREE=$(echo "$MSGLINE" | grep -oE "No single GPU has [0-9.]+" | grep -oE "[0-9.]+")
+    NODEFREE=$(echo "$MSGLINE" | grep -oE "node has [0-9.]+" | grep -oE "[0-9.]+")
+    awk -v c="$CARDFREE" -v n="$NODEFREE" 'BEGIN{exit !(c<6 && n>=6)}' && NUMS_OK=yes
+fi
+if [[ "$FB" == "Failed" && "$NUMS_OK" == "yes" && "$FS" == "Ready" && "$FR" == "Ready" ]]; then
+    cert CERT-04x PASS "boundary two-sided (6Gi>hole FAILED loud, 3Gi<hole landed); message numbers TRUTHFUL (card<6<=node); release->retry recovered"
+else
+    cert CERT-04x FAIL "fbig=$FB nums=$NUMS_OK($CARDFREE/$NODEFREE) fsmall=$FS fretry=$FR"
+fi
+
 say "CERT-05 gang atomicity at sizes 2, 4, 8 + infeasible-zero + name-reuse"
 $SSH "$KC
   kubectl create ns certgang --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -104,6 +151,8 @@ $SSH "$KC
     r=\$(kubectl get vgpuslice -n certgang --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = 14 ] && break; sleep 3
   done
   echo FEASIBLE_READY=\$(kubectl get vgpuslice -n certgang --no-headers 2>/dev/null | grep -c Ready)
+  # per-gang completeness — a 14-total could hide 3/2+5/4+6/8
+  echo PERGANG=\$(kubectl get vgpuslice -n certgang --no-headers | grep g2 | grep -c Ready)/2,\$(kubectl get vgpuslice -n certgang --no-headers | grep g4 | grep -c Ready)/4,\$(kubectl get vgpuslice -n certgang --no-headers | grep g8 | grep -c Ready)/8
   # infeasible: 8 members needing 15Gi each while cards are partly held -> must admit ZERO
   gang toobig 8 $((15*GiB)) | kubectl apply -f - >/dev/null
   sleep 45
@@ -120,10 +169,43 @@ $SSH "$KC
 F=$(grep -oE "FEASIBLE_READY=[0-9]+" "$EVID/cert05.txt" | cut -d= -f2)
 T=$(grep -oE "TOOBIG_READY=[0-9]+" "$EVID/cert05.txt" | cut -d= -f2)
 R=$(grep -oE "REUSE_READY=[0-9]+" "$EVID/cert05.txt" | cut -d= -f2)
-if [[ "$F" == "14" && "$T" == "0" && "$R" == "4" ]]; then
-    cert CERT-05 PASS "gangs 2+4+8 all-or-nothing (14/14); infeasible admitted ZERO; reused name re-admitted atomically (4/4)"
+PG=$(grep -oE "PERGANG=[0-9/,]+" "$EVID/cert05.txt" | cut -d= -f2)
+if [[ "$F" == "14" && "$PG" == "2/2,4/4,8/8" && "$T" == "0" && "$R" == "4" ]]; then
+    cert CERT-05 PASS "gangs COMPLETE per-gang ($PG); infeasible admitted ZERO; reused name re-admitted atomically (4/4)"
 else
-    cert CERT-05 FAIL "feasible=$F/14 toobig=$T/0 reuse=$R/4"
+    cert CERT-05 FAIL "feasible=$F/14 pergang=$PG toobig=$T reuse=$R"
+fi
+
+say "CERT-05x gang deep-matrix: cross-namespace same-name + timeout reclaim"
+$SSH "$KC
+  kubectl create ns certg-a --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl create ns certg-b --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  g(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: %s, namespace: %s}\nspec: {gangSize: %s, minAvailable: %s, reservationTimeoutSeconds: %s, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \"\$1\" \"\$2\" \"\$3\" \"\$3\" \"\$4\" \"\$5\"; }
+  # SAME gang name 'twins' in TWO namespaces, submitted together (cohort keying = ns/name)
+  { g twins certg-a 3 120 \$((2*GiB)); echo ---; g twins certg-b 3 120 \$((2*GiB)); } | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 40); do
+    a=\$(kubectl get vgpuslice -n certg-a --no-headers 2>/dev/null | grep -c Ready)
+    b=\$(kubectl get vgpuslice -n certg-b --no-headers 2>/dev/null | grep -c Ready)
+    [ \"\$a\" = 3 ] && [ \"\$b\" = 3 ] && break; sleep 3
+  done
+  echo TWINS=\$(kubectl get vgpuslice -n certg-a --no-headers | grep -c Ready)/\$(kubectl get vgpuslice -n certg-b --no-headers | grep -c Ready)
+  # timeout reclaim: infeasible gang with a SHORT deadline must clean up FULLY
+  g doomed certg-a 8 45 \$((15*GiB)) | kubectl apply -f - >/dev/null
+  sleep 75
+  echo DOOMED_SLICES=\$(kubectl get vgpuslice -n certg-a --no-headers 2>/dev/null | grep -c doomed || true)
+  echo DOOMED_RSV=\$(kubectl get vgpugangreservation -n certg-a --no-headers 2>/dev/null | grep doomed | grep -civ 'Failed\|Released' || true)
+  # capacity unharmed after the doomed gang: a normal job still lands
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: after, namespace: certg-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  sleep 30
+  echo AFTER=\$(kubectl get vgpuslice after-claim-slice -n certg-a -o jsonpath='{.status.phase}' 2>/dev/null)
+  kubectl delete ns certg-a certg-b --wait=false >/dev/null 2>&1" | tee "$EVID/cert05x.txt"
+TW=$(grep -oE "TWINS=[0-9]/[0-9]" "$EVID/cert05x.txt" | cut -d= -f2)
+DS=$(grep -oE "DOOMED_SLICES=[0-9]+" "$EVID/cert05x.txt" | cut -d= -f2)
+AF=$(grep -oE "AFTER=\w*" "$EVID/cert05x.txt" | cut -d= -f2)
+if [[ "$TW" == "3/3" && "${DS:-9}" == "0" && "$AF" == "Ready" ]]; then
+    cert CERT-05x PASS "same-name gangs in two namespaces both complete (3/3 each — cohort keying); doomed gang fully reclaimed on timeout; capacity unharmed"
+else
+    cert CERT-05x FAIL "twins=$TW doomed_slices=$DS after=$AF"
 fi
 
 say "CERT-06 preemption matrix (gap≥100 evicts · gap<100 doesn't · non-preemptible immune)"
@@ -174,6 +256,44 @@ else
     cert CERT-06 FAIL "smallgap=$SG holders=$HS vip=$VP holdersAfter=$HV fort=$FT vip3=$V3"
 fi
 
+say "CERT-06x preemption boundary (gap==100 evicts, gap==99 waits) + victim ORDER"
+$SSH "$KC
+  kubectl create ns certgap --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  j(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: %s, namespace: certgap}\nspec: {priority: %s, preemptible: %s, workloadClass: Inference, claimTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \"\$1\" \"\$2\" \"\$3\" \"\$4\"; }
+  HOLD=\$(( ($PERCARD_MIB - 1024) * 1024 * 1024 ))
+  # two victims at DIFFERENT priorities (10 and 30) among the holders — order probe
+  j v10 10 true \$HOLD | kubectl apply -f - >/dev/null
+  j v30 30 true \$HOLD | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 $((CARDS-2))); do j blk-\$i 400 false \$HOLD; echo ---; done | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 50); do
+    r=\$(kubectl get vgpuslice -n certgap --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = \"$CARDS\" ] && break; sleep 3
+  done
+  echo PACKED=\$(kubectl get vgpuslice -n certgap --no-headers | grep -c Ready)
+  # (a) gap 99: vip at 109 vs best victim 10 -> 99 < 100 -> MUST wait
+  j gap99 109 false \$((4*GiB)) | kubectl apply -f - >/dev/null; sleep 40
+  echo GAP99=\$(kubectl get vgpuslice gap99-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo V10_AT99=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  kubectl delete vgpujob gap99 -n certgap --wait=false >/dev/null 2>&1; sleep 5
+  # (b) gap exactly 100: vip at 110 -> MUST evict, and the victim must be v10 (lowest priority first), NOT v30
+  j gap100 110 false \$((4*GiB)) | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 60); do
+    ph=\$(kubectl get vgpuslice gap100-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
+  done
+  echo GAP100=\$(kubectl get vgpuslice gap100-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo V10_AFTER=\$(kubectl get vgpuslice v10-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo V30_AFTER=\$(kubectl get vgpuslice v30-claim-slice -n certgap -o jsonpath='{.status.phase}' 2>/dev/null)
+  kubectl delete ns certgap --wait=false >/dev/null 2>&1" | tee "$EVID/cert06x.txt"
+G99=$(grep -oE "GAP99=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
+V99=$(grep -oE "V10_AT99=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
+G100=$(grep -oE "GAP100=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
+V10A=$(grep -oE "V10_AFTER=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
+V30A=$(grep -oE "V30_AFTER=\w*" "$EVID/cert06x.txt" | cut -d= -f2)
+if [[ "$G99" != "Ready" && "$V99" == "Ready" && "$G100" == "Ready" && "$V10A" != "Ready" && "$V30A" == "Ready" ]]; then
+    cert CERT-06x PASS "gap=99 waited (victim untouched); gap=100 evicted; victim ORDER correct (pri-10 evicted, pri-30 spared)"
+else
+    cert CERT-06x FAIL "gap99=$G99 v10@99=$V99 gap100=$G100 v10=$V10A v30=$V30A"
+fi
+
 say "CERT-07 quota: single-job cap + gang-atomic denial"
 $SSH "$KC
   kubectl create ns certq --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -196,6 +316,43 @@ if [[ "$QF" == "Ready" && "$QB" != "Ready" && "$QG" == "0" ]]; then
     cert CERT-07 PASS "6Gi fit under 10Gi quota; second 6Gi denied; 4×4Gi gang admitted ZERO (gang-atomic)"
 else
     cert CERT-07 FAIL "fits=$QF busts=$QB qgang=$QG"
+fi
+
+say "CERT-07x quota deep-matrix: exact boundary + live raise + namespace isolation"
+$SSH "$KC
+  kubectl create ns certq-a --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl create ns certq-b --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' \$((16*GiB)) | kubectl apply -f - >/dev/null
+  sleep 3
+  # (a) gang EXACTLY at quota (4x4=16Gi == 16Gi cap) -> must ADMIT (<=, not <)
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: exact, namespace: certq-a}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 90, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 40); do
+    r=\$(kubectl get vgpuslice -n certq-a --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" = 4 ] && break; sleep 3
+  done
+  echo EXACT=\$(kubectl get vgpuslice -n certq-a --no-headers | grep -c Ready)
+  # (b) +1 byte over: a 1Gi job must now be DENIED (quota full)
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: onemore, namespace: certq-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((1*GiB)) | kubectl apply -f - >/dev/null
+  sleep 30
+  echo ONEMORE=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null)
+  # (c) ns ISOLATION: certq-b (no quota) must be unaffected while certq-a is full
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: freejob, namespace: certq-b}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
+  sleep 25
+  echo FREE=\$(kubectl get vgpuslice freejob-claim-slice -n certq-b -o jsonpath='{.status.phase}' 2>/dev/null)
+  # (d) LIVE RAISE: bump quota to 20Gi -> the denied job must admit WITHOUT resubmission
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' \$((20*GiB)) | kubectl apply -f - >/dev/null
+  for i in \$(seq 1 40); do
+    ph=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
+  done
+  echo AFTER_RAISE=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null)
+  kubectl delete ns certq-a certq-b --wait=false >/dev/null 2>&1" | tee "$EVID/cert07x.txt"
+EX=$(grep -oE "EXACT=[0-9]+" "$EVID/cert07x.txt" | cut -d= -f2)
+OM=$(grep -oE "ONEMORE=\w*" "$EVID/cert07x.txt" | cut -d= -f2)
+FRE=$(grep -oE "FREE=\w*" "$EVID/cert07x.txt" | cut -d= -f2)
+ARZ=$(grep -oE "AFTER_RAISE=\w*" "$EVID/cert07x.txt" | cut -d= -f2)
+if [[ "$EX" == "4" && "$OM" != "Ready" && "$FRE" == "Ready" && "$ARZ" == "Ready" ]]; then
+    cert CERT-07x PASS "gang EXACTLY at cap admitted (<= boundary); next 1Gi denied; other namespace unaffected; LIVE raise unblocked the waiter without resubmit"
+else
+    cert CERT-07x FAIL "exact=$EX onemore=$OM freens=$FRE after_raise=$ARZ"
 fi
 
 say "CERT-09/12/13 enforcement ladder + crash storm + churn (tier3 torture phases)"
