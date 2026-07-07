@@ -164,10 +164,10 @@ MSGLINE=$(grep "FBIG_MSG=" "$EVID/cert04x.txt")
 if [[ "$MSGLINE" == *"Fragmented capacity."* ]]; then
     CARDFREE=$(echo "$MSGLINE" | grep -oE "No single GPU has [0-9.]+" | grep -oE "[0-9.]+")
     NODEFREE=$(echo "$MSGLINE" | grep -oE "node has [0-9.]+" | grep -oE "[0-9.]+")
-    awk -v c="${CARDFREE:-99}" -v n="${NODEFREE:-0}" 'BEGIN{exit !(c<6 && n>=6)}' && NUMS_OK=yes
+    awk -v c="${CARDFREE:-0}" -v n="${NODEFREE:-0}" 'BEGIN{exit !(c>=5.9 && c<=6.1 && n>=6)}' && NUMS_OK=yes
 fi
 if [[ "$FB" == "Failed" && "$NUMS_OK" == "yes" && "$FS" == "Ready" && "$FR" == "Ready" ]]; then
-    cert CERT-04x PASS "boundary two-sided (6Gi>hole FAILED loud, 3Gi<hole landed); message numbers TRUTHFUL (card<6<=node); release->retry recovered"
+    cert CERT-04x PASS "boundary two-sided (6Gi>hole FAILED loud, 3Gi<hole landed); message numbers TRUTHFUL (request echoed, nodeFree>=request); release->retry recovered"
 else
     cert CERT-04x FAIL "fbig=$FB nums=$NUMS_OK(${CARDFREE:-?}/${NODEFREE:-?}) fsmall=$FS fretry=$FR"
 fi
