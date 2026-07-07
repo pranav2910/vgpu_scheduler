@@ -395,6 +395,19 @@ D_FAIL=$(grep -oE "FAIL=[0-9]+" "$EVID/t3d.log" | tail -1 | cut -d= -f2)
 [[ "${D_FAIL:-9}" == "0" ]] && cert CERT-06b PASS "gang 1-per-card + vip preempted victim on a FULL node + invariant" \
     || cert CERT-06b FAIL "phase d FAIL=$D_FAIL — see $EVID/t3d.log"
 
+# LANE 2 owns the vgpu-monitor namespace for its whole life; reap it BEFORE any
+# scheduler-lane test that also touches the monitor (CERT-10 installs it).
+say "reaping LANE 2 (CERT-01/17/16)"
+wait "$LANE2_PID" 2>/dev/null || true
+L2RC=$(cat "$EVID/.lane2rc" 2>/dev/null || echo 3)
+[[ $((L2RC & 1)) -eq 0 ]] && cert CERT-01 PASS "install→doctor→report→bundle→VERIFIED uninstall→reinstall (parallel lane)" \
+    || cert CERT-01 FAIL "see $EVID/cert01.log"
+[[ $((L2RC & 2)) -eq 0 ]] && cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (parallel lane)" \
+    || cert CERT-17 FAIL "see $EVID/cert17.log"
+grep -q "AUDIT_EXIT=0" "$EVID/cert16.txt" && grep -q "SECRET_FILES=0" "$EVID/cert16.txt" && grep -q "PRIVKEYS=0" "$EVID/cert16.txt" \
+    && cert CERT-16 PASS "audit exit 0; bundle: zero Secrets, zero private keys (parallel lane)" \
+    || cert CERT-16 FAIL "$(grep -E 'AUDIT_EXIT|SECRET_FILES|PRIVKEYS' "$EVID/cert16.txt" 2>/dev/null | tr '\n' ' ')"
+
 say "CERT-10 attribution truth at two load levels + format equality"
 $SSH "$KC
   scripts/vgpu install monitor >/dev/null 2>&1; sleep 5
@@ -475,17 +488,6 @@ $SSH "$KC
   kubectl delete ns certhostile --wait=false >/dev/null 2>&1" | tee "$EVID/cert15.txt"
 grep -q "REJECTED=7/7" "$EVID/cert15.txt" && cert CERT-15 PASS "7/7 hostile inputs rejected (zero/huge/garbage-name/negative/10Ti/gangSize-0/immutability-edit)" \
     || cert CERT-15 FAIL "$(grep REJECTED "$EVID/cert15.txt")"
-
-say "reaping LANE 2 (CERT-01/17/16)"
-wait "$LANE2_PID" 2>/dev/null || true
-L2RC=$(cat "$EVID/.lane2rc" 2>/dev/null || echo 3)
-[[ $((L2RC & 1)) -eq 0 ]] && cert CERT-01 PASS "install→doctor→report→bundle→VERIFIED uninstall→reinstall (parallel lane)" \
-    || cert CERT-01 FAIL "see $EVID/cert01.log"
-[[ $((L2RC & 2)) -eq 0 ]] && cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (parallel lane)" \
-    || cert CERT-17 FAIL "see $EVID/cert17.log"
-grep -q "AUDIT_EXIT=0" "$EVID/cert16.txt" && grep -q "SECRET_FILES=0" "$EVID/cert16.txt" && grep -q "PRIVKEYS=0" "$EVID/cert16.txt" \
-    && cert CERT-16 PASS "audit exit 0; bundle: zero Secrets, zero private keys (parallel lane)" \
-    || cert CERT-16 FAIL "$(grep -E 'AUDIT_EXIT|SECRET_FILES|PRIVKEYS' "$EVID/cert16.txt" 2>/dev/null | tr '\n' ' ')"
 
 # ── report generation ─────────────────────────────────────────────────────
 say "generating CERTIFICATION-REPORT.md"
