@@ -43,7 +43,20 @@ quiesce(){
         [ "${n:-1}" = "0" ] && return 0
         sleep 5
     done
-    echo "  (quiesce timeout — $n slices still present)"
+    # SELF-HEAL, never continue dirty: a prior killed run once left 88Gi of
+    # squatters; a warn-and-continue quiesce let the pack fail 22/32 (the
+    # product fail-louded correctly; the harness had lied to it about capacity).
+    echo "  quiesce timeout ($n slices) — purging ALL test namespaces and re-draining"
+    $SSH "export KUBECONFIG=\$HOME/.kube/config
+      kubectl get ns -o name | grep -E 'cert|mgpu-|repro|t3' | cut -d/ -f2 | xargs -r kubectl delete ns --ignore-not-found >/dev/null 2>&1
+      kubectl delete vgpujobs,vgpugangjobs --all -A --wait=false >/dev/null 2>&1" 2>/dev/null
+    for _ in $(seq 1 $((tmo/5))); do
+        local m
+        m=$($SSH "export KUBECONFIG=\$HOME/.kube/config; kubectl get vgpuslice -A --no-headers 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+        [ "${m:-1}" = "0" ] && return 0
+        sleep 5
+    done
+    echo "  (still dirty after purge — sections may see contention)"
 }
 
 # run a long on-box command disconnect-proof: nohup + poll for a marker file
@@ -79,6 +92,10 @@ $SSH "$KC; set -e
   sudo k3s ctr images pull docker.io/pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime >/dev/null 2>&1 || true
   echo FRESH=yes" > "$EVID/00-rebuild.log" 2>&1
 grep -q "FRESH=yes" "$EVID/00-rebuild.log" && ok "stack fresh at $SHA" || { bad "rebuild failed"; exit 1; }
+# clean slate BY CONSTRUCTION: purge every test namespace from any prior run
+$SSH "export KUBECONFIG=\$HOME/.kube/config
+  kubectl get ns -o name | grep -E 'cert|mgpu-|repro|t3' | cut -d/ -f2 | xargs -r kubectl delete ns --ignore-not-found >/dev/null 2>&1; true" 2>/dev/null
+quiesce 240
 CARDS=$($SSH 'nvidia-smi -L | wc -l' 2>/dev/null | tr -d ' ')
 PERCARD_MIB=$($SSH 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | head -1' 2>/dev/null | tr -dc '0-9')
 echo "  hardware: ${CARDS}× ${PERCARD_MIB}MiB"
