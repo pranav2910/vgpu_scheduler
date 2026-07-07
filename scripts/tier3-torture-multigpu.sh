@@ -69,7 +69,7 @@ if run_phase ab; then
 AR0=$(kubectl get pods -n vgpu-system -l app=vgpu-nodeagent -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
 hdr "A. CHURN STORM: 6 waves of random-size jobs across all $CARDS cards"
 CHURN_FAILLOUD=0
-for wave in 1 2 3 4 5 6; do
+for wave in $(seq 1 "${CHURN_WAVES:-6}"); do
     # submit 12 jobs, sizes 2..10 GiB (deterministic pseudo-random per wave)
     for i in $(seq 1 12); do
         SZ=$(( (2 + (wave*7 + i*3) % 9) * GiB ))
@@ -84,7 +84,7 @@ for wave in 1 2 3 4 5 6; do
     invariant "wave$wave"
 done
 R=$(kubectl get vgpuslice -n "$NS" --no-headers 2>/dev/null | grep -c Ready || true)
-[[ "$R" -ge 1 ]] && ok "churn survivors still Ready ($R slices; $CHURN_FAILLOUD fail-loud fragmentation rejections along the way — rejections are honest, over-commit is not)" \
+[[ "$R" -ge 1 ]] && ok "churn survivors still Ready ($R slices after ${CHURN_WAVES:-6} waves; $CHURN_FAILLOUD fail-loud rejections — rejections are honest, over-commit is not)" \
     || bad "churn left zero Ready slices (storm collapsed?)"
 kubectl delete vgpujob -n "$NS" --all --wait=false >/dev/null 2>&1
 wait_for 240 "zero residue after full release" '

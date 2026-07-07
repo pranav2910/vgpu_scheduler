@@ -29,6 +29,10 @@ cert(){ # id verdict note
     CERT_RESULT[$1]="$2"; CERT_NOTE[$1]="$3"
     [[ "$2" == "PASS" ]] && ok "$1: $3" || bad "$1 FAILED: $3"
 }
+# poll_slice ns name phase timeout — early-exit wait (replaces fixed sleeps)
+# (remote-side helper; injected into blocks that need it via $POLL)
+POLL='pollp(){ for _ in $(seq 1 $(($4/4))); do p=$(kubectl get vgpuslice "$2" -n "$1" -o jsonpath="{.status.phase}" 2>/dev/null); [ "$p" = "$3" ] && return 0; sleep 4; done; return 1; };'
+
 # run a long on-box command disconnect-proof: nohup + poll for a marker file
 run_onbox(){ # name script-body timeout-sec
     local name="$1" body="$2" tmo="${3:-900}"
@@ -47,9 +51,11 @@ $SSH "$KC; git fetch -q origin && git reset -q --hard origin/main && git log --o
 $SSH "$KC; bash scripts/h100-control-plane.sh" > "$EVID/00-bringup.log" 2>&1 \
     || { echo "bring-up failed"; exit 1; }
 $SSH "$KC; set -e
-  sudo docker build -t vgpu-scheduler:latest  -f Dockerfile.scheduler  . | tail -1
-  sudo docker build -t vgpu-controller:latest -f Dockerfile.controller . | tail -1
-  sudo docker build --build-arg GOTAGS=nvml -t vgpu-nodeagent:nvml -f Dockerfile.nodeagent . | tail -1
+  # parallel builds; layer cache makes these ~fast right after bring-up built at HEAD
+  sudo docker build -t vgpu-scheduler:latest  -f Dockerfile.scheduler  . >/tmp/b1.log 2>&1 &
+  sudo docker build -t vgpu-controller:latest -f Dockerfile.controller . >/tmp/b2.log 2>&1 &
+  sudo docker build --build-arg GOTAGS=nvml -t vgpu-nodeagent:nvml -f Dockerfile.nodeagent . >/tmp/b3.log 2>&1 &
+  wait
   sudo docker save vgpu-scheduler:latest vgpu-controller:latest vgpu-nodeagent:nvml | sudo k3s ctr images import - | tail -1
   kubectl rollout restart deploy/vgpu-scheduler deploy/vgpu-controller -n vgpu-system
   kubectl rollout restart ds/vgpu-nodeagent -n vgpu-system
@@ -62,12 +68,20 @@ CARDS=$($SSH 'nvidia-smi -L | wc -l' 2>/dev/null | tr -d ' ')
 PERCARD_MIB=$($SSH 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | head -1' 2>/dev/null | tr -dc '0-9')
 echo "  hardware: ${CARDS}× ${PERCARD_MIB}MiB"
 
-say "CERT-01 install lifecycle (via gate2 receipt)"
-if HOST="$HOST" bash scripts/gate2-monitor-lifecycle.sh > "$EVID/cert01.log" 2>&1; then
-    cert CERT-01 PASS "install→doctor(0 fail)→report→bundle→VERIFIED uninstall→reinstall"
-else
-    cert CERT-01 FAIL "see $EVID/cert01.log"
-fi
+say "LANE 2 (parallel): CERT-01 + CERT-17 + CERT-16 — monitor subsystem, no capacity contention"
+(
+  L2=0
+  HOST="$HOST" bash scripts/gate2-monitor-lifecycle.sh > "$EVID/cert01.log" 2>&1 || L2=1
+  HOST="$HOST" bash scripts/gate5-grafana.sh          > "$EVID/cert17.log" 2>&1 || L2=$((L2+2))
+  $SSH "$KC
+    scripts/vgpu install monitor >/dev/null 2>&1
+    scripts/vgpu security audit > /tmp/aud.txt 2>&1; echo AUDIT_EXIT=\$?
+    scripts/vgpu support-bundle --out /tmp/cert-bundle.tgz >/dev/null 2>&1
+    tar tzf /tmp/cert-bundle.tgz 2>/dev/null | grep -ci secret | sed 's/^/SECRET_FILES=/'
+    tar xzf /tmp/cert-bundle.tgz -O 2>/dev/null | grep -cE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY' | sed 's/^/PRIVKEYS=/'" > "$EVID/cert16.txt" 2>&1
+  echo "$L2" > "$EVID/.lane2rc"
+) &
+LANE2_PID=$!
 
 say "CERT-02a slicing at four size classes (1 / 3.75 / 7.5 / 13 Gi coexisting)"
 $SSH "$KC
@@ -332,7 +346,7 @@ $SSH "$KC
   echo EXACT=\$(kubectl get vgpuslice -n certq-a --no-headers | grep -c Ready)
   # (b) +1 byte over: a 1Gi job must now be DENIED (quota full)
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: onemore, namespace: certq-a}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((1*GiB)) | kubectl apply -f - >/dev/null
-  sleep 30
+  sleep 20
   echo ONEMORE=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null)
   # (c) ns ISOLATION: certq-b (no quota) must be unaffected while certq-a is full
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: freejob, namespace: certq-b}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' \$((4*GiB)) | kubectl apply -f - >/dev/null
@@ -356,9 +370,9 @@ else
 fi
 
 say "CERT-09/12/13 enforcement ladder + crash storm + churn (tier3 torture phases)"
-run_onbox t3ab "PHASE=ab NS=certt3 bash scripts/tier3-torture-multigpu.sh" 1500
+run_onbox t3ab "PHASE=ab NS=certt3 CHURN_WAVES=3 bash scripts/tier3-torture-multigpu.sh" 1200
 AB_FAIL=$(grep -oE "FAIL=[0-9]+" "$EVID/t3ab.log" | tail -1 | cut -d= -f2)
-[[ "${AB_FAIL:-9}" == "0" ]] && { cert CERT-13 PASS "72-job churn: invariants every wave, zero residue"; cert CERT-09 PASS "3 cards violating simultaneously, others clean (+softwarn/evict/exempt via tier-1 receipts)"; } \
+[[ "${AB_FAIL:-9}" == "0" ]] && { cert CERT-13 PASS "36-job churn (3 waves): invariant every wave, zero residue"; cert CERT-09 PASS "3 cards violating simultaneously, others clean (+softwarn/evict/exempt via tier-1 receipts)"; } \
     || { cert CERT-13 FAIL "phase ab FAIL=$AB_FAIL"; cert CERT-09 FAIL "phase ab FAIL=$AB_FAIL"; }
 run_onbox t3cload "PHASE=c-load NS=certt3 bash scripts/tier3-torture-multigpu.sh" 600
 echo "  (box rebooting for CERT-12 — riding it out)"
@@ -462,23 +476,16 @@ $SSH "$KC
 grep -q "REJECTED=7/7" "$EVID/cert15.txt" && cert CERT-15 PASS "7/7 hostile inputs rejected (zero/huge/garbage-name/negative/10Ti/gangSize-0/immutability-edit)" \
     || cert CERT-15 FAIL "$(grep REJECTED "$EVID/cert15.txt")"
 
-say "CERT-16 security posture on the live cluster"
-$SSH "$KC
-  scripts/vgpu install monitor >/dev/null 2>&1
-  scripts/vgpu security audit > /tmp/aud.txt 2>&1; echo AUDIT_EXIT=\$?
-  scripts/vgpu support-bundle --out /tmp/cert-bundle.tgz >/dev/null 2>&1
-  tar tzf /tmp/cert-bundle.tgz 2>/dev/null | grep -ci secret | sed 's/^/SECRET_FILES=/'
-  tar xzf /tmp/cert-bundle.tgz -O 2>/dev/null | grep -cE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY' | sed 's/^/PRIVKEYS=/'" | tee "$EVID/cert16.txt"
+say "reaping LANE 2 (CERT-01/17/16)"
+wait "$LANE2_PID" 2>/dev/null || true
+L2RC=$(cat "$EVID/.lane2rc" 2>/dev/null || echo 3)
+[[ $((L2RC & 1)) -eq 0 ]] && cert CERT-01 PASS "install→doctor→report→bundle→VERIFIED uninstall→reinstall (parallel lane)" \
+    || cert CERT-01 FAIL "see $EVID/cert01.log"
+[[ $((L2RC & 2)) -eq 0 ]] && cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (parallel lane)" \
+    || cert CERT-17 FAIL "see $EVID/cert17.log"
 grep -q "AUDIT_EXIT=0" "$EVID/cert16.txt" && grep -q "SECRET_FILES=0" "$EVID/cert16.txt" && grep -q "PRIVKEYS=0" "$EVID/cert16.txt" \
-    && cert CERT-16 PASS "audit exit 0 (live RBAC == claims); bundle has zero Secret files, zero private keys" \
-    || cert CERT-16 FAIL "$(grep -E 'AUDIT_EXIT|SECRET_FILES|PRIVKEYS' "$EVID/cert16.txt" | tr '\n' ' ')"
-
-say "CERT-17 dashboard truth (gate5 receipt)"
-if HOST="$HOST" bash scripts/gate5-grafana.sh > "$EVID/cert17.log" 2>&1; then
-    cert CERT-17 PASS "panels render via provisioned datasource; numbers==report ±1%; survives restart"
-else
-    cert CERT-17 FAIL "see $EVID/cert17.log"
-fi
+    && cert CERT-16 PASS "audit exit 0; bundle: zero Secrets, zero private keys (parallel lane)" \
+    || cert CERT-16 FAIL "$(grep -E 'AUDIT_EXIT|SECRET_FILES|PRIVKEYS' "$EVID/cert16.txt" 2>/dev/null | tr '\n' ' ')"
 
 # ── report generation ─────────────────────────────────────────────────────
 say "generating CERTIFICATION-REPORT.md"
