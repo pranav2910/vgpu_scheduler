@@ -37,8 +37,7 @@ AGP=$(kc "kubectl get pods -n vgpu-system -l app=vgpu-nodeagent --no-headers 2>/
 [[ "$AGP" == 3 ]] && ok "nodeagent Running on all 3 nodes" || bad "only $AGP/3 nodeagent pods Running"
 
 say "CERT-08: topology zone hint honored + infeasible stays SOFT (real 3-node)"
-kc "kubectl label node $SERVER_NODE x- >/dev/null 2>&1 || true
-  BIG=\$(kubectl get nodes -o custom-columns=N:.metadata.name,C:.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes --no-headers | awk '\$2+0>1e11{print \$1}' | head -1)
+kc "BIG=\$(kubectl get nodes -o custom-columns=N:.metadata.name,C:.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes --no-headers | awk '\$2+0>1e11{print \$1}' | head -1)
   kubectl label node \$BIG topology.vgpu.pranav2910.com/zone=zone-big --overwrite >/dev/null
   kubectl label node $N2 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl label node $N3 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
