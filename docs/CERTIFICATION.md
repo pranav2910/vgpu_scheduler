@@ -32,7 +32,7 @@ Run: `HOST=user@gpu-box bash scripts/certify-release.sh`
 | **CERT-15** | Input hostility | Zero/negative/absurd VRAM, gangSize 0/-1/10⁶, spec-edit after admission, garbage names → every one rejected LOUD at CLI or webhook; nothing corrupts state |
 | **CERT-16** | Security posture | `vgpu security audit` exit 0 against live RBAC; support-bundle contains no Secret material (grep-verified) |
 | **CERT-17** | Dashboard truth | Grafana panels render through the provisioned datasource; numbers match `vgpu report` ±1 %; dashboard survives restart |
-| **CERT-18** | Multi-node failures *(optional: needs ≥2 GPU nodes)* | Cross-node gang; whole-node kill → reschedule onto survivors with real NVML teardown; network partition mid-gang → no split-brain admission |
+| **CERT-18** | Multi-node failures *(needs ≥2 GPU nodes — `scripts/cert18.sh`)* | Cross-node gang forced to SPAN nodes; whole-node kill → survivors admit, return re-charges; TRUE network partition (link cut, verified NotReady) before gang submit → gang HELD (never committed-partial), converges + commits on heal. **Certified 2026-07-08 on 3× A10 — docs/CERT-18-MULTINODE-REPORT.md** |
 
 **Known limitation (found by CERT-06 on 8×V100, 2026-07-07):** the preemptor
 triggers on NODE-level capacity shortfall. A request that fits the node total

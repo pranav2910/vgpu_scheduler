@@ -2,11 +2,12 @@
 
 **Commit:** HEAD of main (v0.20 candidate) · **Hardware:** 8× Tesla V100-SXM2-16GB (real NVML) · **Date:** 2026-07-07
 
-**RESULT: 22/22 CERTIFIED, 0 fail**
+**RESULT: 22/22 CERTIFIED, 0 fail** · **CERT-18 (multi-node): PASS 2026-07-08** — full catalog green.
 
 Catalog + verdict rules: docs/CERTIFICATION.md. Each verdict is the final
 green result on real GPU hardware, consolidated across the certification run.
-CERT-18 (multi-node failures) runs separately on a 3-node cluster.
+CERT-18 (multi-node failures) runs separately on a 3-node cluster — certified
+in one clean pass on 3× A10 (same-cloud k3s): docs/CERT-18-MULTINODE-REPORT.md.
 
 | CERT | Verdict | Evidence |
 |------|---------|----------|
@@ -32,3 +33,4 @@ CERT-18 (multi-node failures) runs separately on a 3-node cluster.
 | CERT-15 | PASS | 7/7 hostile inputs rejected (zero/huge/garbage-name/negative/10Ti/gangSize-0/immutability-edit) |
 | CERT-16 | PASS | audit exit 0; bundle: zero Secrets, zero private keys (parallel lane) |
 | CERT-17 | PASS | panels render via datasource; numbers==report ±1%; survives restart (quiet) |
+| CERT-18 | PASS | 3-node A10 cluster, one scripted run (`scripts/cert18.sh` @ ee97719): zone hint + soft-overflow; 3-member gang forced to span all 3 nodes; node loss → survivors admit → return recharges; TRUE partition (link cut, node observed NotReady) → gang HELD at 0/3 `Reserving` (never committed-partial) → heal → 3/3 `Committed` |
