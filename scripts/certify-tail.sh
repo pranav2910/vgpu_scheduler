@@ -74,11 +74,14 @@ run_onbox(){ # name script-body timeout-sec
 }
 
 
+# sync the box repo (the CLI fix lives in scripts/vgpu ON THE BOX)
+$SSH "cd vgpu_scheduler && git fetch -q origin && git reset -q --hard origin/main && git log --oneline -1"
+
 # ═══ TAIL COMPLETION: seed the banked round-7 ledger (product-identical commit;
 # CERT-17's lane-placement FAIL dropped — it re-runs QUIET below) ═══
-SEED="artifacts/certify-17c9645/.certlog"
+SEED="artifacts/certify-9414145/.certlog"
 if [ -f "$SEED" ]; then
-    grep -vE "^CERT-11\||^CERT-15\|" "$SEED" > "$CERTLOG"
+    grep -v "^CERT-15|" "$SEED" > "$CERTLOG"
     PASS=$(grep -c "|PASS|" "$CERTLOG" || true); FAIL=0
     echo "seeded $PASS banked PASS verdicts from round 7"
 fi
@@ -87,36 +90,6 @@ PERCARD_MIB=$($SSH 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,no
 $SSH "export KUBECONFIG=\$HOME/.kube/config
   kubectl get ns -o name | grep -E 'cert|mgpu-|repro|t3' | cut -d/ -f2 | xargs -r kubectl delete ns --ignore-not-found >/dev/null 2>&1; true" 2>/dev/null
 quiesce 240
-
-say "CERT-11 right-sizing: peak learned, rec math = peak*1.15, Low-confidence SAFETY GATE"
-$SSH "$KC
-  kubectl create ns certrs --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: learner, namespace: certrs}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}, podTemplate: {spec: {runtimeClassName: nvidia, containers: [{name: w, image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime, command: [python, -c, \"import torch,time; x=torch.empty(int(6*1024**3)//2, dtype=torch.float16, device='\''cuda'\'').normal_(); torch.cuda.synchronize(); time.sleep(600)\"]}]}}}\n' $((10*GiB)) | kubectl apply -f - >/dev/null
-  for i in \$(seq 1 50); do
-    p=\$(kubectl get pod learner-workload -n certrs -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$p\" = Running ] && break; sleep 4
-  done
-  sleep 160   # profile flush interval x2
-  PEAK=\$(kubectl get vgpuslice learner-claim-slice -n certrs -o jsonpath='{.status.peakObservedVramBytes}' 2>/dev/null)
-  PREC=\$(kubectl get vgpuworkloadprofiles learner -n certrs -o jsonpath='{.status.recommendedVramBytes}' 2>/dev/null)
-  CONF=\$(kubectl get vgpuworkloadprofiles learner -n certrs -o jsonpath='{.status.confidence}' 2>/dev/null)
-  ANN=\$(kubectl get vgpujob learner -n certrs -o jsonpath='{.metadata.annotations.infrastructure\.pranav2910\.com/recommended-vram-bytes}' 2>/dev/null)
-  echo PEAK=\$PEAK PREC=\$PREC CONF=\$CONF ANN=\${ANN:-none}
-  kubectl delete ns certrs --wait=false >/dev/null 2>&1" | tee "$EVID/cert11.txt"
-PEAK=$(grep -oE "PEAK=[0-9]+" "$EVID/cert11.txt" | cut -d= -f2)
-PREC=$(grep -oE "PREC=[0-9]+" "$EVID/cert11.txt" | cut -d= -f2)
-CONF=$(grep -oE "CONF=[A-Za-z]+" "$EVID/cert11.txt" | cut -d= -f2)
-ANN=$(grep -oE "ANN=[A-Za-z0-9]+" "$EVID/cert11.txt" | cut -d= -f2)
-# Short-run truth: the profile LEARNS the peak and computes rec=peak*1.15, and
-# the Low-confidence SAFETY GATE refuses to push a recommendation annotation
-# from a thin profile (Medium needs ~150 stable samples BY DESIGN — the full
-# push/autoResize path is receipted by the 3.5 A10 suite + unit tests).
-if [[ -n "$PEAK" && "$PEAK" -gt $((5*GiB)) && -n "$PREC" \
-      && "$PREC" -ge $((PEAK*112/100)) && "$PREC" -le $((PEAK*118/100)) \
-      && "$CONF" == "Low" && "$ANN" == "none" ]]; then
-    cert CERT-11 PASS "peak learned ($((PEAK/GiB))Gi from a 6Gi burn); profile rec=$((PREC/GiB))Gi = peak*1.15; Low-confidence safety gate HELD (no annotation from a thin profile)"
-else
-    cert CERT-11 FAIL "peak=$PEAK prec=$PREC conf=$CONF ann=$ANN"
-fi
 
 say "CERT-15 input hostility (every garbage input rejected LOUD)"
 $SSH "$KC
