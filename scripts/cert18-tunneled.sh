@@ -14,7 +14,7 @@
 # ============================================================================
 set -uo pipefail
 
-SERVER="${SERVER:?}"; AG2="${AG2:?}"; AG3="${AG3:?}"; N2="${N2:?}"; N3="${N3:?}"
+SERVER="${SERVER:?}"; AG2="${AG2:?}"; AG3="${AG3:?}"; N1="${N1:?}"; N2="${N2:?}"; N3="${N3:?}"
 S="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $SERVER"
 S2="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $AG2"
 S3="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $AG3"
@@ -37,8 +37,7 @@ AGP=$(kc "kubectl get pods -n vgpu-system -l app=vgpu-nodeagent --no-headers 2>/
 [[ "$AGP" == 3 ]] && ok "nodeagent Running on all 3 nodes" || bad "only $AGP/3 nodeagent pods Running"
 
 say "CERT-08: topology zone hint honored + infeasible stays SOFT (real 3-node)"
-kc "BIG=\$(kubectl get nodes -o custom-columns=N:.metadata.name,C:.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes --no-headers | awk '\$2+0>1e11{print \$1}' | head -1)
-  kubectl label node \$BIG topology.vgpu.pranav2910.com/zone=zone-big --overwrite >/dev/null
+kc "kubectl label node $N1 topology.vgpu.pranav2910.com/zone=zone-big --overwrite >/dev/null
   kubectl label node $N2 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl label node $N3 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl rollout restart deploy/vgpu-scheduler -n vgpu-system >/dev/null
