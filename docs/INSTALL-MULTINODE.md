@@ -1,5 +1,9 @@
 # Multi-node install + validation (M-NODE)
 
+> One of the five install paths — the full map is **[INSTALL.md](INSTALL.md)**.
+> This path is certified end-to-end: see [CERT-18-MULTINODE-REPORT.md](CERT-18-MULTINODE-REPORT.md)
+> (cross-node gang, node loss/return, true network partition — one scripted run, 10/10).
+
 True multi-node: several GPU boxes joined into ONE vGPU cluster — the scheduler
 spreads slices across nodes, gangs commit atomically across machines, and a
 lost node's capacity vanishes from scheduling immediately.
@@ -23,7 +27,7 @@ terminals.
 
 **Node 1 (the server):**
 ```sh
-git clone git@github.com:pranav2910/vgpu_scheduler.git && cd vgpu_scheduler
+git clone https://github.com/pranav2910/vgpu_scheduler.git && cd vgpu_scheduler
 bash scripts/multinode-server.sh
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 ```
@@ -31,7 +35,7 @@ It ends by printing `K3S_URL` + `K3S_TOKEN` + the agent command.
 
 **Every other node:**
 ```sh
-git clone git@github.com:pranav2910/vgpu_scheduler.git && cd vgpu_scheduler
+git clone https://github.com/pranav2910/vgpu_scheduler.git && cd vgpu_scheduler
 export K3S_URL="https://<server-ip>:6443"
 export K3S_TOKEN="<token from the server>"
 bash scripts/multinode-agent.sh
@@ -80,8 +84,10 @@ placements there again.
 - **Terminals B/C** → the 1×A100 boxes: server script on B, agent script on C,
   advertise one-liner back on B, then `validate-multinode.sh --node-loss`.
 
-Both green ⇒ tag `v0.14` and the two honest limits — "single GPU per node" and
-"single node" — come off the one-pager.
+Both paths have long since gone green and been re-proven under the release
+certification (multi-GPU: 22/22 on 8×V100, `v0.20-certified`; multi-node:
+CERT-18 10/10 on 3 nodes, `v0.20-cert18`) — the parallel plan above remains the
+fastest way to re-verify both on fresh hardware.
 
 ## Honest scope
 

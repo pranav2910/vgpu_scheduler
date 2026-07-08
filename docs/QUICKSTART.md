@@ -1,8 +1,10 @@
 # Quickstart — run a workload on a shared GPU in 5 minutes
 
+> One of the five install paths — the full map is **[INSTALL.md](INSTALL.md)**.
+
 **For ML engineers.** You need `kubectl` access to a cluster where your platform team
 has already installed vGPU. You do **not** need this repo or any build tools.
-*(Admins setting up a cluster: see [INSTALL-H100.md](INSTALL-H100.md).)*
+*(Admins setting up a cluster: start at [INSTALL.md](INSTALL.md).)*
 
 The one idea: **ask for the GPU memory you need (`16Gi`), not a whole GPU.** The
 platform packs your workload onto a shared card and tells you the right size next time.

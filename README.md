@@ -18,6 +18,18 @@ detect VRAM over-use → attribute it to the exact workload → warn → opt-in 
 **→ [DEMO.md](DEMO.md)** walks the whole thing end to end (kind, then one real GPU).
 **→ [docs/architecture.md](docs/architecture.md)** is the one-page system map.
 
+## Install
+
+```sh
+# The vgpu CLI — one file, no repo, no build (all an ML engineer ever installs):
+curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
+  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+```
+
+Everything else — read-only **waste monitor**, full platform on a **GPU node**,
+**multi-node** cluster, local **kind** dev — is one page with five copy-paste
+paths: **[docs/INSTALL.md](docs/INSTALL.md)**.
+
 ## Components
 
 | Component | Role |
@@ -98,7 +110,9 @@ a cached-vs-direct client read in pod stamping, a controller/slice ordering race
 a CDI device-name mismatch, and malformed pod YAML from the CLI — all caught and
 fixed on hardware.
 
-## Quick start (kind)
+## Local dev quick start (kind, no GPU)
+
+For contributors — installing on real clusters is [docs/INSTALL.md](docs/INSTALL.md).
 
 ```sh
 # One-command, idempotent local cluster (kind + cert-manager + CRDs + deploys)
@@ -121,6 +135,7 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
+- [docs/INSTALL.md](docs/INSTALL.md) — **start here**: the install map — five copy-paste paths (CLI · monitor · single GPU node · multi-node · kind) on one page
 - [docs/PILOT.md](docs/PILOT.md) — **pilot in 15 minutes**: install the read-only monitor, see your waste number, tell us if it matches your suspicion
 - [docs/monitor-mode.md](docs/monitor-mode.md) — **start here, zero-risk**: a read-only GPU **waste report** (`vgpu report`) you drop in beside *any* scheduler (KAI/Volcano/vanilla) — no scheduling, no mutation, no CRDs
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — **for ML engineers, in 5 minutes**: install the CLI, run a workload on a shared GPU, right-size it (copy-paste)

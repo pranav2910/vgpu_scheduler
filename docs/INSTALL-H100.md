@@ -1,8 +1,10 @@
-# Install on a real GPU node (H100) — runbook
+# Install the full platform on a single GPU node — runbook
+
+> One of the five install paths — the full map is **[INSTALL.md](INSTALL.md)**.
 
 A from-scratch, copy-paste runbook for bringing the **full vGPU control plane** up
-on a single real GPU box and proving it end to end. Validated on a 1× NVIDIA H100
-(k3s v1.35.5); the same script works on an A10/L4/A100.
+on a single real GPU box and proving it end to end. Validated on H100, A10, A100
+and V100 (the script is GPU-agnostic — its name is historical).
 
 > **Who runs this:** the **platform/admin**, once per cluster. ML engineers don't
 > run any of this — they just get `kubectl` access + the `vgpu` CLI
@@ -60,13 +62,17 @@ Expected: **`PASS=14 FAIL=0`**. It proves both entry points on the real GPU:
 ## 4. Use it (the ML-engineer experience)
 
 ```sh
+# install the CLI properly (or use scripts/vgpu from this checkout — same file)
+curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
+  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+
 # run a workload on a shared slice of the GPU
-scripts/vgpu submit --name demo --vram 16Gi \
+vgpu submit --name demo --vram 16Gi \
   --image nvidia/cuda:12.4.1-base-ubuntu22.04 \
   --command 'nvidia-smi -L; sleep 3600' --runtime-class nvidia
 
-scripts/vgpu status  demo          # Job / Claim / Slice / Pod, node + alloc
-scripts/vgpu profile demo          # learned peak vs requested → right-size advice
+vgpu status  demo          # Job / Claim / Slice / Pod, node + alloc
+vgpu profile demo          # learned peak vs requested → right-size advice
 ```
 
 The feedback loop: run a workload that actually uses VRAM and `vgpu profile` reports

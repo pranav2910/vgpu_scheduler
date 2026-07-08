@@ -28,13 +28,20 @@ A DaemonSet (`VGPU_MODE=monitor`) on each GPU node:
 `vgpu report` turns those metrics into a table + a $ estimate. That's it — it only
 reads.
 
-## Install (one apply)
+## Install
 
-Build the node-agent image with real GPU support, load it on the cluster, then:
+> Full install map: [INSTALL.md](INSTALL.md) · step-by-step pilot: [PILOT.md](PILOT.md)
+
+Get the node-agent image onto your GPU node(s) — build+push to your registry, or
+build+import on k3s (exact commands: [PILOT.md → Prerequisites](PILOT.md#prerequisites)).
+Then:
 
 ```sh
-kubectl apply -f deployments/monitor/monitor.yaml
+vgpu install monitor      # applies the manifest (repo checkout or GitHub raw) + waits READY
+vgpu doctor               # if anything is off, names the problem AND the fix
 ```
+
+(Equivalent, from a checkout: `kubectl apply -f deployments/monitor/monitor.yaml`.)
 
 RBAC is intentionally minimal — **list/watch Pods, nothing else.** It has no verbs to
 create, delete, evict, or modify anything. (`hostPID` + `privileged` are for read-only

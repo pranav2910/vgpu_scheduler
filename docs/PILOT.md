@@ -1,5 +1,7 @@
 # Pilot guide — see your GPU waste in 15 minutes
 
+> One of the five install paths — the full map is **[INSTALL.md](INSTALL.md)**.
+
 **The ask:** run a read-only agent on one GPU node, look at the waste report it
 prints, and tell us one thing: **does the number match your suspicion?**
 
@@ -68,17 +70,20 @@ dashboard.
 ## The 15 minutes
 
 ```sh
+# 0. The CLI — one file, no build (the clone below is only for the image build):
+curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
+  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
 git clone https://github.com/pranav2910/vgpu_scheduler && cd vgpu_scheduler
 
 # 1. Install the read-only monitor (one namespace, one DaemonSet, minimal RBAC)
-scripts/vgpu install monitor
+vgpu install monitor
 
 # 2. If anything is off, the doctor names the problem AND the fix
-scripts/vgpu doctor
+vgpu doctor
 
 # 3. Let it observe for ~5 minutes while your normal workloads run, then:
-scripts/vgpu report --price-per-gpu-hour <your $/GPU-hr>
-scripts/vgpu report -o csv > waste.csv        # or -o json
+vgpu report --price-per-gpu-hour <your $/GPU-hr>
+vgpu report -o csv > waste.csv        # or -o json
 
 # 4. (Optional) the Grafana dashboard — Prometheus discovers the agent via a
 #    dedicated read-only credential (never your admin kubeconfig):
@@ -87,14 +92,14 @@ cd deployments && GRAFANA_ADMIN_PASSWORD=<pick-one> docker compose up -d
 # open http://<host>:3000 → dashboard "vGPU — GPU waste & right-sizing"
 
 # 5. Verify our permission claims against your live cluster
-scripts/vgpu security audit
+vgpu security audit
 
 # 6. Done? Removal is verified-complete (incl. cluster-scoped RBAC) and never
 #    touches your workloads:
-scripts/vgpu uninstall monitor
+vgpu uninstall monitor
 ```
 
-If anything misbehaves: `scripts/vgpu support-bundle` produces a redacted
+If anything misbehaves: `vgpu support-bundle` produces a redacted
 tarball (no Secrets are ever read) — review it, then send it with your report.
 
 ## What we ask in return (5 minutes, honestly)
