@@ -17,6 +17,12 @@ HOST="${HOST:?set HOST=user@ip}"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 $HOST"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 EVID="artifacts/certify-${SHA}"; mkdir -p "$EVID"
+# SELF-STAMP: run from an immutable copy so editing the repo script can never
+# kill a live run (bash reads scripts incrementally — learned twice, painfully).
+if [ -z "${CERT_STAMPED:-}" ]; then
+    cp "$0" "$EVID/runner.sh"
+    CERT_STAMPED=1 exec bash "$EVID/runner.sh"
+fi
 KC='export KUBECONFIG=$HOME/.kube/config; cd vgpu_scheduler'
 GiB=$((1024*1024*1024))
 
