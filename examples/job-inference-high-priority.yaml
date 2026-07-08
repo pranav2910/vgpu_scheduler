@@ -1,0 +1,24 @@
+# A latency-sensitive inference service that must never be evicted:
+# high priority (wins contention) + preemptible: false (can never be a victim).
+# CLI equivalent:
+#   vgpu submit --name embed-api --vram 12Gi --image my-embedder:v3 \
+#     --class Inference --priority 200 --runtime-class nvidia
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: embed-api
+spec:
+  priority: 200
+  workloadClass: Inference
+  preemptible: false                       # immune to preemption, at any priority gap
+  claimTemplate:
+    spec:
+      requestedVramBytes: 12884901888      # 12 GiB
+      serviceTier: Guaranteed
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+      - name: workload
+        image: my-embedder:v3

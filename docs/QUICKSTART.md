@@ -55,4 +55,5 @@ real footprint.
 - If your cluster **enforces** right-sizing, an undersized re-submit may be rejected with a clear hint — either raise `--vram` or add `--override`. See [recommendation-policy.md](recommendation-policy.md).
 
 **Next:** the full manual with gang (multi-worker) jobs, troubleshooting, and the
-habit of right-sizing → [USER-GUIDE.md](USER-GUIDE.md).
+habit of right-sizing → [USER-GUIDE.md](USER-GUIDE.md). Want it by example instead?
+[EXAMPLES.md](EXAMPLES.md) has CLI + YAML side by side for 10 use cases.

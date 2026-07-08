@@ -1,0 +1,19 @@
+# Distributed training, all-or-nothing: 4 workers x 12 GiB admit ATOMICALLY —
+# either all four get a slice or none do (no half-started jobs holding GPUs).
+# If the cluster can't fit all 4 within 300s, the reservation is released.
+# Watch it:  kubectl get vgpugangjob ddp-run -o wide   (RUNNING goes 0 -> 4)
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata:
+  name: ddp-run
+spec:
+  gangSize: 4
+  minAvailable: 4                          # all 4 or none
+  reservationTimeoutSeconds: 300           # give up + release if not assembled in 5 min
+  priority: 100
+  workloadClass: Training
+  preemptible: false                       # never tear down a committed gang member
+  podTemplate:
+    spec:
+      requestedVramBytes: 12884901888      # 12 GiB per worker
+      serviceTier: Guaranteed

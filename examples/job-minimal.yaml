@@ -1,0 +1,12 @@
+# Smallest possible ask: reserve 512 MiB of GPU memory — no pod, just capacity.
+# Use case: hold a slice for a process you start some other way, or smoke-test
+# the scheduler. Slicing is byte-granular; sub-GiB requests are first-class.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: tiny-hold
+spec:
+  claimTemplate:
+    spec:
+      requestedVramBytes: 536870912        # 512 MiB
+      serviceTier: Guaranteed
