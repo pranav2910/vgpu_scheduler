@@ -348,9 +348,10 @@ else
 fi
 
 say "CERT-07 quota: single-job cap + gang-atomic denial"
+quiesce 180
 $SSH "$KC
   kubectl create ns certq --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq}\nspec: {maxVramBytes: %s}\n' $((10*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq}\nspec: {targetNamespace: certq, maxVramBytes: %s}\n' $((10*GiB)) | kubectl apply -f - >/dev/null
   sleep 3
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fits, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: busts, namespace: certq}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}}\n' $((6*GiB)) | kubectl apply -f - >/dev/null
@@ -376,7 +377,7 @@ say "CERT-07x quota deep-matrix: exact boundary + live raise + namespace isolati
 $SSH "$KC
   kubectl create ns certq-a --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl create ns certq-b --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' $((16*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {targetNamespace: certq-a, maxVramBytes: %s}\n' $((16*GiB)) | kubectl apply -f - >/dev/null
   sleep 3
   # (a) gang EXACTLY at quota (4x4=16Gi == 16Gi cap) -> must ADMIT (<=, not <)
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: exact, namespace: certq-a}\nspec: {gangSize: 4, minAvailable: 4, reservationTimeoutSeconds: 90, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: %s, serviceTier: Guaranteed}}}\n' $((4*GiB)) | kubectl apply -f - >/dev/null
@@ -393,7 +394,7 @@ $SSH "$KC
   sleep 25
   echo FREE=\$(kubectl get vgpuslice freejob-claim-slice -n certq-b -o jsonpath='{.status.phase}' 2>/dev/null)
   # (d) LIVE RAISE: bump quota to 20Gi -> the denied job must admit WITHOUT resubmission
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {maxVramBytes: %s}\n' $((20*GiB)) | kubectl apply -f - >/dev/null
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUQuota\nmetadata: {name: q, namespace: certq-a}\nspec: {targetNamespace: certq-a, maxVramBytes: %s}\n' $((20*GiB)) | kubectl apply -f - >/dev/null
   for i in \$(seq 1 40); do
     ph=\$(kubectl get vgpuslice onemore-claim-slice -n certq-a -o jsonpath='{.status.phase}' 2>/dev/null); [ \"\$ph\" = Ready ] && break; sleep 4
   done
