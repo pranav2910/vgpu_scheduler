@@ -111,23 +111,32 @@ PR=$(kc "kubectl get vgpuslice postret-claim-slice -n c18loss -o jsonpath='{.sta
 [[ "$RET" == True && "$PR" == Ready ]] && ok "CERT-18c+: node returned; new work landed (flap-recovery live)" || bad "CERT-18c+: returned=$RET postret=$PR"
 kc "kubectl delete ns c18loss --wait=false >/dev/null 2>&1"; sleep 5
 
-say "CERT-18d: 60s PARTITION ($N2 egress to :6443) during gang assembly → never committed-partial, converges on heal"
+say "CERT-18d: PARTITION FIRST ($N2 egress to :6443) → gang needing all 3 nodes must HOLD → heal → converges"
 quiesce 120
 kc "kubectl create ns c18part --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
-# submit the gang WHILE all nodes reachable (webhook admits), THEN partition
-kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: $GANG, minAvailable: $GANG, reservationTimeoutSeconds: 300, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $MEMBYTES, serviceTier: Guaranteed}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null"
+# Partition BEFORE submitting, and wait until the apiserver sees the node dark —
+# otherwise a fast gang assembles in the seconds before the DROP lands and the
+# hold-back assertion is vacuous (run-1 raced exactly this way).
 echo "  partitioning $AG2 (iptables DROP egress to $SERVER_IP:6443)..."
 timeout 15 $S2 "sudo iptables -I OUTPUT -d $SERVER_IP -p tcp --dport 6443 -j DROP" >/dev/null 2>&1
-sleep 55
+for i in $(seq 1 40); do st=$(kc "kubectl get node $N2 -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null); [ "$st" != True ] && break; sleep 5; done
+PST=$(kc "kubectl get node $N2 -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null)
+[ "$PST" != True ] && ok "partition took effect ($N2 Ready=$PST)" || bad "partition never took effect ($N2 still Ready)"
+# gang needs 1 node per member; only 2 nodes reachable → full admission is impossible
+kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: $GANG, minAvailable: $GANG, reservationTimeoutSeconds: 300, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $MEMBYTES, serviceTier: Guaranteed}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null"
+sleep 45
 DUR=$(ready c18part)
 RSV=$(kc "kubectl get vgpugangreservation pg-rsv -n c18part -o jsonpath='{.status.phase}'" 2>/dev/null)
-echo "  DURING: ready=$DUR reservation=$RSV" | tee "$EVID/cert18d.txt"
-[[ "$RSV" != "Committed" || "$DUR" == "$GANG" ]] && ok "CERT-18d: during partition NOT committed-partial (ready=$DUR/$GANG, rsv=$RSV — no split-brain)" || bad "CERT-18d: Committed with only $DUR/$GANG (split-brain)"
+echo "  DURING: ready=${DUR:-0}/$GANG reservation=${RSV:-none}" | tee "$EVID/cert18d.txt"
+[[ "${DUR:-0}" -le $((GANG-1)) && "$RSV" != "Committed" ]] \
+  && ok "CERT-18d: gang HELD during partition (ready=${DUR:-0}/$GANG, rsv=${RSV:-none} — never committed-partial, no split-brain)" \
+  || bad "CERT-18d: admitted/committed with a needed node dark (ready=$DUR rsv=$RSV)"
 echo "  healing $AG2..."
 timeout 15 $S2 "sudo iptables -D OUTPUT -d $SERVER_IP -p tcp --dport 6443 -j DROP" >/dev/null 2>&1
 for i in $(seq 1 60); do [ "$(ready c18part)" -ge "$GANG" ] && break; sleep 6; done
 AH=$(ready c18part)
-[ "$AH" -ge "$GANG" ] && ok "CERT-18d+: after heal the SAME gang converged to $AH/$GANG (no split-brain, deterministic convergence)" || bad "CERT-18d+: did not converge ($AH/$GANG)"
+RSV2=$(kc "kubectl get vgpugangreservation pg-rsv -n c18part -o jsonpath='{.status.phase}'" 2>/dev/null)
+[[ "$AH" -ge "$GANG" && "$RSV2" == "Committed" ]] && ok "CERT-18d+: after heal the SAME gang converged to $AH/$GANG and Committed (deterministic convergence)" || bad "CERT-18d+: did not converge cleanly (ready=$AH rsv=${RSV2:-none})"
 kc "kubectl delete ns c18part --wait=false >/dev/null 2>&1"
 
 echo
