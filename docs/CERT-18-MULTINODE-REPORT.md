@@ -1,50 +1,40 @@
-# CERT-18 — Multi-Node Failure Certification
+# CERT-18 — Multi-Node Failure Certification (HONEST STATUS)
 
-> STATUS: substance demonstrated across runs; a SINGLE clean end-to-end scripted
-> receipt is being earned (harness fixes: CERT-08 soft-overflow for this card
-> shape, 18d webhook-pin + request-timeout, 18c+ pre-probe cleanup). Not final
-> until FINAL_VERDICT=PASS in one run.
+**Cluster:** 3 real GPU nodes, TWO clouds — 1× 8×Tesla V100 (Lambda us-south-1)
++ 2× A10 (Oracle), joined over SSH tunnels (us-south-1 firewall un-configurable).
+**Date:** 2026-07-08.
 
-**Cluster:** 3 real GPU nodes across TWO clouds — 1× 8×Tesla V100 (Lambda, us-south-1)
-+ 2× A10 (Oracle) — joined over SSH tunnels (Lambda's us-south-1 firewall cannot
-be configured, so k3s agents reach the API via a systemd-managed SSH tunnel;
-the server's private IP is loopback-aliased on each agent so the k3s client
-load-balancer's discovered endpoint also routes through the tunnel).
-**Date:** 2026-07-08. **Commit:** HEAD of main.
+## Status: SUBSTANCE PROVEN, single all-green run NOT captured
 
-## Results — every multi-node failure scenario PASSED on real hardware
+Every scenario passed on real hardware — but spread across runs, not all-green in
+ONE scripted pass (boxes terminated before a final clean run). By our own
+"one clean receipt" standard, CERT-18 is **substance-proven, receipt-incomplete**.
 
-| ID | Scenario | Verdict | Live evidence |
-|----|----------|---------|---------------|
-| pre | 3 nodes Ready, capacity advertised, nodeagents Running | ✅ | 128Gi + 22Gi + 22Gi; 3/3 agent pods Running |
-| **18b** | Gang bigger than any single node → members SPAN nodes, all-or-nothing | ✅ (×2) | 10-member × 12Gi gang admitted SPANNING all 3 nodes |
-| **18c** | Node loss mid-life → survivors keep admitting | ✅ (×2) | killed A10 → NotReady(Unknown); a new 4Gi job admitted on survivors |
-| **18c+** | Node return → capacity re-charged, work lands on it | ✅ | node returned; a 20Gi job (fits only A10s) landed on the returned node |
-| **18d** | 60s network partition during gang assembly → all-or-nothing holds; converges on heal | ✅ | during partition the reservation stayed **Reserved for all 10, never Committed-partial**; the stuck member (pg-2, on the partitioned node) sat in Scheduled; on heal it converged **9→10/10** the instant its node reconnected |
-| CERT-08 | Topology zone hint honored | ✅ (hint) | zoned job landed in its hinted zone (ZONE=zone-a10) both runs |
+| ID | Scenario | Best result | Notes |
+|----|----------|-------------|-------|
+| CERT-08 | zone hint + soft-overflow when zone full | ✅ green (final run) | rewrote for this cluster's card shape (V100 cards 16Gi < A10 22Gi) |
+| **18b** | cross-node gang spans 3 nodes, all-or-nothing | ✅ green (runs 1–2); ✗ 0/10 (final) | final red = CERT-08 leftover fill jobs starved the A10s → product CORRECTLY refused to over-admit; not a product fault |
+| **18c** | node loss → survivors admit | ✅ green (×3) | killed A10 → NotReady; new work admitted on survivors |
+| **18c+** | node return → capacity re-charged | ✅ green (final) | 20Gi landed on the returned node after holder cleanup |
+| **18d** | partition during gang → no split-brain; converge | ✅ green (final) | reservation NEVER committed-partial; converged 10/10 on heal (also seen live 9→10) |
 
-## The 18d finding, precisely
+## What is solidly proven
 
-All-or-nothing gang scheduling is a guarantee about **commitment**, not mid-flight
-binding. During the partition: the gang reservation held **Reserved for all 10
-members** (never committed with a partial membership — no split-brain), 9 members
-completed allocation, and the 10th — which had landed on the partitioned node —
-correctly waited in `Scheduled` because that node's agent could not reach the
-control plane. The moment the partition healed, the 10th allocated and the gang
-converged to **10/10**, observed live. This is the correct distributed-systems
-behavior: atomic *admission*, patient *binding*, deterministic *convergence*.
+- Cross-node gang scheduling spanning 3 real nodes (18b, twice).
+- Real node loss + survivor admission (18c, thrice).
+- Node return / flap recovery (18c+).
+- **Network partition: atomic — the gang reservation never committed with partial
+  membership (no split-brain) and converged to 10/10 on heal** (18d, final run +
+  observed live). This is the hardest multi-node property and it passed cleanly.
 
-## Honest notes on the harness (not the product)
+## What is NOT fully earned
 
-Several test rounds failed on HARNESS bugs while the product behaved correctly
-throughout — documented so the receipt is trustworthy:
-- CERT-08's "infeasible" fallback used a 40Gi request, but this cluster's largest
-  single card is 16Gi (V100) / 22Gi (A10) — no card can hold 40Gi, so the product
-  *correctly refused it*; the soft-placement half needs a cluster-appropriate size.
-- 18c+ / packing reds in some rounds were leaked test namespaces consuming capacity
-  (a killed prior run's holders) — the product's fail-loud refusal was correct.
-- 18d's SIGSTOP partition method froze a tunnel the shared control plane partly
-  depends on; the convergence itself (the substantive claim) was proven live.
+A single scripted run with FINAL_VERDICT=PASS across all six. The one repeatable
+gap is HARNESS sequencing (CERT-08's fill jobs not guaranteed drained before 18b),
+never a product defect — across every run the scheduler's only "failures" were
+correct refusals to over-admit onto occupied capacity.
 
-**CERT-18 substance: PASSED on real cross-cloud hardware.** Cross-node gangs,
-node loss, node return, and network partition all behave to contract.
+## To finish (next multi-node box session, ~30 min)
+
+Add a `quiesce`-to-zero between CERT-08 and 18b (the same pattern that fixed the
+single-cluster cert's capacity sections), then one clean run tags it.
