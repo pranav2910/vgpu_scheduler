@@ -1,5 +1,10 @@
 # CERT-18 — Multi-Node Failure Certification
 
+> STATUS: substance demonstrated across runs; a SINGLE clean end-to-end scripted
+> receipt is being earned (harness fixes: CERT-08 soft-overflow for this card
+> shape, 18d webhook-pin + request-timeout, 18c+ pre-probe cleanup). Not final
+> until FINAL_VERDICT=PASS in one run.
+
 **Cluster:** 3 real GPU nodes across TWO clouds — 1× 8×Tesla V100 (Lambda, us-south-1)
 + 2× A10 (Oracle) — joined over SSH tunnels (Lambda's us-south-1 firewall cannot
 be configured, so k3s agents reach the API via a systemd-managed SSH tunnel;

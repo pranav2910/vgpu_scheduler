@@ -36,22 +36,36 @@ NR=$(grep -c Ready "$EVID/00-nodes.txt"); NC=$(awk '$3+0>1e9' "$EVID/00-nodes.tx
 AGP=$(kc "kubectl get pods -n vgpu-system -l app=vgpu-nodeagent --no-headers 2>/dev/null | grep -c Running" | tr -d ' ')
 [[ "$AGP" == 3 ]] && ok "nodeagent Running on all 3 nodes" || bad "only $AGP/3 nodeagent pods Running"
 
-say "CERT-08: topology zone hint honored + infeasible stays SOFT (real 3-node)"
+say "CERT-08: topology zone hint honored + SOFT overflow when the zone is FULL"
+# NOTE on this cluster's shape: the "big" node (V100) has 16Gi CARDS; the A10s
+# have 22Gi cards. So "too big for zone-a10" is impossible (nothing is bigger
+# than a 22Gi card). The honest SOFT test: FILL zone-a10, then a zone-a10-hinted
+# job must softly OVERFLOW to zone-big — the preference is a hint, not a hard pin.
 kc "kubectl label node $N1 topology.vgpu.pranav2910.com/zone=zone-big --overwrite >/dev/null
   kubectl label node $N2 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl label node $N3 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl create ns c18topo --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: zoned, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((4*GiB))}}}\n' | kubectl apply -f - >/dev/null
-  sleep 30
+  # (a) hint honored: a small zone-a10 job lands in zone-a10
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: zoned, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((4*GiB))}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null
+  sleep 25
   ZN=\$(kubectl get vgpuslice zoned-claim-slice -n c18topo -o jsonpath='{.spec.nodeName}' 2>/dev/null)
   echo ZONE=\$(kubectl get node \$ZN -o jsonpath='{.metadata.labels.topology\.vgpu\.pranav2910\.com/zone}' 2>/dev/null)
-  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: softz, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((40*GiB))}}}\n' | kubectl apply -f - >/dev/null
+  # (b) FILL both A10s (zone-a10) so the zone has no room
+  for i in \$(seq 1 4); do printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fill-%s, namespace: c18topo}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((18*GiB))}}, podTemplate: {spec: {nodeSelector: {topology.vgpu.pranav2910.com/zone: zone-a10}}}}\n---\n' \$i; done | kubectl apply --request-timeout=30s -f - >/dev/null 2>&1 || true
+  # simpler robust fill: 2 more 18Gi zone-a10-HINTED jobs (each A10 fits one 18Gi)
+  for i in 1 2; do printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: fa-%s, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((18*GiB))}}}\n---\n' \$i; done | kubectl apply --request-timeout=30s -f - >/dev/null
   sleep 30
+  # (c) one MORE zone-a10-hinted job: zone-a10 is full (2 A10s each hold ~18Gi +
+  # the 4Gi zoned = >22Gi) → must SOFT overflow to zone-big (V100) and be Ready
+  printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: softz, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((8*GiB))}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null
+  sleep 30
+  SN=\$(kubectl get vgpuslice softz-claim-slice -n c18topo -o jsonpath='{.spec.nodeName}' 2>/dev/null)
   echo SOFT=\$(kubectl get vgpuslice softz-claim-slice -n c18topo -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo SOFTNODE=\$(kubectl get node \$SN -o jsonpath='{.metadata.labels.topology\.vgpu\.pranav2910\.com/zone}' 2>/dev/null)
   kubectl delete ns c18topo --wait=false >/dev/null 2>&1" | tee "$EVID/cert08.txt"
-grep -q "ZONE=zone-a10" "$EVID/cert08.txt" && grep -q "SOFT=Ready" "$EVID/cert08.txt" \
-  && ok "CERT-08: hint honored (landed zone-a10); infeasible 40Gi stayed SOFT (scheduled on the big node)" \
-  || bad "CERT-08: $(grep -E 'ZONE=|SOFT=' "$EVID/cert08.txt" | tr '\n' ' ')"
+grep -q "ZONE=zone-a10" "$EVID/cert08.txt" && grep -q "SOFT=Ready" "$EVID/cert08.txt" && grep -q "SOFTNODE=zone-big" "$EVID/cert08.txt" \
+  && ok "CERT-08: hint honored (landed zone-a10); when zone-a10 was FULL a zone-a10-hinted job SOFT-overflowed to zone-big and ran (Ready) — preference not a hard pin" \
+  || bad "CERT-08: $(grep -E 'ZONE=|SOFT' "$EVID/cert08.txt" | tr '\n' ' ')"
 
 say "CERT-18b: cross-node gang bigger than any node → members SPAN nodes, all-or-nothing"
 kc "kubectl create ns c18xg --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -93,7 +107,11 @@ RET=$(kc "kubectl get node $N3 -o jsonpath='{.status.conditions[?(@.type==\"Read
 M3=$($S3 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -dc 0-9')
 kc "kubectl patch node $N3 --subresource=status --type=merge -p '{\"status\":{\"capacity\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"'$((M3*1024*1024))'\"},\"allocatable\":{\"infrastructure.pranav2910.com/vgpu-bytes\":\"'$((M3*1024*1024))'\"}}}' >/dev/null"
 sleep 15
-kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: postret, namespace: c18loss}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((20*GiB))}}}\n' | kubectl apply -f - >/dev/null"
+# CLEAN the earlier holders (a10job 20Gi + survivor 4Gi) so the post-return probe
+# tests the RETURNED node's freed capacity, not leftover pressure.
+kc "kubectl delete vgpujob a10job survivor -n c18loss --wait=false >/dev/null 2>&1"
+for i in $(seq 1 20); do [ "$(ready c18loss)" == 0 ] && break; sleep 4; done
+kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: postret, namespace: c18loss}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((20*GiB))}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null"
 sleep 40
 PR=$(kc "kubectl get vgpuslice postret-claim-slice -n c18loss -o jsonpath='{.status.phase}'" 2>/dev/null)
 PRN=$(kc "kubectl get vgpuslice postret-claim-slice -n c18loss -o jsonpath='{.spec.nodeName}'" 2>/dev/null)
@@ -101,14 +119,19 @@ PRN=$(kc "kubectl get vgpuslice postret-claim-slice -n c18loss -o jsonpath='{.sp
   || bad "CERT-18c+: returned=$RET postret=$PR"
 kc "kubectl delete ns c18loss --wait=false >/dev/null 2>&1"; sleep 8
 
-say "CERT-18d: 60s PARTITION (sever tunnel on $N2) during gang assembly → never partial, converges after heal"
-kc "kubectl create ns c18part --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
-# Partition by SUSPENDING the tunnel unit's traffic: freeze the ssh child (SIGSTOP)
-# so packets black-hole but the systemd unit survives; resume with SIGCONT to heal.
-# (The unit uses --collect, so stop/start would delete it — freezing is the clean partition.)
+say "CERT-18d: 60s PARTITION during gang assembly → never committed-partial, converges after heal"
+# Pin BOTH control-plane deployments (webhook backends) onto the server node, then
+# submit the gang FIRST (webhook reachable), and only THEN partition an A10. This
+# avoids the hang where the fail-closed webhook's backend sat on the frozen node
+# (a frozen socket black-holes with no RST → the gang apply waits forever).
+kc "kubectl -n vgpu-system patch deploy vgpu-controller --type=merge -p '{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"$N1\"}}}}' >/dev/null 2>&1 || true
+  kubectl -n vgpu-system rollout status deploy/vgpu-controller --timeout=90s >/dev/null 2>&1 || true
+  kubectl create ns c18part --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
+# submit the gang WHILE all nodes are reachable (webhook admits it), --request-timeout guards any stall
+kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: 10, minAvailable: 10, reservationTimeoutSeconds: 300, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $((12*GiB)), serviceTier: Guaranteed}}}\n' | kubectl apply --request-timeout=30s -f - >/dev/null"
+# NOW partition $AG2 (freeze its tunnel ssh) — its 1 member can't allocate; gang must not commit-partial
 echo "  partitioning $AG2 (freezing its tunnel ssh)..."
-$S2 "sudo pkill -STOP -f '6443:localhost:6443'" >/dev/null 2>&1
-kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: 10, minAvailable: 10, reservationTimeoutSeconds: 240, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $((12*GiB)), serviceTier: Guaranteed}}}\n' | kubectl apply -f - >/dev/null"
+timeout 15 $S2 "sudo pkill -STOP -f '6443:localhost:6443'" >/dev/null 2>&1
 sleep 55
 # The all-or-nothing CONTRACT is about COMMITMENT, not mid-flight binding: the
 # reservation must never be Committed with a partial membership. Assert on the
