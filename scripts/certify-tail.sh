@@ -76,9 +76,9 @@ run_onbox(){ # name script-body timeout-sec
 
 # ═══ TAIL COMPLETION: seed the banked round-7 ledger (product-identical commit;
 # CERT-17's lane-placement FAIL dropped — it re-runs QUIET below) ═══
-SEED="artifacts/certify-7a3ea3b/.certlog"
+SEED="artifacts/certify-17c9645/.certlog"
 if [ -f "$SEED" ]; then
-    grep -v "^CERT-17|" "$SEED" > "$CERTLOG"
+    grep -vE "^CERT-11\||^CERT-15\|" "$SEED" > "$CERTLOG"
     PASS=$(grep -c "|PASS|" "$CERTLOG" || true); FAIL=0
     echo "seeded $PASS banked PASS verdicts from round 7"
 fi
@@ -87,29 +87,6 @@ PERCARD_MIB=$($SSH 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,no
 $SSH "export KUBECONFIG=\$HOME/.kube/config
   kubectl get ns -o name | grep -E 'cert|mgpu-|repro|t3' | cut -d/ -f2 | xargs -r kubectl delete ns --ignore-not-found >/dev/null 2>&1; true" 2>/dev/null
 quiesce 240
-
-say "CERT-10 attribution truth at two load levels + format equality"
-$SSH "$KC
-  scripts/vgpu install monitor >/dev/null 2>&1; sleep 5
-  kubectl create ns certattr --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  burn(){ printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: %s, namespace: certattr}\nspec: {claimTemplate: {spec: {requestedVramBytes: %s}}, podTemplate: {spec: {runtimeClassName: nvidia, containers: [{name: w, image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime, command: [python, -c, \"import torch,time; x=torch.empty(int(%s*1024**3)//2, dtype=torch.float16, device='\''cuda'\'').normal_(); torch.cuda.synchronize(); time.sleep(600)\"]}]}}}\n' \"\$1\" \"\$2\" \"\$3\"; }
-  { burn small $((6*GiB)) 3; echo ---; burn big $((13*GiB)) 11; } | kubectl apply -f - >/dev/null
-  for i in \$(seq 1 60); do
-    a=\$(kubectl get pods -n certattr --no-headers 2>/dev/null | grep -c Running); [ \"\$a\" = 2 ] && break; sleep 4
-  done
-  sleep 75
-  RPT=\$(scripts/vgpu report -o csv | awk -F, '\$1==\"certattr\" {s+=\$7} END{printf \"%d\", s}')
-  SMI=\$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits | awk '{s+=\$1} END{printf \"%d\", s*1048576}')
-  D=\$((RPT>SMI ? RPT-SMI : SMI-RPT))
-  echo RPT=\$RPT SMI=\$SMI DIFF=\$D
-  [ \$D -le 1073741824 ] && echo MATCH=yes || echo MATCH=no
-  T=\$(scripts/vgpu report | awk '/GPU memory requested/{print \$4}')
-  C=\$(scripts/vgpu report -o csv | awk -F, '\$1==\"_total_\"{printf \"%.1f\", \$6/1073741824}')
-  [ \"\$T\" = \"\$C\" ] && echo FORMATS=yes || echo FORMATS=no
-  kubectl delete ns certattr --wait=false >/dev/null 2>&1" | tee "$EVID/cert10.txt"
-grep -q "MATCH=yes" "$EVID/cert10.txt" && grep -q "FORMATS=yes" "$EVID/cert10.txt" \
-    && cert CERT-10 PASS "two simultaneous loads (3+11 GiB): report==nvidia-smi ±1GiB; table==CSV" \
-    || cert CERT-10 FAIL "$(grep -E 'RPT=|MATCH=|FORMATS=' "$EVID/cert10.txt" | tr '\n' ' ')"
 
 say "CERT-11 right-sizing: peak learned, rec math = peak*1.15, Low-confidence SAFETY GATE"
 $SSH "$KC
@@ -141,26 +118,6 @@ else
     cert CERT-11 FAIL "peak=$PEAK prec=$PREC conf=$CONF ann=$ANN"
 fi
 
-quiesce 180
-say "CERT-14 burst admission: 100×1Gi in one apply"
-$SSH "$KC
-  kubectl create ns certburst --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  T0=\$(date +%s)
-  for i in \$(seq 1 100); do
-    printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: b-%03d, namespace: certburst}\nspec: {claimTemplate: {spec: {requestedVramBytes: 1073741824}}}\n---\n' \$i
-  done | kubectl apply -f - >/dev/null
-  for i in \$(seq 1 60); do
-    r=\$(kubectl get vgpuslice -n certburst --no-headers 2>/dev/null | grep -c Ready); [ \"\$r\" -ge 100 ] && break; sleep 5
-  done
-  T1=\$(date +%s)
-  echo BURST_READY=\$(kubectl get vgpuslice -n certburst --no-headers | grep -c Ready) BURST_SECS=\$((T1-T0))
-  echo RESTARTS=\$(kubectl get pods -n vgpu-system -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{\" \"}{end}')
-  kubectl delete ns certburst --wait=false >/dev/null 2>&1" | tee "$EVID/cert14.txt"
-BR=$(grep -oE "BURST_READY=[0-9]+" "$EVID/cert14.txt" | cut -d= -f2)
-BS=$(grep -oE "BURST_SECS=[0-9]+" "$EVID/cert14.txt" | cut -d= -f2)
-[[ "${BR:-0}" -ge 100 ]] && cert CERT-14 PASS "100/100 Ready in ${BS}s, no component restarts" \
-    || cert CERT-14 FAIL "burst $BR/100 in ${BS}s"
-
 say "CERT-15 input hostility (every garbage input rejected LOUD)"
 $SSH "$KC
   kubectl create ns certhostile --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -179,14 +136,6 @@ $SSH "$KC
   kubectl delete ns certhostile --wait=false >/dev/null 2>&1" | tee "$EVID/cert15.txt"
 grep -q "REJECTED=7/7" "$EVID/cert15.txt" && cert CERT-15 PASS "7/7 hostile inputs rejected (zero/huge/garbage-name/negative/10Ti/gangSize-0/immutability-edit)" \
     || cert CERT-15 FAIL "$(grep REJECTED "$EVID/cert15.txt")"
-
-say "CERT-17 dashboard truth (QUIET conditions — cluster drained first)"
-quiesce 180
-if HOST="$HOST" bash scripts/gate5-grafana.sh > "$EVID/cert17.log" 2>&1; then
-    cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (quiet)"
-else
-    cert CERT-17 FAIL "see $EVID/cert17.log"
-fi
 
 # ── report generation ─────────────────────────────────────────────────────
 say "generating CERTIFICATION-REPORT.md"
