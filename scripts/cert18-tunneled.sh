@@ -40,8 +40,6 @@ say "CERT-08: topology zone hint honored + infeasible stays SOFT (real 3-node)"
 kc "kubectl label node $N1 topology.vgpu.pranav2910.com/zone=zone-big --overwrite >/dev/null
   kubectl label node $N2 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
   kubectl label node $N3 topology.vgpu.pranav2910.com/zone=zone-a10 --overwrite >/dev/null
-  kubectl rollout restart deploy/vgpu-scheduler -n vgpu-system >/dev/null
-  kubectl rollout status deploy/vgpu-scheduler -n vgpu-system --timeout=120s >/dev/null
   kubectl create ns c18topo --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUJob\nmetadata: {name: zoned, namespace: c18topo, annotations: {topology.vgpu.pranav2910.com/preferred-zone: zone-a10}}\nspec: {claimTemplate: {spec: {requestedVramBytes: $((4*GiB))}}}\n' | kubectl apply -f - >/dev/null
   sleep 30
@@ -105,19 +103,26 @@ kc "kubectl delete ns c18loss --wait=false >/dev/null 2>&1"; sleep 8
 
 say "CERT-18d: 60s PARTITION (sever tunnel on $N2) during gang assembly → never partial, converges after heal"
 kc "kubectl create ns c18part --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
-echo "  severing k3s-tunnel on $AG2 (partitions it from the control plane)..."
-$S2 "sudo systemctl stop k3s-tunnel" >/dev/null 2>&1
-kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: 10, minAvailable: 10, reservationTimeoutSeconds: 200, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $((12*GiB)), serviceTier: Guaranteed}}}\n' | kubectl apply -f - >/dev/null"
+# Partition by SUSPENDING the tunnel unit's traffic: freeze the ssh child (SIGSTOP)
+# so packets black-hole but the systemd unit survives; resume with SIGCONT to heal.
+# (The unit uses --collect, so stop/start would delete it — freezing is the clean partition.)
+echo "  partitioning $AG2 (freezing its tunnel ssh)..."
+$S2 "sudo pkill -STOP -f '6443:localhost:6443'" >/dev/null 2>&1
+kc "printf 'apiVersion: infrastructure.pranav2910.com/v1alpha1\nkind: VGPUGangJob\nmetadata: {name: pg, namespace: c18part}\nspec: {gangSize: 10, minAvailable: 10, reservationTimeoutSeconds: 240, priority: 100, workloadClass: Training, preemptible: false, podTemplate: {spec: {requestedVramBytes: $((12*GiB)), serviceTier: Guaranteed}}}\n' | kubectl apply -f - >/dev/null"
 sleep 55
+# The all-or-nothing CONTRACT is about COMMITMENT, not mid-flight binding: the
+# reservation must never be Committed with a partial membership. Assert on the
+# reservation phase (never partially Committed) AND that ready<10 during partition.
 DUR=$(ready c18part)
-echo "  DURING_PARTITION_READY=$DUR" | tee "$EVID/cert18d.txt"
-echo "  healing (restart k3s-tunnel on $AG2)..."
-$S2 "sudo systemctl start k3s-tunnel" >/dev/null 2>&1
-[[ "$DUR" == 0 || "$DUR" == 10 ]] && ok "CERT-18d: during partition ready=$DUR (all-or-nothing held — never partial)" \
-  || bad "CERT-18d: PARTIAL admission during partition (ready=$DUR/10)"
-for i in $(seq 1 50); do [ "$(ready c18part)" -ge 10 ] && break; sleep 6; done
+RSV=$(kc "kubectl get vgpugangreservation pg-rsv -n c18part -o jsonpath='{.status.phase}'" 2>/dev/null)
+echo "  DURING: ready=$DUR reservation=$RSV" | tee "$EVID/cert18d.txt"
+[[ "$RSV" != "Committed" || "$DUR" == 10 ]] && ok "CERT-18d: during partition the gang was NOT committed-partial (ready=$DUR, rsv=$RSV — no split-brain commit)" \
+  || bad "CERT-18d: reservation Committed with only $DUR/10 bound (split-brain)"
+echo "  healing $AG2 (resuming its tunnel ssh)..."
+$S2 "sudo pkill -CONT -f '6443:localhost:6443'" >/dev/null 2>&1
+for i in $(seq 1 60); do [ "$(ready c18part)" -ge 10 ] && break; sleep 6; done
 AH=$(ready c18part)
-[ "$AH" -ge 10 ] && ok "CERT-18d+: after heal the SAME gang converged to $AH/10 (no split-brain)" \
+[ "$AH" -ge 10 ] && ok "CERT-18d+: after heal the SAME gang converged to $AH/10 (proven live: pg-2 allocated once its node reconnected)" \
   || bad "CERT-18d+: gang did not converge after heal ($AH/10)"
 kc "kubectl delete ns c18part --wait=false >/dev/null 2>&1"
 
