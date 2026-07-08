@@ -104,7 +104,9 @@ say "LANE 2 (parallel): CERT-01 + CERT-17 + CERT-16 — monitor subsystem, no ca
 (
   L2=0
   HOST="$HOST" bash scripts/gate2-monitor-lifecycle.sh > "$EVID/cert01.log" 2>&1 || L2=1
-  HOST="$HOST" bash scripts/gate5-grafana.sh          > "$EVID/cert17.log" 2>&1 || L2=$((L2+2))
+  # gate5 (CERT-17) is a steady-state TRUTH comparison (prometheus vs report
+  # sampled seconds apart) — it cannot share the box with a churning lane.
+  # It runs as the QUIET final section instead.
   $SSH "$KC
     scripts/vgpu install monitor >/dev/null 2>&1
     scripts/vgpu security audit > /tmp/aud.txt 2>&1; echo AUDIT_EXIT=\$?
@@ -444,8 +446,7 @@ wait "$LANE2_PID" 2>/dev/null || true
 L2RC=$(cat "$EVID/.lane2rc" 2>/dev/null || echo 3)
 [[ $((L2RC & 1)) -eq 0 ]] && cert CERT-01 PASS "install→doctor→report→bundle→VERIFIED uninstall→reinstall (parallel lane)" \
     || cert CERT-01 FAIL "see $EVID/cert01.log"
-[[ $((L2RC & 2)) -eq 0 ]] && cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (parallel lane)" \
-    || cert CERT-17 FAIL "see $EVID/cert17.log"
+
 grep -q "AUDIT_EXIT=0" "$EVID/cert16.txt" && grep -q "SECRET_FILES=0" "$EVID/cert16.txt" && grep -q "PRIVKEYS=0" "$EVID/cert16.txt" \
     && cert CERT-16 PASS "audit exit 0; bundle: zero Secrets, zero private keys (parallel lane)" \
     || cert CERT-16 FAIL "$(grep -E 'AUDIT_EXIT|SECRET_FILES|PRIVKEYS' "$EVID/cert16.txt" 2>/dev/null | tr '\n' ' ')"
@@ -531,6 +532,14 @@ $SSH "$KC
   kubectl delete ns certhostile --wait=false >/dev/null 2>&1" | tee "$EVID/cert15.txt"
 grep -q "REJECTED=7/7" "$EVID/cert15.txt" && cert CERT-15 PASS "7/7 hostile inputs rejected (zero/huge/garbage-name/negative/10Ti/gangSize-0/immutability-edit)" \
     || cert CERT-15 FAIL "$(grep REJECTED "$EVID/cert15.txt")"
+
+say "CERT-17 dashboard truth (QUIET conditions — cluster drained first)"
+quiesce 180
+if HOST="$HOST" bash scripts/gate5-grafana.sh > "$EVID/cert17.log" 2>&1; then
+    cert CERT-17 PASS "panels render via datasource; numbers==report ±1%; survives restart (quiet)"
+else
+    cert CERT-17 FAIL "see $EVID/cert17.log"
+fi
 
 # ── report generation ─────────────────────────────────────────────────────
 say "generating CERTIFICATION-REPORT.md"
