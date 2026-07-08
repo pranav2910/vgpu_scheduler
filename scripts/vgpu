@@ -148,6 +148,8 @@ cmd_submit() {
         esac
     done
     [[ -n "$name"  ]] || die "submit requires --name"
+    [[ "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "invalid --name '$name': must be lowercase alphanumeric/dashes (RFC 1123), e.g. my-job-2"
     [[ -n "$vram"  ]] || die "submit requires --vram"
     [[ -n "$image" ]] || die "submit requires --image"
 
