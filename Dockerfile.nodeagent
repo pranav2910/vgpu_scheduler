@@ -1,5 +1,5 @@
 # NodeAgent needs CGO for NVML. Use the bookworm-slim runtime with libnvidia-ml.
-FROM golang:1.25.11-bookworm AS builder
+FROM golang:1.25.12-bookworm AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

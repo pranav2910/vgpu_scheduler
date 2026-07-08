@@ -37,5 +37,5 @@ jobs:
     - name: govulncheck
       uses: golang/govulncheck-action@v1
       with:
-        go-version-input: '1.25.11'
+        go-version-input: '1.25.12'
         go-package: ./...

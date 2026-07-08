@@ -2,7 +2,7 @@
 # Build the real (NVML) variant:
 #   docker build --build-arg GOTAGS=nvml -f Dockerfile.gpu-probe -t vgpu-gpu-probe:nvml .
 #   docker run --rm --gpus all vgpu-gpu-probe:nvml
-FROM golang:1.25.11-bookworm AS builder
+FROM golang:1.25.12-bookworm AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
