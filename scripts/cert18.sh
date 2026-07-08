@@ -111,14 +111,19 @@ PR=$(kc "kubectl get vgpuslice postret-claim-slice -n c18loss -o jsonpath='{.sta
 [[ "$RET" == True && "$PR" == Ready ]] && ok "CERT-18c+: node returned; new work landed (flap-recovery live)" || bad "CERT-18c+: returned=$RET postret=$PR"
 kc "kubectl delete ns c18loss --wait=false >/dev/null 2>&1"; sleep 5
 
-say "CERT-18d: PARTITION FIRST ($N2 egress to :6443) → gang needing all 3 nodes must HOLD → heal → converges"
+say "CERT-18d: TRUE PARTITION (server drops ALL traffic from $N2) → gang needing all 3 nodes must HOLD → heal → converges"
 quiesce 120
 kc "kubectl create ns c18part --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
 # Partition BEFORE submitting, and wait until the apiserver sees the node dark —
-# otherwise a fast gang assembles in the seconds before the DROP lands and the
-# hold-back assertion is vacuous (run-1 raced exactly this way).
-echo "  partitioning $AG2 (iptables DROP egress to $SERVER_IP:6443)..."
-timeout 15 $S2 "sudo iptables -I OUTPUT -d $SERVER_IP -p tcp --dport 6443 -j DROP" >/dev/null 2>&1
+# otherwise a fast gang assembles before the cut lands and the hold-back assert
+# is vacuous (run-1 raced this way). And the cut must be a LINK cut, not a port
+# cut: an agent-side drop of dst:6443 measurably dropped packets yet leases kept
+# renewing — the k3s agent LB fails over to a path riding the wireguard overlay
+# (UDP 51820 on the wire). Server-side blanket DROP = dead switch port; k3s
+# cannot route around it. Inserted at position 1, above the subnet ACCEPT.
+AG2PRIV=$($S2 'hostname -I' 2>/dev/null | awk '{print $1}')
+echo "  partitioning: server drops ALL traffic from $N2 ($AG2PRIV)..."
+$S "sudo iptables -I INPUT 1 -s $AG2PRIV -j DROP" >/dev/null 2>&1
 for i in $(seq 1 40); do st=$(kc "kubectl get node $N2 -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null); [ "$st" != True ] && break; sleep 5; done
 PST=$(kc "kubectl get node $N2 -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null)
 [ "$PST" != True ] && ok "partition took effect ($N2 Ready=$PST)" || bad "partition never took effect ($N2 still Ready)"
@@ -131,8 +136,8 @@ echo "  DURING: ready=${DUR:-0}/$GANG reservation=${RSV:-none}" | tee "$EVID/cer
 [[ "${DUR:-0}" -le $((GANG-1)) && "$RSV" != "Committed" ]] \
   && ok "CERT-18d: gang HELD during partition (ready=${DUR:-0}/$GANG, rsv=${RSV:-none} — never committed-partial, no split-brain)" \
   || bad "CERT-18d: admitted/committed with a needed node dark (ready=$DUR rsv=$RSV)"
-echo "  healing $AG2..."
-timeout 15 $S2 "sudo iptables -D OUTPUT -d $SERVER_IP -p tcp --dport 6443 -j DROP" >/dev/null 2>&1
+echo "  healing (remove server-side DROP)..."
+$S "sudo iptables -D INPUT -s $AG2PRIV -j DROP" >/dev/null 2>&1
 for i in $(seq 1 60); do [ "$(ready c18part)" -ge "$GANG" ] && break; sleep 6; done
 AH=$(ready c18part)
 RSV2=$(kc "kubectl get vgpugangreservation pg-rsv -n c18part -o jsonpath='{.status.phase}'" 2>/dev/null)
