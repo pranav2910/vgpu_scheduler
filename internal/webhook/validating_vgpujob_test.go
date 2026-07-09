@@ -112,3 +112,26 @@ func TestJobValidator_AdequateRequestAllowed(t *testing.T) {
 		t.Errorf("adequately-sized request was denied: %q", resp.Result.Message)
 	}
 }
+
+// TestJobUpdate_ClaimTemplateFrozen: the template that materialized the claim
+// cannot change after creation — a silent-ignore edit must become a loud deny.
+func TestJobUpdate_ClaimTemplateFrozen(t *testing.T) {
+	oldJob := &vgpuv1alpha1.VGPUJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "default"},
+		Spec: vgpuv1alpha1.VGPUJobSpec{
+			ClaimTemplate: vgpuv1alpha1.VGPUClaimTemplate{
+				Spec: vgpuv1alpha1.VGPUClaimSpec{RequestedVRAMBytes: 16 << 30},
+			},
+		},
+	}
+	grown := oldJob.DeepCopy()
+	grown.Spec.ClaimTemplate.Spec.RequestedVRAMBytes = 56 << 30
+	if err := ValidateJobUpdate(oldJob, grown); err == nil {
+		t.Fatal("changing claimTemplate.requestedVramBytes must be denied")
+	}
+	same := oldJob.DeepCopy()
+	same.Annotations = map[string]string{"unrelated": "edit"}
+	if err := ValidateJobUpdate(oldJob, same); err != nil {
+		t.Fatalf("template-preserving update must be allowed, got: %v", err)
+	}
+}

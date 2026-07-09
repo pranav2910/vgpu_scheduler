@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
 	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
@@ -37,6 +38,27 @@ func NewJobRecommendationValidator(c client.Client, decoder admission.Decoder, m
 }
 
 func (h *JobRecommendationValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	// UPDATE: the claimTemplate is immutable after admission, in EVERY mode. The
+	// claim/slice/pod were materialized from the original template exactly once —
+	// without this check a template edit is accepted and then silently ignored,
+	// leaving job.spec claiming one size while the live grant holds another
+	// (found live: job said 56Gi, claim/slice still held 16Gi). The claim's own
+	// immutability webhook remains the hard wall protecting the grant; this one
+	// exists to fail LOUD at the surface users actually touch.
+	if req.Operation == admissionUpdate {
+		newJob := &vgpuv1alpha1.VGPUJob{}
+		if err := h.decoder.Decode(req, newJob); err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
+		}
+		oldJob := &vgpuv1alpha1.VGPUJob{}
+		if err := h.decoder.DecodeRaw(req.OldObject, oldJob); err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
+		}
+		if err := ValidateJobUpdate(oldJob, newJob); err != nil {
+			return admission.Denied(err.Error())
+		}
+		return admission.Allowed("") // recommendation policy is create-only
+	}
 	// Only requireOverride can ever reject; recommendOnly/warn are advisory-only.
 	if h.mode != recommendation.RequireOverride {
 		return admission.Allowed("")
@@ -88,3 +110,20 @@ func (h *JobRecommendationValidator) Handle(ctx context.Context, req admission.R
 // admissionCreate matches admission.Request.Operation for CREATE without importing
 // the admissionv1 package just for the constant.
 const admissionCreate = "CREATE"
+const admissionUpdate = "UPDATE"
+
+// ValidateJobUpdate freezes spec.claimTemplate after creation — the same
+// contract VGPUClaim and VGPUGangJob updates already enforce. A job's claim is
+// materialized from the template exactly once, so any later template edit would
+// be accepted-then-ignored: the honest behavior is a loud rejection that tells
+// the user how to actually resize.
+func ValidateJobUpdate(oldJob, newJob *vgpuv1alpha1.VGPUJob) error {
+	if !reflect.DeepEqual(oldJob.Spec.ClaimTemplate, newJob.Spec.ClaimTemplate) {
+		return fmt.Errorf(
+			"immutability violation: spec.claimTemplate cannot change after creation "+
+				"(the workload's claim/slice/pod were materialized from the original template; "+
+				"an edit here would be silently ignored). To resize: kubectl delete vgpujob %s, then resubmit",
+			oldJob.Name)
+	}
+	return nil
+}

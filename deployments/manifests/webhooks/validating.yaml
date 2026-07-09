@@ -42,11 +42,14 @@ webhooks:
         apiVersions: ["v1alpha1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["vgpugangjobs"]
-  # Phase 3.7 — recommendation enforcement. Rejects CREATE of an under-provisioned
-  # VGPUJob (vs its learned profile) only in requireOverride mode, only at Medium+
-  # confidence, and only without the override annotation. failurePolicy: Ignore —
-  # this is advisory policy, NOT data integrity: a webhook outage must never block
-  # job submission cluster-wide.
+  # Phase 3.7 — recommendation enforcement (CREATE) + claimTemplate immutability
+  # (UPDATE). CREATE rejects an under-provisioned VGPUJob (vs its learned profile)
+  # only in requireOverride mode; UPDATE freezes spec.claimTemplate in every mode
+  # (a template edit after admission was accepted-then-silently-ignored — job spec
+  # said one size while the live claim/slice held another). failurePolicy: Ignore —
+  # advisory + UX honesty, NOT data integrity: the fail-closed CLAIM immutability
+  # webhook remains the hard wall protecting the actual grant, so a webhook outage
+  # must never block job traffic cluster-wide.
   - name: vvgpujob.vgpu.pranav2910.com
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -60,5 +63,5 @@ webhooks:
     rules:
       - apiGroups: ["infrastructure.pranav2910.com"]
         apiVersions: ["v1alpha1"]
-        operations: ["CREATE"]
+        operations: ["CREATE", "UPDATE"]
         resources: ["vgpujobs"]

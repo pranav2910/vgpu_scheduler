@@ -159,6 +159,18 @@ cmd_submit() {
     # webhook. The client only rejects the nonsensical.
     (( bytes >= 1 )) || die "VRAM $vram must be at least 1 byte"
 
+    # A workload's size is immutable once admitted (the claim/slice/pod are
+    # materialized from the template exactly once) — re-submitting an existing
+    # name would at best no-op and at worst mislead. Fail loud with the fix.
+    if [[ "$dry_run" != 1 ]] && kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1; then
+        local curbytes
+        curbytes="$(kget vgpujob "$name" "$ns" '{.spec.claimTemplate.spec.requestedVramBytes}')"
+        die "a VGPUJob '$name' already exists in namespace '$ns' (requested $(human "${curbytes:-0}")).
+       Its size is immutable after admission. To change it:
+           kubectl delete vgpujob $name -n $ns    # then re-run this submit
+       To inspect it instead:  vgpu status $name -n $ns"
+    fi
+
     # Deterministic names mirror the controller exactly:
     #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice -> pod=NAME-workload
     local claim="${name}-claim"
