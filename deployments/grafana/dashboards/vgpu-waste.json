@@ -678,7 +678,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "increase(vgpu_recommendation_autoresizes_total[24h])",
+          "expr": "sum(increase(vgpu_recommendation_autoresizes_total[24h]))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
