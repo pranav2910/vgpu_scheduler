@@ -185,6 +185,10 @@ cmd_submit() {
     if [[ -n "$command_override" ]]; then
         local esc="${command_override//\\/\\\\}"   # backslash -> \\
         esc="${esc//\"/\\\"}"                       # double-quote -> \"
+        esc="${esc//$'\n'/\\n}"                     # newline -> \n : YAML folds raw
+        esc="${esc//$'\r'/\\r}"                     # newlines in a "..." scalar into
+        esc="${esc//$'\t'/\\t}"                     # SPACES, space-joining multi-line
+                                                    # programs into a syntax error
         cmd_block='        command: ["/bin/sh","-c"]'$'\n''        args: ["'"$esc"'"]'$'\n'
     fi
     # Optional pod-spec fields, indented 6 spaces (under spec.podTemplate.spec).

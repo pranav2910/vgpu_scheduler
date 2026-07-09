@@ -131,6 +131,23 @@ if echo "$ST" | grep -q "Released"; then
   ok "D7b: status says 'Released' honestly instead of '<none>'"
 else bad "D7b: status hides the release: $(echo "$ST" | sed -n '3p')"; fi
 
+say "D8: a MULTI-LINE --command survives the CLI intact (no YAML line-folding)"
+# Dogfood find #6 (2026-07-09): newlines in --command were folded to spaces by
+# the YAML quoted scalar; python got a space-joined program -> instant Failed
+# while the CLI printed 'submitted!'. Newlines must arrive in the pod verbatim.
+$VG submit --name df-nl --vram 1Gi -n "$NS" --image busybox \
+  --command $'echo df-nl-line-1\necho df-nl-line-2\nsleep 120' $RTCARGS --wait 90 \
+  > "$EVID/d8-submit.txt" 2>&1 || true
+NLOUT=""
+for _ in $(seq 1 12); do
+  NLOUT=$(kubectl logs df-nl-workload -n "$NS" 2>/dev/null)
+  echo "$NLOUT" | grep -q "df-nl-line-2" && break; sleep 5
+done
+echo "$NLOUT" > "$EVID/d8-logs.txt"
+if echo "$NLOUT" | grep -q "df-nl-line-1" && echo "$NLOUT" | grep -q "df-nl-line-2"; then
+  ok "D8: both lines of a multi-line --command executed (newlines preserved end-to-end)"
+else bad "D8: pod output missing lines (got: $(echo "$NLOUT" | tr '\n' ' ')) — CLI mangled the command"; fi
+
 kubectl delete ns "$NS" --wait=false >/dev/null 2>&1
 
 echo

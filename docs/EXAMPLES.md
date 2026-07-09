@@ -139,6 +139,8 @@ vgpu submit --name thrifty --vram 8Gi --image ... --override --runtime-class nvi
 
 ```sh
 vgpu submit --name sweep-lr3 --vram 8Gi --image x --no-wait      # fire-and-forget (batches)
+vgpu submit --name multi --vram 8Gi --image x \
+  --command $'echo prep\npython train.py'                        # multi-line commands work (v0.20.4+)
 vgpu submit --name peek --vram 40Gi --image x --dry-run          # print YAML, apply nothing
 vgpu submit --name t1 --vram 4Gi --image x -n team-a             # another namespace
 vgpu submit --name pin --vram 2Gi --image x --node gpu-node-3    # pin to a node (demos only)
