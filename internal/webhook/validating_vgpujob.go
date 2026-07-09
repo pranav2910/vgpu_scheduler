@@ -71,6 +71,10 @@ func (h *JobRecommendationValidator) Handle(ctx context.Context, req admission.R
 	if err := h.decoder.Decode(req, job); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+	// Birth the counter series at 0 before any increment (see mutating_vgpujob.go:
+	// a series born at 1 is invisible to increase()/rate() on its first event).
+	telemetry.RecommendationRejectionsTotal.WithLabelValues(job.Namespace)
+	telemetry.RecommendationOverridesTotal.WithLabelValues(job.Namespace)
 	requested := job.Spec.ClaimTemplate.Spec.RequestedVRAMBytes
 	if requested <= 0 {
 		return admission.Allowed("") // VRAM bounds are the claim validator's job

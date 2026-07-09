@@ -641,7 +641,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(vgpu_workload_underprovisioned)",
+          "expr": "sum(max by (namespace, workload) (vgpu_workload_underprovisioned))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -715,7 +715,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, vgpu_workload_recommended_vram_bytes)",
+          "expr": "topk(10, max by (namespace, workload) (vgpu_workload_recommended_vram_bytes))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"

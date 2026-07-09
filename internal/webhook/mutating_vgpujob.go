@@ -46,6 +46,12 @@ func (h *JobAutoResizer) Handle(ctx context.Context, req admission.Request) admi
 	if err := h.decoder.Decode(req, job); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+	// Birth the per-namespace counter series at 0 BEFORE any increment can happen.
+	// A labeled counter whose first sample is already 1 has no observable 0→1
+	// transition, so increase()/rate() report 0 for the first-ever event and the
+	// dashboard's "autoResizes (24h)" stat lied right after a real resize.
+	telemetry.RecommendationAutoResizesTotal.WithLabelValues(job.Namespace)
+	telemetry.RecommendationAutoResizeCappedTotal.WithLabelValues(job.Namespace)
 	requested := job.Spec.ClaimTemplate.Spec.RequestedVRAMBytes
 	if requested <= 0 {
 		return admission.Allowed("")
