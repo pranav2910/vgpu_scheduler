@@ -33,6 +33,7 @@ Run: `HOST=user@gpu-box bash scripts/certify-release.sh`
 | **CERT-16** | Security posture | `vgpu security audit` exit 0 against live RBAC; support-bundle contains no Secret material (grep-verified) |
 | **CERT-17** | Dashboard truth | Grafana panels render through the provisioned datasource; numbers match `vgpu report` ±1 %; dashboard survives restart |
 | **CERT-18** | Multi-node failures *(needs ≥2 GPU nodes — `scripts/cert18.sh`)* | Cross-node gang forced to SPAN nodes; whole-node kill → survivors admit, return re-charges; TRUE network partition (link cut, verified NotReady) before gang submit → gang HELD (never committed-partial), converges + commits on heal. **Certified 2026-07-08 on 3× A10 — docs/CERT-18-MULTINODE-REPORT.md** |
+| **CERT-19** | Dogfood / UX honesty (`scripts/dogfood-ux.sh`, any live cluster) | The CLI's story must match cluster truth at every step of the human journey: missing-job status points at the fix; submit's claim == cluster bytes; profile NEVER advises "0 B" (says "none yet" or a real value) and its `requested` matches the live claim; re-submitting an existing name is REFUSED loudly with the current grant and nothing mutates; a direct kubectl resize is DENIED with the delete-and-resubmit recipe; a deleted job's profile is labeled SAVED history. Born from the 2026-07-09 dogfooding session that caught 3 bugs behavior tests structurally missed |
 
 **Known limitation (found by CERT-06 on 8×V100, 2026-07-07):** the preemptor
 triggers on NODE-level capacity shortfall. A request that fits the node total
