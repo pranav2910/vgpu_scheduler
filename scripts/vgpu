@@ -369,10 +369,19 @@ cmd_profile() {
         '{.status.conditions[?(@.type=="Underprovisioned")].status}')"
 
     printf 'profile %s  (ns=%s)\n' "$name" "$ns"
+    # A profile OUTLIVES its job by design (the data loop: the next run of this
+    # workload starts informed) — but label history as history instead of
+    # rendering it as if the job were still live.
+    kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1 || printf \
+        '  note         VGPUJob %s no longer exists — this is its SAVED history (profiles outlive jobs)\n' "$name"
     printf '  requested    %s\n'              "$(human "${requested:-0}")"
     printf '  peak observed%s\n'              "  $(human "${peak:-0}")"
     printf '  avg observed %s\n'              "  $(human "${avg:-0}")"
-    printf '  recommended  %s   <- request this next time\n' "$(human "${recommended:-0}")"
+    if [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
+        printf '  recommended  %s   <- request this next time\n' "$(human "$recommended")"
+    else
+        printf '  recommended  (none yet — no VRAM usage observed to learn from)\n'
+    fi
     printf '  confidence   %s  (%s observations)\n' "${conf:-<none>}" "${obs:-0}"
     [[ "${evictions:-0}" != "0" ]] && printf '  evictions    %s\n' "$evictions"
 
