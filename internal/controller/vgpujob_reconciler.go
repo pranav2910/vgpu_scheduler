@@ -128,10 +128,13 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	// The recreated claim then got a fresh slice bound (capacity consumed by a
 	// finished job at minimum), and if the completed pod had been GC'd, the
 	// workload was recreated and re-ran.
+	//
+	// The guard also makes the release below safe: a terminal job's claim can be
+	// deleted with no recreate and no resurrection.
 	if job.Status.Phase == vgpuv1alpha1.JobPhaseSucceeded ||
 		job.Status.Phase == vgpuv1alpha1.JobPhaseFailed ||
 		job.Status.Phase == vgpuv1alpha1.JobPhaseCompleted {
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, r.releaseTerminalGrant(ctx, &job)
 	}
 
 	// 1. Ensure a Claim exists for this Job.
@@ -194,6 +197,37 @@ func (r *VGPUJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	return reconcile.Result{}, nil
+}
+
+// releaseTerminalGrant frees a finished workload's VRAM. A terminal pod can
+// never use its GPU again (restartPolicy=Never + the no-resurrect guard), yet
+// the grant used to stay charged until someone deleted the VGPUJob — a
+// finished 45Gi batch job silently blocked live 40Gi work (found dogfooding
+// on kind, 2026-07-09; vanilla Kubernetes frees a terminal pod's devices, so
+// holding was strictly worse than stock behavior). Deleting the claim rides
+// the exact release path job-deletion has always used: OwnerReference cascade
+// tears down the slice, whose finalizer runs the node-side dealloc. The
+// VGPUJob object and its VGPUWorkloadProfile survive — `vgpu status/profile`
+// history and the right-sizing data loop keep everything they had.
+// Idempotent: NotFound means already released (or a preemptor beat us here).
+func (r *VGPUJobReconciler) releaseTerminalGrant(ctx context.Context, job *vgpuv1alpha1.VGPUJob) error {
+	var claim vgpuv1alpha1.VGPUClaim
+	key := types.NamespacedName{Namespace: job.Namespace, Name: claimNameForJob(job.Name)}
+	if err := r.Client.Get(ctx, key, &claim); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !claim.DeletionTimestamp.IsZero() {
+		return nil // teardown already in flight
+	}
+	log.Printf("VGPUJob %s/%s: terminal (%s) — releasing VRAM grant (deleting claim %s)",
+		job.Namespace, job.Name, job.Status.Phase, claim.Name)
+	if err := r.Client.Delete(ctx, &claim); err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // createClaim materializes the VGPUClaim from the Job's claimTemplate and

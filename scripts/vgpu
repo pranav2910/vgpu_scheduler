@@ -307,11 +307,18 @@ cmd_status() {
 
     printf 'workload %s  (ns=%s, requested %s)\n' "$name" "$ns" "$(human "${req:-0}")"
     printf '  Job    %-12s %s\n' "${job_phase:-<none>}"   "VGPUJob/$name"
-    printf '  Claim  %-12s %s%s\n' "${claim_phase:-<none>}" "VGPUClaim/$claim" \
-        "$( [[ -n "$bound" ]] && printf '  bound=%s' "$bound" )"
-    printf '  Slice  %-12s %s%s%s\n' "${slice_phase:-<none>}" "VGPUSlice/$slice" \
-        "$( [[ -n "$node"  ]] && printf '  node=%s'  "$node" )" \
-        "$( [[ -n "$alloc" ]] && printf '  alloc=%s' "$alloc" )"
+    # A finished workload's grant is auto-released (claim+slice torn down, VRAM
+    # returned). Say so — '<none>' would read like something went missing.
+    if [[ -z "$claim_phase" && ( "$job_phase" == "Succeeded" || "$job_phase" == "Failed" || "$job_phase" == "Completed" ) ]]; then
+        printf '  Claim  %-12s %s\n' "Released" "VGPUClaim/$claim  (workload finished — VRAM grant returned)"
+        printf '  Slice  %-12s %s\n' "Released" "VGPUSlice/$slice  (freed for other workloads)"
+    else
+        printf '  Claim  %-12s %s%s\n' "${claim_phase:-<none>}" "VGPUClaim/$claim" \
+            "$( [[ -n "$bound" ]] && printf '  bound=%s' "$bound" )"
+        printf '  Slice  %-12s %s%s%s\n' "${slice_phase:-<none>}" "VGPUSlice/$slice" \
+            "$( [[ -n "$node"  ]] && printf '  node=%s'  "$node" )" \
+            "$( [[ -n "$alloc" ]] && printf '  alloc=%s' "$alloc" )"
+    fi
     printf '  Pod    %-12s Pod/%s\n' "${pod_phase:-<none>}" "$pod"
 
     # Surface the learned advisory inline if the feedback loop has flagged it.

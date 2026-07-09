@@ -108,6 +108,29 @@ if echo "$PROF2" | grep -Eq 'recommended[[:space:]]+0 B'; then
   bad "D6b: historical profile recommends 0 B"
 else ok "D6b: historical recommendation line stays honest"; fi
 
+say "D7: a FINISHED workload releases its VRAM automatically (no zombie grants)"
+# Dogfood find #4 (2026-07-09): a Succeeded 45Gi job kept its slice Ready and
+# blocked a live 40Gi submit. Terminal jobs must free their grant on their own.
+$VG submit --name df-quick --vram "$V2" -n "$NS" --image busybox \
+  --command 'true' $RTCARGS --wait 90 > "$EVID/d7-submit.txt" 2>&1 || true
+JP=""
+for _ in $(seq 1 24); do
+  JP=$(kubectl get vgpujob df-quick -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+  [ "$JP" = "Succeeded" ] && break; sleep 5
+done
+GONE=""
+for _ in $(seq 1 12); do
+  kubectl get vgpuclaim df-quick-claim -n "$NS" >/dev/null 2>&1 || { GONE=1; break; }
+  sleep 5
+done
+ST=$($VG status df-quick -n "$NS" 2>&1); echo "$ST" > "$EVID/d7-status.txt"
+if [ "$JP" = "Succeeded" ] && [ -n "$GONE" ]; then
+  ok "D7: job Succeeded and its claim+slice were auto-released (VRAM returned)"
+else bad "D7: phase=$JP claim-gone=${GONE:-no} — finished workload still pins its grant"; fi
+if echo "$ST" | grep -q "Released"; then
+  ok "D7b: status says 'Released' honestly instead of '<none>'"
+else bad "D7b: status hides the release: $(echo "$ST" | sed -n '3p')"; fi
+
 kubectl delete ns "$NS" --wait=false >/dev/null 2>&1
 
 echo
