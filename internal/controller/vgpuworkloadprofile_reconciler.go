@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/recommendation"
 	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -159,13 +160,31 @@ func (r *VGPUWorkloadProfileReconciler) upsert(ctx context.Context, ns, jobName 
 	now := metav1.Now()
 	st.LastUpdated = &now
 
-	under := st.RecommendedVRAMBytes > st.RequestedVRAMBytes && st.RequestedVRAMBytes > 0
+	// Dogfood find #5: this used to be a raw `recommended > requested` — a 25 MiB
+	// (0.2%) delta at Low confidence rendered "VERDICT UNDERPROVISIONED" telling
+	// the user to request the size they had already requested. The verdict the
+	// CLI shows must obey the SAME gates as enforcement (recommendation.Blocks):
+	// Medium+ confidence AND undersized beyond the documented 10% tolerance —
+	// one source of truth, so following the advice always clears the verdict.
+	rawUnder := st.RecommendedVRAMBytes > st.RequestedVRAMBytes && st.RequestedVRAMBytes > 0
+	under := rawUnder &&
+		recommendation.ConfidentEnough(st.Confidence) &&
+		recommendation.Undersized(st.RequestedVRAMBytes, st.RecommendedVRAMBytes)
 	cond := metav1.Condition{Type: "Underprovisioned", Status: metav1.ConditionFalse, Reason: "WithinRecommendation", Message: "Requested VRAM covers the observed peak (with headroom)."}
-	if under {
+	switch {
+	case under:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "BelowRecommendation"
 		cond.Message = fmt.Sprintf("Requested %d MiB but observed peak recommends %d MiB (confidence %s).",
 			st.RequestedVRAMBytes>>20, st.RecommendedVRAMBytes>>20, st.Confidence)
+	case rawUnder && !recommendation.ConfidentEnough(st.Confidence):
+		cond.Reason = "InsufficientConfidence"
+		cond.Message = fmt.Sprintf("Requested %d MiB is below the current estimate (%d MiB), but confidence is %s — not advising yet.",
+			st.RequestedVRAMBytes>>20, st.RecommendedVRAMBytes>>20, st.Confidence)
+	case rawUnder:
+		cond.Reason = "WithinTolerance"
+		cond.Message = fmt.Sprintf("Requested %d MiB is within %d%% of the recommendation (%d MiB) — adequately sized.",
+			st.RequestedVRAMBytes>>20, recommendation.TolerancePercent, st.RecommendedVRAMBytes>>20)
 	}
 	apimeta.SetStatusCondition(&st.Conditions, cond)
 

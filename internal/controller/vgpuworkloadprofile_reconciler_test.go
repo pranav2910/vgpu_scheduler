@@ -216,3 +216,61 @@ func TestProfile_NoProfileWhenNoStatsYet(t *testing.T) {
 		t.Fatalf("no profile should be created before any slice observation exists")
 	}
 }
+
+// Dogfood find #5 (2026-07-09, live A10): the profile's Underprovisioned verdict
+// fired at a 25 MiB (0.2%) delta and at Low confidence — telling the user to
+// "request 13.0 GiB" when they had requested exactly 13.0 GiB. The verdict must
+// obey the same gates as enforcement: Medium+ confidence AND beyond the 10%
+// tolerance, so following the advice always clears the flag.
+func TestProfile_VerdictHonorsToleranceAndConfidence(t *testing.T) {
+	// The exact live numbers: requested 13312 MiB, recommendation 13337 MiB.
+	req := int64(13312) << 20
+	peak := int64(11597) << 20 // ×1.15 → ~13336–13337 MiB
+
+	// Medium confidence + within 10% tolerance → NOT underprovisioned.
+	r, c := buildReconciler(t,
+		mkClaim("c5", "job5"),
+		mkStatSlice("c5-slice", "c5", req, peak, peak, 150, 0, 0, 0),
+	)
+	reconcileJob(t, r, "job5")
+	p := getProfile(t, c, "job5")
+	if p.Status.RecommendedVRAMBytes <= req {
+		t.Fatalf("test setup: recommendation %d must exceed requested %d", p.Status.RecommendedVRAMBytes, req)
+	}
+	if apimeta.IsStatusConditionTrue(p.Status.Conditions, "Underprovisioned") {
+		t.Fatalf("0.2%% delta flagged Underprovisioned — the documented 10%% tolerance is not honored (find #5)")
+	}
+	cond := apimeta.FindStatusCondition(p.Status.Conditions, "Underprovisioned")
+	if cond == nil || cond.Reason != "WithinTolerance" {
+		t.Fatalf("want Reason=WithinTolerance, got %+v", cond)
+	}
+
+	// Low confidence (few samples) + far below → still NOT flagged (gate holds).
+	r2, c2 := buildReconciler(t,
+		mkClaim("c6", "job6"),
+		mkStatSlice("c6-slice", "c6", 2*giB, 9*giB, 7*giB, 3, 0, 0, 0),
+	)
+	reconcileJob(t, r2, "job6")
+	p2 := getProfile(t, c2, "job6")
+	if p2.Status.Confidence != vgpuv1alpha1.ProfileConfidenceLow {
+		t.Fatalf("test setup: want Low confidence, got %v", p2.Status.Confidence)
+	}
+	if apimeta.IsStatusConditionTrue(p2.Status.Conditions, "Underprovisioned") {
+		t.Fatalf("Low-confidence profile set the verdict — the confidence gate is not honored (find #5)")
+	}
+	c6 := apimeta.FindStatusCondition(p2.Status.Conditions, "Underprovisioned")
+	if c6 == nil || c6.Reason != "InsufficientConfidence" {
+		t.Fatalf("want Reason=InsufficientConfidence, got %+v", c6)
+	}
+
+	// Medium confidence + genuinely undersized (beyond 10%) → flagged (unchanged).
+	r3, c3 := buildReconciler(t,
+		mkClaim("c7", "job7"),
+		mkStatSlice("c7-slice", "c7", 4*giB, 9*giB, 7*giB, 150, 0, 0, 0),
+	)
+	reconcileJob(t, r3, "job7")
+	p3 := getProfile(t, c3, "job7")
+	if !apimeta.IsStatusConditionTrue(p3.Status.Conditions, "Underprovisioned") {
+		t.Fatalf("genuinely undersized (4Gi vs ~10.35Gi rec, Medium) must still flag")
+	}
+}
