@@ -477,6 +477,26 @@ cmd_report() {
     fi
     [[ -n "$metrics" ]] || die "no vgpu_monitor_* metrics found (is the monitor DaemonSet installed in ns '$ns'? see docs/monitor-mode.md)"
 
+    # Pod-less committed grants (dogfood find #11): gang members and claim-only
+    # holds have NO pod, so pod-based metrics cannot see their committed VRAM —
+    # the report once said "$0 wasted" while 18Gi sat committed to a gang.
+    # Best-effort CRD read; silently empty on monitor-only clusters (no CRDs /
+    # no RBAC). NEVER folded into the totals (they must keep matching the
+    # dashboard's pod-based numbers) — rendered as a clearly-labeled addendum.
+    local podless_list="" podless_bytes=0 podless_count=0
+    if command -v kubectl >/dev/null 2>&1; then
+        local _podded _claims _cns _cnm _cby _cph
+        _podded=$'\n'"$(kubectl get pods -A -l vgpu-claim -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.labels.vgpu-claim}{"\n"}{end}' 2>/dev/null)"$'\n'
+        _claims="$(kubectl get vgpuclaim -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.spec.requestedVramBytes}{"|"}{.status.phase}{"\n"}{end}' 2>/dev/null)"
+        while IFS='|' read -r _cns _cnm _cby _cph; do
+            [[ -n "$_cns" && "$_cph" == "Bound" ]] || continue
+            [[ -n "$filter_ns" && "$_cns" != "$filter_ns" ]] && continue
+            [[ "$_podded" == *$'\n'"$_cns/$_cnm"$'\n'* ]] && continue
+            podless_list+="${_cns}/${_cnm}|${_cby};"
+            podless_bytes=$((podless_bytes + _cby)); podless_count=$((podless_count + 1))
+        done <<< "$_claims"
+    fi
+
     # Optional team map: "ns=team,ns2=team2". Live clusters derive it from the
     # namespace label (VGPU_TEAM_LABEL, default "team"); tests inject VGPU_TEAM_MAP.
     local team_map="${VGPU_TEAM_MAP:-}"
@@ -487,7 +507,8 @@ cmd_report() {
     fi
 
     printf '%s\n' "$metrics" | awk -v price="$price" -v output="$output" -v filter_ns="$filter_ns" \
-                                   -v topn="$top" -v team_map="$team_map" '
+                                   -v topn="$top" -v team_map="$team_map" \
+                                   -v podless_count="$podless_count" -v podless_bytes="$podless_bytes" -v podless_list="$podless_list" '
         function lbl(line, name,   re, m) {
             re = name "=\"[^\"]*\""
             if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub(name "=\"", "", m); sub("\"$", "", m); return m }
@@ -565,7 +586,15 @@ cmd_report() {
                     printf "%s\n    {\"namespace\": \"%s\", \"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f}", (first?"":","), kns, nsreq[kns], nsused[kns], nswaste[kns]
                     first = 0
                 }
-                printf "\n  ],\n  \"totals\": {\"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"estimated_waste_per_month_usd\": %.0f, \"cards_idle_equivalent\": %.2f}\n}\n", treq, tused, twaste, ut_all, permo, cards
+                printf "\n  ],\n  \"podless_grants\": {\"count\": %d, \"total_bytes\": %.0f, \"claims\": [", podless_count, podless_bytes
+                pn = split(podless_list, pl, ";"); first = 1
+                for (i = 1; i <= pn; i++) {
+                    if (pl[i] == "") continue
+                    split(pl[i], pp, "|")
+                    printf "%s{\"claim\": \"%s\", \"requested_bytes\": %s}", (first?"":", "), pp[1], pp[2]
+                    first = 0
+                }
+                printf "]},\n  \"totals\": {\"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"estimated_waste_per_month_usd\": %.0f, \"cards_idle_equivalent\": %.2f}\n}\n", treq, tused, twaste, ut_all, permo, cards
                 exit
             }
             # ── table (default) ──────────────────────────────────────────────
@@ -580,7 +609,7 @@ cmd_report() {
                 ut = (r > 0) ? (u * 100.0 / r) : 0
                 printf "  %-26s %9s GiB %9s GiB %9s GiB %5.0f%%  %s\n", k, gib(r), gib(u), gib(w), ut, (src[k] == "" ? "unknown" : src[k])
             }
-            if (n == 0) print "  (no GPU workloads observed" (filter_ns != "" ? " in namespace " filter_ns : "") " yet)"
+            if (n == 0) print "  (no pod-attached GPU workloads observed" (filter_ns != "" ? " in namespace " filter_ns : "") (podless_count > 0 ? " — but committed grants exist, see below" : " yet") ")"
             print ""
             # top wasting pods
             shown = 0
@@ -622,6 +651,19 @@ cmd_report() {
             printf "  Estimated waste:          %s GiB\n", gib(twaste)
             printf "  Utilization:              %.1f%%\n", ut_all
             printf "  Estimated waste/month:    $%.0f   (at $%.2f/GPU-hr, ~%.2f cards idle)\n", permo, price, cards
+            if (podless_count > 0) {
+                print ""
+                print "  Committed grants WITHOUT pods (gang members / claim-only holds — NOT in the totals above):"
+                pn = split(podless_list, pl, ";"); shown = 0
+                for (i = 1; i <= pn; i++) {
+                    if (pl[i] == "") continue
+                    split(pl[i], pp, "|")
+                    if (shown < 4) printf "    %-38s %8s GiB\n", pp[1], gib(pp[2])
+                    shown++
+                }
+                if (shown > 4) printf "    ...and %d more\n", shown - 4
+                printf "    TOTAL committed, pod-less:             %8s GiB across %d claim(s)\n", gib(podless_bytes), podless_count
+            }
             print ""
             print "  Estimated, not guaranteed savings. Read-only; runs alongside Kubernetes, KAI, Volcano, or Slurm-on-K8s."
         }'

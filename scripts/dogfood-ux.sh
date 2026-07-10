@@ -148,6 +148,37 @@ if echo "$NLOUT" | grep -q "df-nl-line-1" && echo "$NLOUT" | grep -q "df-nl-line
   ok "D8: both lines of a multi-line --command executed (newlines preserved end-to-end)"
 else bad "D8: pod output missing lines (got: $(echo "$NLOUT" | tr '\n' ' ')) — CLI mangled the command"; fi
 
+say "D9: pod-less committed grants are VISIBLE to the report (never '\$0 wasted' beside a committed gang)"
+# Dogfood find #11 (2026-07-09): a Committed 3x6Gi gang (18Gi, no pods) was
+# invisible to vgpu report — "no GPU workloads observed yet / \$0". Pod-less
+# Bound claims must appear as a labeled addendum (and NOT be folded into totals).
+kubectl apply -f - >/dev/null <<GANG
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata: {name: df-gang, namespace: $NS}
+spec:
+  gangSize: 2
+  minAvailable: 2
+  reservationTimeoutSeconds: 90
+  priority: 100
+  workloadClass: Training
+  preemptible: false
+  podTemplate:
+    spec: {requestedVramBytes: 1073741824, serviceTier: Guaranteed}
+GANG
+GP=""
+for _ in $(seq 1 18); do
+  GP=$(kubectl get vgpugangreservation df-gang-rsv -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+  [ "$GP" = "Committed" ] && break; sleep 5
+done
+FAKEM="$EVID/d9-fake-metrics.txt"
+echo 'vgpu_monitor_pod_requested_vram_bytes{namespace="x",pod="fake",node="n",source="test"} 1073741824' > "$FAKEM"
+R9=$($VG report --metrics-file "$FAKEM" --filter-ns "$NS" 2>&1); echo "$R9" > "$EVID/d9-report.txt"
+if [ "$GP" = "Committed" ] && echo "$R9" | grep -q "Committed grants WITHOUT pods" && echo "$R9" | grep -q "2 claim(s)"; then
+  ok "D9: report surfaces the pod-less committed gang (2 claims) instead of pretending \$0"
+else bad "D9: gang=$GP report: $(echo "$R9" | grep -E 'Committed grants|no pod-attached' | head -2)"; fi
+kubectl delete vgpugangjob df-gang -n "$NS" --wait=false >/dev/null 2>&1
+
 kubectl delete ns "$NS" --wait=false >/dev/null 2>&1
 
 echo
