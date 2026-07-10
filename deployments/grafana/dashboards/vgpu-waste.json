@@ -573,7 +573,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(vgpu_node_memory_violation_active)",
+          "expr": "sum(max by (namespace, slice) (vgpu_memory_violation_active))",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
