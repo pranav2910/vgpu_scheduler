@@ -22,8 +22,9 @@ vgpu version        # works offline; cluster commands need only kubectl + a kube
 ```
 
 A single zero-dependency file (bash around `kubectl`), published with a sha256 on
-every release. Then: **[QUICKSTART.md](QUICKSTART.md)** (run + right-size a job in
-5 minutes) and **[USER-GUIDE.md](USER-GUIDE.md)** (the full manual).
+every release. Then: **[QUICKSTART.md](QUICKSTART.md)** (5 minutes),
+**[TUTORIAL.md](TUTORIAL.md)** (the whole product in 45, real outputs included),
+or **[USER-GUIDE.md](USER-GUIDE.md)** (the manual).
 
 ## 2. Read-only monitor (the 15-minute pilot)
 

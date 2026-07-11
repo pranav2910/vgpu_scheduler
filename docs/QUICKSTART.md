@@ -54,6 +54,7 @@ real footprint.
 - **`--runtime-class nvidia`** is required on real GPU clusters; drop it on a local/test cluster.
 - If your cluster **enforces** right-sizing, an undersized re-submit may be rejected with a clear hint — either raise `--vram` or add `--override`. See [recommendation-policy.md](recommendation-policy.md).
 
-**Next:** the full manual with gang (multi-worker) jobs, troubleshooting, and the
-habit of right-sizing → [USER-GUIDE.md](USER-GUIDE.md). Want it by example instead?
-[EXAMPLES.md](EXAMPLES.md) has CLI + YAML side by side for 10 use cases.
+**Next:** the 45-minute guided tour of the WHOLE product (packing, preemption,
+gangs, quotas, enforcement — every command with its real output) →
+[TUTORIAL.md](TUTORIAL.md). Prefer reference material? [USER-GUIDE.md](USER-GUIDE.md)
+is the manual, [EXAMPLES.md](EXAMPLES.md) the copy-paste cookbook.

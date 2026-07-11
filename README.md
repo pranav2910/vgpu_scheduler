@@ -135,26 +135,24 @@ See [docs/metrics.md](docs/metrics.md).
 
 ## Documentation
 
-- [docs/INSTALL.md](docs/INSTALL.md) — **start here**: the install map — five copy-paste paths (CLI · monitor · single GPU node · multi-node · kind) on one page
-- [docs/PILOT.md](docs/PILOT.md) — **pilot in 15 minutes**: install the read-only monitor, see your waste number, tell us if it matches your suspicion
-- [docs/monitor-mode.md](docs/monitor-mode.md) — **start here, zero-risk**: a read-only GPU **waste report** (`vgpu report`) you drop in beside *any* scheduler (KAI/Volcano/vanilla) — no scheduling, no mutation, no CRDs
-- [docs/QUICKSTART.md](docs/QUICKSTART.md) — **for ML engineers, in 5 minutes**: install the CLI, run a workload on a shared GPU, right-size it (copy-paste)
-- [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — **for ML engineers**: the full manual — `vgpu submit / status / profile`, right-sizing, gang jobs, troubleshooting
-- [docs/EXAMPLES.md](docs/EXAMPLES.md) — **the cookbook**: CLI + YAML side by side for 10 use cases (sizes from 512Mi to 64Gi, priorities, preemption, gangs, zones, quotas, scripting) — ready-to-apply files in [`examples/`](examples/)
-- [docs/INSTALL-H100.md](docs/INSTALL-H100.md) — **for platform/admins**: from-scratch control-plane install on a real GPU node (clone → `h100-control-plane.sh` → validate), with the before/after packing proof
-- [docs/INSTALL-MULTINODE.md](docs/INSTALL-MULTINODE.md) — **multi-node + multi-GPU**: join several GPU boxes into one cluster (WireGuard flannel) and validate spread / cross-node gangs / node loss (`validate-multinode.sh`), plus the multi-GPU-per-node validator (`validate-multigpu-a100.sh`)
-- [docs/benchmarks.md](docs/benchmarks.md) — **the numbers**: 4× packing / ~80% utilization / no over-commit / right-sizing on a 1× H100, the 15-test battery, and how to reproduce it all
-- [docs/one-pager.md](docs/one-pager.md) — **the 2-minute brief**: problem → solution → proof → differentiator → honest limits → who it's for (also linked at the top)
-- [docs/customer-discovery.md](docs/customer-discovery.md) — **for founders**: a Mom-Test call guide for talking to GPU/ML platform teams (problem-first, no pitching)
-- [DEMO.md](DEMO.md) — end-to-end walkthrough: control plane on kind, then runtime intelligence on a real GPU
-- [docs/architecture.md](docs/architecture.md) — one-page system map: CRDs, components, the runtime stack, the safety philosophy
-- [docs/gang-scheduling.md](docs/gang-scheduling.md) — gang guarantees, serialized admission, tunables, limits
-- [docs/ha-failover.md](docs/ha-failover.md) — active/standby model, readiness semantics, failover invariants
-- [docs/metrics.md](docs/metrics.md) — Prometheus metrics reference + sample scrape config
-- [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md) — NVML observation scaffolding + g5 validation runbook
-- [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — staged over-use detection → attribution → soft enforcement → opt-in eviction (3.4a–d), tunables, A10 E2E
-- [docs/runtime-feedback.md](docs/runtime-feedback.md) — GPU behavior profiles: learn peak usage → recommend right-sized grants (3.5) → non-blocking under-provisioning advisory (3.6)
-- [docs/recommendation-policy.md](docs/recommendation-policy.md) — recommendation enforcement (3.7a): `recommendOnly` / `warn` / `requireOverride` modes, the override annotation, safety gates, and the `vgpu --override` flow
+**Learn it** (engineers running workloads — read top to bottom, stop when satisfied):
+- 🎓 [docs/TUTORIAL.md](docs/TUTORIAL.md) — **the guided tour: the whole product in 45 minutes**, 14 steps on one GPU, every command shown with its real output (packing, the right-sizing loop, autoResize, preemption, gangs, quotas, enforcement, the $ report)
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — the 5-minute version: install the CLI, run a workload, right-size it
+- [docs/EXAMPLES.md](docs/EXAMPLES.md) — copy-paste cookbook: CLI + YAML side by side for 10 use cases, ready-to-apply files in [`examples/`](examples/)
+- [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — the full CLI manual + troubleshooting
+
+**Run it** (platform admins):
+- [docs/INSTALL.md](docs/INSTALL.md) — the install map: five copy-paste paths (CLI · monitor · single GPU node · multi-node · kind) on one page
+- [docs/monitor-mode.md](docs/monitor-mode.md) — the zero-risk wedge: a read-only waste report beside *any* scheduler; [docs/PILOT.md](docs/PILOT.md) is the 15-minute pilot version
+- [docs/SECURITY.md](docs/SECURITY.md) + `vgpu security audit` — blast radius, verified against live RBAC
+- [docs/recommendation-policy.md](docs/recommendation-policy.md) — the policy dial: `recommendOnly` / `warn` / `requireOverride` / `autoResize`
+- [docs/runtime-enforcement.md](docs/runtime-enforcement.md) — the enforcement ladder: detect → attribute → warn → opt-in evict, and its tunables
+
+**Trust it** (proof + internals):
+- [docs/CERTIFICATION.md](docs/CERTIFICATION.md) — the named test catalog every release must pass, with [the current report](docs/CERTIFICATION-REPORT.md) (22/22 + multi-node)
+- [docs/benchmarks.md](docs/benchmarks.md) — 4× packing / ~80% utilization / no over-commit, and how to reproduce it
+- [docs/architecture.md](docs/architecture.md) — one-page system map · [docs/gang-scheduling.md](docs/gang-scheduling.md) · [docs/ha-failover.md](docs/ha-failover.md) · [docs/metrics.md](docs/metrics.md) · [docs/runtime-feedback.md](docs/runtime-feedback.md) · [docs/gpu-hardware-truth.md](docs/gpu-hardware-truth.md)
+- [docs/one-pager.md](docs/one-pager.md) — the 2-minute business brief · [DEMO.md](DEMO.md) — scripted end-to-end demo
 
 ## Status & roadmap
 
