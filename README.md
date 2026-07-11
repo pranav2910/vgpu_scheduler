@@ -22,8 +22,8 @@ detect VRAM over-use → attribute it to the exact workload → warn → opt-in 
 
 ```sh
 # The vgpu CLI — one file, no repo, no build (all an ML engineer ever installs):
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 ```
 
 Everything else — read-only **waste monitor**, full platform on a **GPU node**,

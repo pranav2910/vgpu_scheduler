@@ -19,8 +19,8 @@ installed vGPU, and the single `vgpu` command.
 export KUBECONFIG=/path/to/your/kubeconfig
 
 # 2. install the vgpu CLI — one file, no repo, no compiler
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 
 vgpu version         # confirm it works
 vgpu --help

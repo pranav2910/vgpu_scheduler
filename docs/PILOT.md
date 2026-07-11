@@ -71,8 +71,8 @@ dashboard.
 
 ```sh
 # 0. The CLI — one file, no build (the clone below is only for the image build):
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 git clone https://github.com/pranav2910/vgpu_scheduler && cd vgpu_scheduler
 
 # 1. Install the read-only monitor (one namespace, one DaemonSet, minimal RBAC)

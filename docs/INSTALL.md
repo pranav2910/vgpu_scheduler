@@ -16,9 +16,16 @@ is a deep-dive; this is the map.
 ## 1. Just the CLI — no repo, no build
 
 ```sh
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 vgpu version        # works offline; cluster commands need only kubectl + a kubeconfig
+```
+
+No sudo on this machine? Install to your own PATH instead:
+
+```sh
+mkdir -p ~/.local/bin && curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
+  -o ~/.local/bin/vgpu && chmod +x ~/.local/bin/vgpu    # ensure ~/.local/bin is on your PATH
 ```
 
 A single zero-dependency file (bash around `kubectl`), published with a sha256 on

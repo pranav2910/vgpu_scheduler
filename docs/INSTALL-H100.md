@@ -63,8 +63,8 @@ Expected: **`PASS=14 FAIL=0`**. It proves both entry points on the real GPU:
 
 ```sh
 # install the CLI properly (or use scripts/vgpu from this checkout — same file)
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 
 # run a workload on a shared slice of the GPU
 vgpu submit --name demo --vram 16Gi \

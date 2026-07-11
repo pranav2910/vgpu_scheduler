@@ -17,8 +17,8 @@ output** — if your screen disagrees, something is genuinely wrong.
 stack on a GPU node in ~5 minutes. Then install the CLI anywhere:
 
 ```sh
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 vgpu version
 ```
 
@@ -74,8 +74,9 @@ its 6 GiB went straight back to the pool. Nobody has to remember to clean up.
 ## 4. Fill the card — meet the honest waitlist
 
 ```sh
+# demo already holds 8; three more 6 GiB asks = 26 total, but the card is ~22.
 for i in 1 2 3; do vgpu submit --name pack-$i --vram 6Gi --image busybox \
-  --command 'sleep 3600' --runtime-class nvidia --no-wait; done   # 8 + 3×6 = 26? no — card is ~22: 8+6+6 fits, third 6 doesn't
+  --command 'sleep 3600' --runtime-class nvidia --no-wait; done
 kubectl get vgpuslice
 ```
 ```

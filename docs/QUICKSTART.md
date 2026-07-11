@@ -11,8 +11,8 @@ platform packs your workload onto a shared card and tells you the right size nex
 
 ```sh
 # 1. Install the vgpu CLI — one file, no repo, no compiler
-curl -sSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu \
-  -o /usr/local/bin/vgpu && chmod +x /usr/local/bin/vgpu
+curl -fsSL https://github.com/pranav2910/vgpu_scheduler/releases/latest/download/vgpu -o /tmp/vgpu \
+  && sudo install -m 0755 /tmp/vgpu /usr/local/bin/vgpu && rm -f /tmp/vgpu
 export KUBECONFIG=/path/to/your/kubeconfig          # your platform team gives you this
 vgpu version                                         # confirm it works (no cluster needed)
 
