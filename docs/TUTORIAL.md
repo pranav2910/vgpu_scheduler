@@ -312,9 +312,37 @@ vgpu report --price-per-gpu-hour 1.00
   Estimated waste/month:    $87   (at $1.00/GPU-hr, ~0.12 cards idle)
 ```
 
-`-o csv` / `-o json` for finance, `--filter-ns` per team. The Grafana dashboard
-(`deployments/`, see [PILOT.md](PILOT.md)) shows the same numbers — they must
-agree with the CLI within 1%, and that agreement is itself a certified test.
+`-o csv` / `-o json` for finance, `--filter-ns` per team.
+
+### See it in a browser — the Grafana dashboard
+
+Same numbers, live panels. On the GPU box:
+
+```sh
+scripts/gen-prometheus-kubeconfig.sh        # least-privilege read-only credential for Prometheus
+cd deployments && sudo env GRAFANA_ADMIN_PASSWORD=pickone docker compose up -d
+```
+
+Cloud firewalls won't expose port 3000 — tunnel it. **On your laptop:**
+
+```sh
+ssh -L 3000:localhost:3000 ubuntu@<box-ip>      # leave this window open — it IS the tunnel
+```
+
+Browse to **http://localhost:3000** → login `admin` / `pickone` → dashboard
+**"vGPU — GPU waste & right-sizing."** Set the `$ per GPU-hour` variable at the
+top and the money panels recalculate. You'll see: requested-vs-used over time,
+per-GPU utilization on the card's real UUID, top wasting pods/namespaces, active
+memory violations, autoResizes, and the estimated `$`/month — the same numbers as
+`vgpu report`, and they must agree within 1% (that agreement is itself a
+certified test, CERT-17).
+
+Two gotchas, learned the honest way: compose interpolates the password variable
+on **every** command — including teardown — so bring it down with
+`sudo env GRAFANA_ADMIN_PASSWORD=x docker compose down` (any value works there);
+and if the SSH tunnel says `Permission denied (publickey)`, your laptop's key
+isn't on the box — add `~/.ssh/id_ed25519.pub`'s line to the box's
+`~/.ssh/authorized_keys` from a terminal that IS connected, then retry.
 
 ## 14. Clean up
 
@@ -322,7 +350,11 @@ agree with the CLI within 1%, and that agreement is itself a certified test.
 kubectl delete vgpujob,vgpugangjob --all -A
 kubectl delete vgpuquota,vgpuworkloadprofile --all -A
 kubectl get vgpuslice -A     # "No resources found" = every seat back in the pool
+cd deployments && sudo env GRAFANA_ADMIN_PASSWORD=x docker compose down   # if you ran step 13's dashboard
 ```
+
+And if this was a rented cloud box: **terminate the instance** — it bills by the
+hour whether or not anything runs on it (the product's own lesson, after all).
 
 ---
 
