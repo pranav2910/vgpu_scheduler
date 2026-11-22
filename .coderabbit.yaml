@@ -1,0 +1,18 @@
+# CodeRabbit settings for the one-off whole-codebase review PR.
+# Lives only on the coderabbit-* review branches, not on main.
+language: en-US
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  path_filters:
+    - "!**/*.md"
+    - "!go.sum"
+    - "!**/zz_generated*.go"
+    - "!codebase_review.txt"
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - ".*"
