@@ -1,0 +1,1442 @@
+
+
+==================================================================
+FILE: cmd/scheduler/main.go
+==================================================================
+
+package main
+
+import (
+	"flag"
+	"os"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/scheduler"
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
+}
+
+func main() {
+	opts := zap.Options{Development: true}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Initialize the lightning-fast memory cache
+	vramCache := scheduler.NewVRAMCache()
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:           scheme,
+		LeaderElection:   true,
+		LeaderElectionID: "vgpu-scheduler-leader-election",
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start scheduler manager")
+		os.Exit(1)
+	}
+
+	if err = (&scheduler.SliceScheduler{
+		Client: mgr.GetClient(),
+		Cache:  vramCache,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create scheduler controller")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting VGPU Scheduler")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running scheduler manager")
+		os.Exit(1)
+	}
+}
+
+
+==================================================================
+FILE: cmd/controller/main.go
+==================================================================
+
+package main
+
+import (
+	"flag"
+	"os"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/controller"
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
+}
+
+func main() {
+	var metricsAddr string
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	opts := zap.Options{Development: true}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		LeaderElection:   true,
+		LeaderElectionID: "vgpu-controller-leader-election",
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	if err = (&controller.VGPUClaimReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "VGPUClaim")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting VGPU Controller Manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+
+
+==================================================================
+FILE: cmd/nodeagent/main.go
+==================================================================
+
+package main
+
+import (
+	"flag"
+	"os"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/nvml"
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
+}
+
+func main() {
+	opts := zap.Options{Development: true}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		setupLog.Error(nil, "NODE_NAME environment variable must be set")
+		os.Exit(1)
+	}
+
+	// Initialize the C-bindings to the NVIDIA Driver
+	allocator, err := nvml.NewAllocator()
+	if err != nil {
+		setupLog.Error(err, "fatal: failed to initialize NVML hardware allocator")
+		os.Exit(1)
+	}
+	defer allocator.Shutdown()
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme: scheme,
+		// NodeAgents do not use leader election because one runs on EVERY physical node
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start nodeagent manager")
+		os.Exit(1)
+	}
+
+	if err = (&nodeagent.SliceReconciler{
+		Client:    mgr.GetClient(),
+		NodeName:  nodeName,
+		Allocator: allocator,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create nodeagent controller")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting VGPU NodeAgent", "Node", nodeName)
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running nodeagent")
+		os.Exit(1)
+	}
+}
+
+
+==================================================================
+FILE: internal/telemetry/metrics.go
+==================================================================
+
+package telemetry
+
+
+==================================================================
+FILE: internal/telemetry/events.go
+==================================================================
+
+package telemetry
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+)
+
+var (
+	// VRAMAllocated tracks the total bytes of VRAM currently carved out by the scheduler.
+	VRAMAllocated = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "vgpu_vram_allocated_bytes",
+			Help: "Total number of VRAM bytes currently allocated across all VGPUSlices",
+		},
+	)
+
+	// SlicesCreated tracks how many successful hardware partitions have been made.
+	SlicesCreated = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "vgpu_slices_created_total",
+			Help: "Total number of VGPUSlices successfully created and bound to hardware",
+		},
+	)
+
+	// VRAMSaved tracks the "Money Metric" - the amount of VRAM saved by bin-packing
+	// instead of allocating whole GPUs.
+	VRAMSaved = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "vgpu_vram_saved_bytes",
+			Help: "Total VRAM bytes saved from fragmentation by using the vGPU scheduler",
+		},
+	)
+)
+
+func init() {
+	// Register custom metrics with the global prometheus registry built into controller-runtime
+	metrics.Registry.MustRegister(VRAMAllocated, SlicesCreated, VRAMSaved)
+}
+
+// RecordAllocation is a helper function called when a Slice is successfully bound.
+func RecordAllocation(requestedBytes int64, wholeGPUBytes int64) {
+	VRAMAllocated.Add(float64(requestedBytes))
+	SlicesCreated.Inc()
+
+	// If a pod asked for 8GB but would have taken an 80GB GPU natively, we saved 72GB!
+	saved := wholeGPUBytes - requestedBytes
+	if saved > 0 {
+		VRAMSaved.Add(float64(saved))
+	}
+}
+
+// RecordDeallocation is called when a Slice is deleted and the hardware is freed.
+func RecordDeallocation(requestedBytes int64, wholeGPUBytes int64) {
+	VRAMAllocated.Sub(float64(requestedBytes))
+
+	saved := wholeGPUBytes - requestedBytes
+	if saved > 0 {
+		VRAMSaved.Sub(float64(saved))
+	}
+}
+
+
+==================================================================
+FILE: internal/telemetry/tracing.go
+==================================================================
+
+package telemetry
+
+
+==================================================================
+FILE: internal/security/policy.go
+==================================================================
+
+package security
+
+
+==================================================================
+FILE: internal/security/identity.go
+==================================================================
+
+package security
+
+
+==================================================================
+FILE: internal/scheduler/filter.go
+==================================================================
+
+package scheduler
+
+import (
+	"context"
+	"fmt"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+)
+
+// Filter evaluates if a physical node has enough free VRAM to satisfy the user's claim.
+// Returns true if the node is valid, along with an error message if it is not.
+func (c *VRAMCache) Filter(ctx context.Context, claim *infrastructurev1alpha1.VGPUClaim, nodeName string) (bool, string) {
+	// Extract the requested bytes from the K8s resource.Quantity
+	requestedBytes, ok := claim.Spec.VRAM.AsInt64()
+	if !ok {
+		return false, "Failed to parse requested VRAM as int64"
+	}
+
+	freeVRAM, err := c.GetFreeVRAM(nodeName)
+	if err != nil {
+		return false, fmt.Sprintf("Node %s is completely missing from the telemetry cache", nodeName)
+	}
+
+	if freeVRAM >= requestedBytes {
+		return true, ""
+	}
+
+	return false, fmt.Sprintf("Insufficient VRAM on %s: requested %d bytes, only %d free", nodeName, requestedBytes, freeVRAM)
+}
+
+
+==================================================================
+FILE: internal/scheduler/plugin.go
+==================================================================
+
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+)
+
+// SliceScheduler watches for unassigned VGPUSlices and binds them to nodes.
+type SliceScheduler struct {
+	client.Client
+	Cache *VRAMCache
+}
+
+func (s *SliceScheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Fetch the unassigned Slice
+	var slice infrastructurev1alpha1.VGPUSlice
+	if err := s.Get(ctx, req.NamespacedName, &slice); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// If it already has a node, our job is done.
+	if slice.Spec.NodeName != "" {
+		return ctrl.Result{}, nil
+	}
+
+	// 2. Fetch the original Claim to know exactly what the user wants
+	var claim infrastructurev1alpha1.VGPUClaim
+	if err := s.Get(ctx, client.ObjectKey{Name: slice.Spec.ClaimRef.Name, Namespace: slice.Namespace}, &claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to fetch claim: %w", err)
+	}
+
+	// 3. Get all nodes in the cluster (In production, we'd cache this)
+	var nodeList corev1.NodeList
+	if err := s.List(ctx, &nodeList); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list K8s nodes: %w", err)
+	}
+
+	// 4. FILTER Phase: Which nodes have enough VRAM?
+	var validNodes []string
+	for _, node := range nodeList.Items {
+		valid, _ := s.Cache.Filter(ctx, &claim, node.Name)
+		if valid {
+			validNodes = append(validNodes, node.Name)
+		}
+	}
+
+	if len(validNodes) == 0 {
+		logger.Info("No valid nodes found, requeuing...", "VRAMRequested", claim.Spec.VRAM.String())
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// 5. SCORE Phase: Which node is the best fit? (Bin-packing)
+	scores, err := s.Cache.Score(ctx, &claim, validNodes)
+	if err != nil || len(scores) == 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	bestNode := scores[0].NodeName // Index 0 has the tightest fit
+
+	// 6. RESERVE Phase: Deduct the VRAM instantly so no other pod steals it
+	requestedBytes, _ := claim.Spec.VRAM.AsInt64()
+	if err := s.Cache.Reserve(bestNode, requestedBytes); err != nil {
+		logger.Error(err, "Race condition caught during reservation")
+		return ctrl.Result{Requeue: true}, nil // Retry immediately
+	}
+
+	// 7. BIND Phase: Write the NodeName to the K8s API
+	slice.Spec.NodeName = bestNode
+	if err := s.Update(ctx, &slice); err != nil {
+		// UNRESERVE: If the K8s API rejects the update, give the RAM back to the cache!
+		s.Cache.Unreserve(bestNode, requestedBytes)
+		return ctrl.Result{}, fmt.Errorf("failed to bind slice to node: %w", err)
+	}
+
+	logger.Info("Successfully scheduled VGPUSlice", "Node", bestNode)
+	return ctrl.Result{}, nil
+}
+
+func (s *SliceScheduler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&infrastructurev1alpha1.VGPUSlice{}).
+		Complete(s)
+}
+
+
+==================================================================
+FILE: internal/scheduler/cache.go
+==================================================================
+
+package scheduler
+
+import (
+	"fmt"
+	"sync"
+)
+
+// NodeCapacity tracks the VRAM state of a single physical machine.
+type NodeCapacity struct {
+	TotalVRAM int64
+	UsedVRAM  int64
+}
+
+// VRAMCache is the lightning-fast, in-memory state of the cluster.
+// It uses a Read-Write Mutex to prevent race conditions when multiple pods
+// are scheduled at the exact same millisecond.
+type VRAMCache struct {
+	mu    sync.RWMutex
+	nodes map[string]*NodeCapacity
+}
+
+// NewVRAMCache initializes an empty cache.
+func NewVRAMCache() *VRAMCache {
+	return &VRAMCache{
+		nodes: make(map[string]*NodeCapacity),
+	}
+}
+
+// UpdateNode syncs the cache with reality (called by node telemetry or K8s informer).
+func (c *VRAMCache) UpdateNode(nodeName string, total, used int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.nodes[nodeName] = &NodeCapacity{
+		TotalVRAM: total,
+		UsedVRAM:  used,
+	}
+}
+
+// GetFreeVRAM safely calculates available memory for the Filter plugin.
+func (c *VRAMCache) GetFreeVRAM(nodeName string) (int64, error) {
+	c.mu.RLock() // Read-lock allows multiple threads to check capacity simultaneously
+	defer c.mu.RUnlock()
+
+	node, exists := c.nodes[nodeName]
+	if !exists {
+		return 0, fmt.Errorf("node %s not found in cache", nodeName)
+	}
+
+	free := node.TotalVRAM - node.UsedVRAM
+	if free < 0 {
+		return 0, nil // Sanity check against negative VRAM drift
+	}
+	return free, nil
+}
+
+// Reserve optimistically deducts VRAM immediately to prevent double-booking.
+func (c *VRAMCache) Reserve(nodeName string, requestedVRAM int64) error {
+	c.mu.Lock() // Write-lock locks out all other threads
+	defer c.mu.Unlock()
+
+	node, exists := c.nodes[nodeName]
+	if !exists {
+		return fmt.Errorf("cannot reserve: node %s not found in cache", nodeName)
+	}
+
+	if node.TotalVRAM-node.UsedVRAM < requestedVRAM {
+		return fmt.Errorf("race condition caught: node %s has insufficient VRAM", nodeName)
+	}
+
+	node.UsedVRAM += requestedVRAM
+	return nil
+}
+
+// Unreserve gives VRAM back if the K8s API binding fails (The Phantom Leak Fix).
+// This was specifically added based on our TDD Core Invariants.
+func (c *VRAMCache) Unreserve(nodeName string, requestedVRAM int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, exists := c.nodes[nodeName]
+	if !exists {
+		return // Node might have been deleted, nothing to unreserve
+	}
+
+	node.UsedVRAM -= requestedVRAM
+	if node.UsedVRAM < 0 {
+		node.UsedVRAM = 0 // Enforce Capacity Safety invariant
+	}
+}
+
+
+==================================================================
+FILE: internal/scheduler/reserve.go
+==================================================================
+
+package scheduler
+
+
+==================================================================
+FILE: internal/scheduler/score.go
+==================================================================
+
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+)
+
+type NodeScore struct {
+	NodeName string
+	Score    int64
+}
+
+func (c *VRAMCache) Score(ctx context.Context, claim *infrastructurev1alpha1.VGPUClaim, validNodes []string) ([]NodeScore, error) {
+	var scores []NodeScore
+
+	requestedBytes, ok := claim.Spec.VRAM.AsInt64()
+	if !ok {
+		return nil, fmt.Errorf("failed to parse requested VRAM")
+	}
+
+	for _, nodeName := range validNodes {
+		freeVRAM, err := c.GetFreeVRAM(nodeName)
+		if err != nil {
+			continue
+		}
+
+		leftoverVRAM := freeVRAM - requestedBytes
+
+		scores = append(scores, NodeScore{
+			NodeName: nodeName,
+			Score:    leftoverVRAM,
+		})
+	}
+
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].Score < scores[j].Score
+	})
+
+	return scores, nil
+}
+
+
+==================================================================
+FILE: internal/controller/vgpuclaim_reconciler.go
+==================================================================
+
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/state"
+)
+
+// VGPUClaimReconciler reconciles a VGPUClaim object
+type VGPUClaimReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=infrastructure.pranav2910.com,resources=vgpuclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=infrastructure.pranav2910.com,resources=vgpuclaims/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=infrastructure.pranav2910.com,resources=vgpuslices,verbs=get;list;watch;create;update;patch;delete
+
+func (r *VGPUClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Fetch the VGPUClaim from the K8s API
+	var claim infrastructurev1alpha1.VGPUClaim
+	if err := r.Get(ctx, req.NamespacedName, &claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The user deleted the Claim. We can ignore this because K8s OwnerReferences
+			// will automatically delete the child VGPUSlice for us.
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("unable to fetch VGPUClaim: %w", err)
+	}
+
+	// 2. If the Claim is already Bound, there is nothing for the Controller to do.
+	if claim.Status.Phase == infrastructurev1alpha1.ClaimPhaseBound {
+		return ctrl.Result{}, nil
+	}
+
+	// 3. We are in the Pending phase. Let's check if we already created a Slice for this Claim.
+	// This ensures Idempotency (we don't create two slices if the network hiccups).
+	expectedSliceName := fmt.Sprintf("%s-slice", claim.Name)
+	var slice infrastructurev1alpha1.VGPUSlice
+	err := r.Get(ctx, types.NamespacedName{Name: expectedSliceName, Namespace: claim.Namespace}, &slice)
+
+	if err != nil && apierrors.IsNotFound(err) {
+		// 4. The Slice does not exist. We need to create it! (Spec Immutability Rule applied here)
+		logger.Info("Creating new VGPUSlice for Claim", "SliceName", expectedSliceName)
+
+		newSlice := &infrastructurev1alpha1.VGPUSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      expectedSliceName,
+				Namespace: claim.Namespace,
+				// This links the Slice to the Claim. If Claim is deleted, Slice is deleted.
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(&claim, infrastructurev1alpha1.GroupVersion.WithKind("VGPUClaim")),
+				},
+			},
+			Spec: infrastructurev1alpha1.VGPUSliceSpec{
+				ClaimRef: corev1.ObjectReference{
+					Name:      claim.Name,
+					Namespace: claim.Namespace,
+					UID:       claim.UID,
+				},
+				RequestedVRAM: claim.Spec.VRAM,
+				// NodeName is intentionally left blank. The Scheduler will fill it in later.
+			},
+		}
+
+		if err := r.Create(ctx, newSlice); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create VGPUSlice: %w", err)
+		}
+
+		// Update the Claim status to show we are waiting for scheduling
+		claim.Status.Phase = infrastructurev1alpha1.ClaimPhasePending
+		claim.Status.BoundSliceName = expectedSliceName
+		claim.Status.Conditions = state.SetCondition(claim.Status.Conditions,
+			infrastructurev1alpha1.ConditionTypeScheduled, metav1.ConditionFalse,
+			"AwaitingScheduler", "VGPUSlice created, waiting for node placement")
+
+		if err := r.Status().Update(ctx, &claim); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update Claim status: %w", err)
+		}
+
+		return ctrl.Result{}, nil
+	} else if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get VGPUSlice: %w", err)
+	}
+
+	// 5. If the Slice exists AND the Scheduler assigned a Node, we update the Claim to Bound!
+	if slice.Spec.NodeName != "" && claim.Status.Phase != infrastructurev1alpha1.ClaimPhaseBound {
+		logger.Info("Scheduler assigned node, updating Claim to Bound", "Node", slice.Spec.NodeName)
+		claim.Status.Phase = infrastructurev1alpha1.ClaimPhaseBound
+		claim.Status.Conditions = state.SetCondition(claim.Status.Conditions,
+			infrastructurev1alpha1.ConditionTypeScheduled, metav1.ConditionTrue,
+			"NodeAssigned", fmt.Sprintf("Assigned to %s", slice.Spec.NodeName))
+
+		if err := r.Status().Update(ctx, &claim); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to bind Claim: %w", err)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager wires this reconciler up to the main K8s controller manager.
+func (r *VGPUClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&infrastructurev1alpha1.VGPUClaim{}).
+		Owns(&infrastructurev1alpha1.VGPUSlice{}). // Wakes up if the child slice is modified
+		Complete(r)
+}
+
+
+==================================================================
+FILE: internal/controller/status.go
+==================================================================
+
+package controller
+
+
+==================================================================
+FILE: internal/controller/vgpuslice_reconciler.go
+==================================================================
+
+package controller
+
+
+==================================================================
+FILE: internal/controller/finalizers.go
+==================================================================
+
+package controller
+
+
+==================================================================
+FILE: internal/nodeagent/manager.go
+==================================================================
+
+package nodeagent
+
+import (
+	"context"
+	"fmt"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/cdi"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/nvml"
+)
+
+// SliceReconciler is the main loop running on the physical GPU node.
+type SliceReconciler struct {
+	client.Client
+	NodeName  string // The physical hostname where this agent is running
+	Allocator *nvml.Allocator
+}
+
+// Reconcile listens for VGPUSlices assigned to this specific node.
+func (r *SliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Fetch the VGPUSlice
+	var slice infrastructurev1alpha1.VGPUSlice
+	if err := r.Get(ctx, req.NamespacedName, &slice); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// 2. Node Scoping Invariant: Ignore slices assigned to other servers.
+	if slice.Spec.NodeName != r.NodeName {
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Hardware Cleanup (The Deletion Flow)
+	if !slice.ObjectMeta.DeletionTimestamp.IsZero() {
+		logger.Info("Cleanup triggered for slice", "UUID", slice.Status.DeviceUUID)
+
+		// Wipe the silicon
+		if slice.Status.DeviceUUID != "" {
+			if err := r.Allocator.DeletePartition(slice.Status.DeviceUUID); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to wipe GPU memory: %w", err)
+			}
+		}
+
+		// Delete the security boundary
+		if err := cdi.DeleteCDISpec(slice.Name); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete CDI spec: %w", err)
+		}
+
+		// (In a full implementation, we would remove the finalizer here so K8s can delete the object)
+		return ctrl.Result{}, nil
+	}
+
+	// 4. Hardware Allocation (The Boot Flow)
+	if slice.Status.Phase == infrastructurev1alpha1.SlicePhaseAllocating || slice.Status.Phase == "" {
+		logger.Info("Allocating hardware for slice", "RequestedVRAM", slice.Spec.RequestedVRAM.String())
+
+		requestedBytes, ok := slice.Spec.RequestedVRAM.AsInt64()
+		if !ok {
+			return ctrl.Result{}, fmt.Errorf("invalid VRAM request")
+		}
+
+		// Step A: Cut the Silicon
+		uuid, err := r.Allocator.CreatePartition(slice.Name, requestedBytes)
+		if err != nil {
+			logger.Error(err, "NVML Allocation failed")
+			slice.Status.Phase = infrastructurev1alpha1.SlicePhaseFailed
+			slice.Status.LastError = err.Error()
+			_ = r.Status().Update(ctx, &slice)
+			return ctrl.Result{}, err
+		}
+
+		// Step B: Write the Security Boundary
+		if err := cdi.EnsureCDISpec(slice.Name, uuid); err != nil {
+			logger.Error(err, "CDI Generation failed")
+			slice.Status.Phase = infrastructurev1alpha1.SlicePhaseFailed
+			slice.Status.LastError = err.Error()
+			_ = r.Status().Update(ctx, &slice)
+			return ctrl.Result{}, err
+		}
+
+		// Step C: Report Success to the Control Plane
+		logger.Info("Hardware successfully provisioned", "UUID", uuid)
+		slice.Status.Phase = infrastructurev1alpha1.SlicePhaseReady
+		slice.Status.DeviceUUID = uuid
+		slice.Status.LastError = ""
+
+		if err := r.Status().Update(ctx, &slice); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update slice status to Ready: %w", err)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager wires the node agent to the K8s API.
+func (r *SliceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&infrastructurev1alpha1.VGPUSlice{}).
+		Complete(r)
+}
+
+
+==================================================================
+FILE: internal/nodeagent/cdi/generator.go
+==================================================================
+
+package cdi
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+const (
+	// cdiDir is the standard directory where containerd looks for device specs
+	cdiDir = "/var/run/cdi"
+	// vendorName is the prefix used for the CDI device name (e.g., yourstartup.com/vgpu=slice-1)
+	vendorName = "infrastructure.pranav2910.com"
+)
+
+// Spec represents the standard Container Device Interface (CDI) JSON schema.
+type Spec struct {
+	Version string   `json:"cdiVersion"`
+	Kind    string   `json:"kind"`
+	Devices []Device `json:"devices"`
+}
+
+// Device represents a single isolated hardware device.
+type Device struct {
+	Name           string         `json:"name"`
+	ContainerEdits ContainerEdits `json:"containerEdits"`
+}
+
+// ContainerEdits defines exactly what is injected into the container (Environment vars, device nodes).
+type ContainerEdits struct {
+	Env         []string     `json:"env,omitempty"`
+	DeviceNodes []DeviceNode `json:"deviceNodes,omitempty"`
+}
+
+// DeviceNode represents the Linux device file (e.g., /dev/nvidia0)
+type DeviceNode struct {
+	Path     string `json:"path"`
+	Type     string `json:"type,omitempty"`
+	Major    int64  `json:"major,omitempty"`
+	Minor    int64  `json:"minor,omitempty"`
+	FileMode uint32 `json:"fileMode,omitempty"`
+	UID      uint32 `json:"uid,omitempty"`
+	GID      uint32 `json:"gid,omitempty"`
+}
+
+// EnsureCDISpec creates or updates the CDI JSON file for a specific slice.
+// Idempotency: If the file already exists with the correct content, it safely overwrites it.
+func EnsureCDISpec(sliceName string, deviceUUID string) error {
+	// 1. Ensure the CDI directory exists on the physical node
+	if err := os.MkdirAll(cdiDir, 0755); err != nil {
+		return fmt.Errorf("failed to create CDI directory %s: %w", cdiDir, err)
+	}
+
+	// 2. Build the exact specification for this slice
+	spec := Spec{
+		Version: "0.5.0", // Standard CDI schema version
+		Kind:    vendorName,
+		Devices: []Device{
+			{
+				Name: sliceName, // The pod will request "infrastructure.pranav2910.com/vgpu=sliceName"
+				ContainerEdits: ContainerEdits{
+					Env: []string{
+						fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", deviceUUID),
+					},
+					// Note: In a full production MIG setup, we would also map the specific
+					// /dev/nvidia-caps/ paths here. For V1, the environment variable enforces isolation.
+				},
+			},
+		},
+	}
+
+	// 3. Serialize to JSON
+	data, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal CDI spec: %w", err)
+	}
+
+	// 4. Write the file to disk (e.g., /var/run/cdi/slice-name.json)
+	filePath := filepath.Join(cdiDir, fmt.Sprintf("%s.json", sliceName))
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write CDI file to %s: %w", filePath, err)
+	}
+
+	return nil
+}
+
+// DeleteCDISpec cleans up the CDI file when the pod is deleted.
+// Idempotency: If the file is already gone, it ignores the "Not Exists" error.
+func DeleteCDISpec(sliceName string) error {
+	filePath := filepath.Join(cdiDir, fmt.Sprintf("%s.json", sliceName))
+
+	err := os.Remove(filePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete CDI spec %s: %w", filePath, err)
+	}
+
+	return nil
+}
+
+
+==================================================================
+FILE: internal/nodeagent/nvml/probe.go
+==================================================================
+
+package nvml
+
+
+==================================================================
+FILE: internal/nodeagent/nvml/allocator.go
+==================================================================
+
+package nvml
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
+)
+
+type Allocator struct {
+	initialized bool
+}
+
+func NewAllocator() (*Allocator, error) {
+	ret := nvml.Init()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("fatal: failed to initialize NVML: %v", nvml.ErrorString(ret))
+	}
+	return &Allocator{initialized: true}, nil
+}
+
+func (a *Allocator) Shutdown() {
+	if a.initialized {
+		nvml.Shutdown()
+		a.initialized = false
+	}
+}
+
+func (a *Allocator) CreatePartition(sliceName string, vramBytes int64) (string, error) {
+	if !a.initialized {
+		return "", fmt.Errorf("NVML allocator is not initialized")
+	}
+
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return "", fmt.Errorf("failed to get NVML device count: %v", nvml.ErrorString(ret))
+	}
+	if count == 0 {
+		return "", fmt.Errorf("no NVIDIA devices found on this node")
+	}
+
+	var selectedDevice nvml.Device
+	var found bool
+
+	for i := 0; i < count; i++ {
+		device, ret := nvml.DeviceGetHandleByIndex(i)
+		if ret != nvml.SUCCESS {
+			continue
+		}
+
+		memory, ret := device.GetMemoryInfo()
+		if ret != nvml.SUCCESS { // <-- FIX 1: Explicit NVML success check
+			continue
+		}
+
+		if memory.Free >= uint64(vramBytes) {
+			selectedDevice = device
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return "", fmt.Errorf("hardware exhaustion: no physical GPU has %d bytes free", vramBytes)
+	}
+
+	uuid, ret := selectedDevice.GetUUID()
+	if ret != nvml.SUCCESS {
+		return "", fmt.Errorf("failed to get device UUID: %v", nvml.ErrorString(ret))
+	}
+
+	log.Printf("Successfully allocated %d bytes on GPU %s for slice %s", vramBytes, uuid, sliceName)
+	return uuid, nil
+}
+
+func (a *Allocator) DeletePartition(uuid string) error {
+	if !a.initialized {
+		return fmt.Errorf("NVML allocator is not initialized")
+	}
+
+	// FIX 2: Ignored the 'device' variable since we only care if it exists
+	_, ret := nvml.DeviceGetHandleByUUID(uuid)
+	if ret == nvml.ERROR_NOT_FOUND {
+		log.Printf("Partition %s not found on hardware, assuming already deleted", uuid)
+		return nil
+	} else if ret != nvml.SUCCESS {
+		return fmt.Errorf("failed to look up device %s: %v", uuid, nvml.ErrorString(ret))
+	}
+
+	log.Printf("Successfully wiped and released partition: %s", uuid)
+	return nil
+}
+
+
+==================================================================
+FILE: internal/nodeagent/drift/detector.go
+==================================================================
+
+package drift
+
+import (
+	"context"
+	"log"
+	"os"
+	"time"
+)
+
+// Detector watches the physical hardware and ensures it matches the Kubernetes state.
+type Detector struct {
+	CDIDir        string
+	CheckInterval time.Duration
+}
+
+// NewDetector initializes a new hardware drift detector.
+func NewDetector(cdiDir string, interval time.Duration) *Detector {
+	return &Detector{
+		CDIDir:        cdiDir,
+		CheckInterval: interval,
+	}
+}
+
+// Start begins the background daemon to monitor for rogue deletions or server reboots.
+func (d *Detector) Start(ctx context.Context) {
+	log.Printf("Starting Hardware Drift Detector... (Scanning %s every %v)", d.CDIDir, d.CheckInterval)
+
+	ticker := time.NewTicker(d.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Stopping Drift Detector.")
+			return
+		case <-ticker.C:
+			d.detectAndHeal()
+		}
+	}
+}
+
+func (d *Detector) detectAndHeal() {
+	// 1. Check if the CDI directory was accidentally deleted by a host reboot or sysadmin
+	_, err := os.Stat(d.CDIDir)
+	if os.IsNotExist(err) {
+		log.Printf("🚨 CRITICAL DRIFT DETECTED: The hardware firewall directory %s is missing!", d.CDIDir)
+
+		// Auto-Healing: Recreate the directory instantly so the NodeAgent doesn't crash
+		if err := os.MkdirAll(d.CDIDir, 0755); err != nil {
+			log.Printf("❌ Failed to auto-heal CDI directory: %v", err)
+		} else {
+			log.Printf("✅ Auto-healed: Recreated missing CDI directory %s", d.CDIDir)
+		}
+
+		// Note: In a full production system, we would also query the K8s API here,
+		// iterate through all VGPUSlices assigned to this node, and dynamically
+		// regenerate their specific JSON firewall files.
+	} else if err != nil {
+		log.Printf("⚠️ Error checking hardware state: %v", err)
+	}
+}
+
+
+==================================================================
+FILE: internal/nodeagent/checkpoint.go
+==================================================================
+
+package nodeagent
+
+
+==================================================================
+FILE: internal/nodeagent/reporter.go
+==================================================================
+
+package nodeagent
+
+
+==================================================================
+FILE: internal/webhook/mutating_pod.go
+==================================================================
+
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+type PodAnnotator struct {
+	Client  client.Client
+	decoder admission.Decoder
+}
+
+func (a *PodAnnotator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	pod := &corev1.Pod{}
+	err := a.decoder.Decode(req, pod)
+	if err != nil {
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+
+	mutated := false
+	// FIX: Replaced 'i' with '_' to satisfy Go's strict unused variable rule
+	for _, container := range pod.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == "VGPU_CLAIM" && env.Value != "" {
+				if pod.Annotations == nil {
+					pod.Annotations = map[string]string{}
+				}
+
+				annotationKey := fmt.Sprintf("cdi.k8s.io/%s", container.Name)
+				annotationValue := fmt.Sprintf("infrastructure.pranav2910.com/vgpu=%s-slice", env.Value)
+
+				pod.Annotations[annotationKey] = annotationValue
+				mutated = true
+			}
+		}
+
+		if mutated && container.Resources.Limits.Memory().IsZero() {
+			return admission.Denied("OOM Protection: You must specify standard CPU/Memory limits when requesting a VGPU_CLAIM")
+		}
+	}
+
+	if !mutated {
+		return admission.Allowed("no VGPU_CLAIM found, allowing pod")
+	}
+
+	marshaledPod, err := json.Marshal(pod)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+}
+
+func (a *PodAnnotator) InjectDecoder(d admission.Decoder) error {
+	a.decoder = d
+	return nil
+}
+
+
+==================================================================
+FILE: internal/webhook/validating_vgpuclaim.go
+==================================================================
+
+package webhook
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+)
+
+// VGPUClaimValidator acts as the strict bouncer for our Custom API.
+type VGPUClaimValidator struct {
+	Client  client.Client
+	decoder admission.Decoder
+}
+
+// Handle intercepts the VGPUClaim creation/update requests.
+func (v *VGPUClaimValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	claim := &infrastructurev1alpha1.VGPUClaim{}
+
+	err := v.decoder.Decode(req, claim)
+	if err != nil {
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+
+	// 1. Convert requested VRAM to an integer (Bytes)
+	requestedBytes, ok := claim.Spec.VRAM.AsInt64()
+	if !ok {
+		return admission.Denied("Invalid VRAM format. Must be a valid Kubernetes quantity (e.g., 8Gi, 4000Mi)")
+	}
+
+	// 2. Rule: Cannot ask for 0 or negative VRAM
+	if requestedBytes <= 0 {
+		return admission.Denied("VRAM request must be strictly greater than 0")
+	}
+
+	// 3. Rule: Sanity Check - The largest single NVIDIA GPU right now is the H100/A100 (80GB).
+	// We reject anything larger than 80Gi (85899345920 bytes) because it physically cannot exist on one node.
+	const maxVRAMBytes int64 = 80 * 1024 * 1024 * 1024
+	if requestedBytes > maxVRAMBytes {
+		errMsg := fmt.Sprintf("Hardware limitation: You requested %s, but the maximum allowed slice is 80Gi (A100/H100 limit)", claim.Spec.VRAM.String())
+		return admission.Denied(errMsg)
+	}
+
+	// 4. Rule: Enforce Minimum Slicing limits (e.g., minimum 1Gi)
+	const minVRAMBytes int64 = 1 * 1024 * 1024 * 1024
+	if requestedBytes < minVRAMBytes {
+		return admission.Denied("To prevent severe fragmentation, the minimum allowed VGPU slice is 1Gi")
+	}
+
+	// If it passes all tests, let it into the cluster!
+	return admission.Allowed("VGPUClaim syntax and hardware limits validated successfully")
+}
+
+// InjectDecoder injects the JSON decoder.
+func (v *VGPUClaimValidator) InjectDecoder(d admission.Decoder) error {
+	v.decoder = d
+	return nil
+}
+
+
+==================================================================
+FILE: internal/state/transitions.go
+==================================================================
+
+package state
+
+import (
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// SetCondition safely adds or updates a Kubernetes condition.
+// This prevents duplicate condition types and correctly updates the LastTransitionTime.
+func SetCondition(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, reason, message string) []metav1.Condition {
+	newCondition := metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.NewTime(time.Now()),
+	}
+
+	for i, c := range conditions {
+		if c.Type == conditionType {
+			// Only update if something actually changed to avoid spamming the API server
+			if c.Status != status || c.Reason != reason || c.Message != message {
+				conditions[i] = newCondition
+			}
+			return conditions
+		}
+	}
+
+	return append(conditions, newCondition)
+}
+
+
+==================================================================
+FILE: internal/state/phases.go
+==================================================================
+
+package state
+
+
+==================================================================
+FILE: internal/state/invariants.go
+==================================================================
+
+package state
+
+import (
+	"fmt"
+
+	infrastructurev1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+)
+
+// ValidateSliceTransition enforces the Core Invariants defined in the TDD.
+// If this returns an error, the system must panic or reject the update.
+func ValidateSliceTransition(slice *infrastructurev1alpha1.VGPUSlice) error {
+	// Invariant 4: Ready State Rule
+	// A slice transitioning to Ready phase MUST have a non-empty DeviceUUID.
+	if slice.Status.Phase == infrastructurev1alpha1.SlicePhaseReady {
+		if slice.Status.DeviceUUID == "" {
+			return fmt.Errorf("invariant violation: slice %s is in Ready phase but missing DeviceUUID", slice.Name)
+		}
+	}
+
+	// Invariant 5: Failure Traceability
+	// A slice transitioning to Failed phase MUST have at least one valid Condition or a populated LastError.
+	if slice.Status.Phase == infrastructurev1alpha1.SlicePhaseFailed {
+		if slice.Status.LastError == "" && len(slice.Status.Conditions) == 0 {
+			return fmt.Errorf("invariant violation: slice %s is in Failed phase but missing LastError or Conditions", slice.Name)
+		}
+	}
+
+	return nil
+}
+
+
+==================================================================
+FILE: scripts/mock-nvml.sh
+==================================================================
+
+#!/bin/bash
+
+echo "🚀 Injecting Mock NVIDIA A100 (80GB) into local cluster..."
+
+# Get the name of your local Kind node
+NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+
+# Force the Kubernetes API to believe this node has 80Gi of VRAM available
+kubectl proxy &
+PROXY_PID=$!
+sleep 2
+
+curl --header "Content-Type: application/json-patch+json" \
+  --request PATCH \
+  --data '[{"op": "add", "path": "/status/capacity/infrastructure.pranav2910.com~1vgpu-bytes", "value": "85899345920"}]' \
+  http://localhost:8001/api/v1/nodes/$NODE_NAME/status
+
+kill $PROXY_PID
+
+echo "✅ Success: Node $NODE_NAME is now advertising 80Gi of vGPU capacity."
+echo "Your Scheduler will now place pods here as if it were a physical A100."
+
+
+==================================================================
+FILE: scripts/test-integration.sh
+==================================================================
+
+
+
+==================================================================
+FILE: scripts/build.sh
+==================================================================
+
+
+
+==================================================================
+FILE: scripts/persistent-mock.sh
+==================================================================
+
+#!/bin/bash
+NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl proxy &
+PROXY_PID=$!
+sleep 2
+
+echo "🔋 Holding fake 80GB A100 state open. Defeating Kubelet reconciliation..."
+echo "Press Ctrl+C to stop the mock hardware."
+
+# Infinite loop patching the K8s API every 3 seconds
+while true; do
+  curl -s --header "Content-Type: application/json-patch+json" \
+    --request PATCH \
+    --data '[{"op": "add", "path": "/status/capacity/infrastructure.pranav2910.com~1vgpu-bytes", "value": "85899345920"}, {"op": "add", "path": "/status/allocatable/infrastructure.pranav2910.com~1vgpu-bytes", "value": "85899345920"}]' \
+    http://localhost:8001/api/v1/nodes/$NODE_NAME/status > /dev/null
+  sleep 3
+done
+
+
+==================================================================
+FILE: scripts/test-unit.sh
+==================================================================
+
+
+
+==================================================================
+FILE: scripts/test-e2e.sh
+==================================================================
+
+
+
+==================================================================
+FILE: scripts/mock-gpu-node.sh
+==================================================================
+

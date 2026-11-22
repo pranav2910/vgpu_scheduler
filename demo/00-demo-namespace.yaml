@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vgpu-demo
+  labels:
+    # GPU workloads can't satisfy 'restricted' — they don't set runAsNonRoot /
+    # drop-all-caps / seccompProfile, and real GPU pods need device access — so
+    # the demo namespace runs at 'baseline': it still blocks privileged and
+    # host-namespace pods, but admits ordinary GPU workloads (incl. the
+    # controller-created VGPUJob pods). Only the control-plane ns is privileged.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: baseline
+

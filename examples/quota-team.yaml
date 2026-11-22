@@ -1,0 +1,13 @@
+# Cap a team's total GPU memory. Jobs beyond the cap are held/rejected;
+# raising the cap LIVE unblocks waiting jobs without resubmission.
+# A gang whose TOTAL would exceed the cap admits ZERO members (gang-atomic).
+#
+# IMPORTANT: spec.targetNamespace is REQUIRED and is what the quota applies to
+# — it is NOT inferred from metadata.namespace. A quota without it guards nothing.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUQuota
+metadata:
+  name: team-a-cap
+spec:
+  targetNamespace: team-a
+  maxVramBytes: 68719476736                # 64 GiB total across team-a

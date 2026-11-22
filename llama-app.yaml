@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llama-1-workload
+  namespace: default
+  labels:
+    app: ai-inference
+    vgpu-claim: test-llama-model   # selector for the mutating webhook
+  annotations:
+    infrastructure.pranav2910.com/claim-ref: test-llama-model
+spec:
+  # nodeName is only set so the demo lands on the kind control-plane where the
+  # NodeAgent runs — drop it in real deployments.
+  nodeName: vgpu-test-control-plane
+  containers:
+    - name: ai-model
+      image: alpine:3.20
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "=================================================="
+          echo "🚀 vGPU demo pod online"
+          echo "=================================================="
+          echo "CDI annotation (set by the mutating webhook):"
+          env | grep -i cdi || true
+          echo "Allocation info (informational):"
+          cat /etc/podinfo/alloc 2>/dev/null || echo "  (no podinfo volume configured)"
+          sleep infinity

@@ -1,0 +1,475 @@
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"sync"
+	"time"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// GangCheckResult: gate decisions.
+type GangCheckResult int
+
+const (
+	GangNotApplicable GangCheckResult = iota // POSITIVE finding: slice has no gang annotation — may bind solo
+	GangBindAllowed                          // gang quorum reached, this slice may bind
+	GangBindDeferred                         // admitted gang, sub-quorum; reservation HELD
+	GangBindRejected                         // reservation in terminal phase (Failed/Released)
+	GangBindWait                             // another gang holds the admission slot; do NOT hold — release the reservation and retry
+	GangRetry                                // gang state UNDETERMINED (transient read error) — fail closed: do NOT bind, requeue
+)
+
+// gangMember represents a single slice's "I'm here, holding my reservation"
+// registration in the gate. The gate tracks one entry per (gang, sliceUID).
+type gangMember struct {
+	sliceUID string
+	nodeName string
+	bytes    int64
+	heldAt   time.Time
+}
+
+// gangCohort tracks a single gang's members across reconcile cycles. Once
+// all gangSize members are present, cohort transitions to "released" — the
+// next gate-check for any sibling returns Allowed.
+type gangCohort struct {
+	gangSize  int32
+	priority  int32                 // gang scheduling priority; higher admits first
+	members   map[string]gangMember // sliceUID -> registration
+	released  bool                  // true once quorum reached; sticky
+	createdAt time.Time             // first time the gate observed this gang (≈ age)
+	rsvUID    types.UID             // which INCARNATION of the reservation this cohort belongs to
+}
+
+// GangBindingGate decides whether a slice may bind based on whether enough
+// of its sibling gang members are also "ready to bind" (i.e. holding cache
+// reservations). The gate's state is in-memory and per-scheduler-instance.
+//
+// Hold-the-reservation design:
+//
+//  1. When a slice arrives at the gate:
+//     - If gang cohort doesn't exist, create it.
+//     - Register self as a member (record sliceUID, node, bytes).
+//     - If members count < gangSize: return Deferred. The CALLER is expected
+//     to NOT release the cache reservation (Schedule() calls tx.Confirm()
+//     on Deferred so the speculative lock is held).
+//     - If members count >= gangSize: mark cohort released, return Allowed.
+//
+//  2. Subsequent reconciles for sibling slices observe cohort.released=true
+//     and return Allowed immediately (their reservation may still need to be
+//     created or refreshed, but the gate doesn't gate them).
+//
+//  3. Cleanup: stale cohorts (members heldAt older than maxHoldAge) are
+//     reaped. This catches the case where a gang's reservation transitions
+//     to Failed but the gate state isn't notified.
+//
+// CRITICAL CORRECTNESS INVARIANTS:
+//
+//   - The gate is consulted AFTER cache.AssumeSlice succeeds. So when the
+//     gate registers a member, that member's bytes ARE held in the cache.
+//
+//   - When cohort tips to released, it stays released. Subsequent siblings
+//     can bind without re-checking quorum.
+//
+//   - The gate DOES NOT release cache reservations directly. That's the
+//     scheduler's job (via tx.Rollback or the cache's TTL reaper).
+//
+//   - The reservation reconciler in the controller continues to drive the
+//     CRD-side state machine (Reserving → Reserved → Committed). The gate
+//     uses the CRD only for terminal-phase rejection (Failed/Released).
+//
+// SERIALIZED ADMISSION (liveness fix):
+//
+//	The naive cohort gate let every contending gang hold capacity concurrently.
+//	Under contention that fragments capacity: N gangs each park a sub-quorum of
+//	slices, none reaches quorum, and the cluster under-packs even though some
+//	subset of gangs would fit if admitted one at a time. The gate is "safe" (no
+//	over-admission) but not "live".
+//
+//	The fix gives the gate a single admission slot. Only the gang holding the
+//	slot (the "admitting" gang) may hold cache reservations; its siblings get
+//	Deferred (hold). Every other contending gang gets GangBindWait — the caller
+//	releases that slice's reservation, so non-admitted gangs hold ZERO capacity
+//	and cannot fragment it. When the slot is free it is claimed by the head of
+//	the contending set, ordered priority desc → age asc → name asc. Admission is
+//	sticky: once a gang holds the slot it keeps it until it reaches quorum
+//	(commit, slot frees) or stalls past gangAdmissionTimeout (backoff, slot
+//	frees) so an impossible gang cannot starve the rest.
+type GangBindingGate struct {
+	client client.Client
+
+	mu      sync.Mutex
+	cohorts map[string]*gangCohort // key: namespace/reservationName
+
+	// Single admission slot. admitting is the cohort key currently allowed to
+	// hold capacity ("" = slot free). backoff maps a cohort key to the time
+	// until which it is skipped for slot selection (set when a gang stalls).
+	admitting      string
+	admittingSince time.Time
+	backoff        map[string]time.Time
+}
+
+// NewGangBindingGate constructs a gate with an empty cohort map.
+func NewGangBindingGate(c client.Client) *GangBindingGate {
+	return &GangBindingGate{
+		client:  c,
+		cohorts: make(map[string]*gangCohort),
+		backoff: make(map[string]time.Time),
+	}
+}
+
+// gateMaxHoldAge bounds how long a cohort can sit half-formed before the
+// gate gives up and forgets its members. Should be longer than the slice
+// reservation TTL but shorter than the gang reservation deadline.
+const gateMaxHoldAge = 90 * time.Second
+
+// gangAdmissionTimeout bounds how long the admitting gang may hold the slot
+// without reaching quorum. Past this, the gate assumes the gang cannot
+// assemble (e.g. it needs more capacity than is free), backs it off, and frees
+// the slot for the next contender. Must be shorter than the gang reservation
+// deadline so the slot recycles several times before a gang's reservation
+// fails outright.
+const gangAdmissionTimeout = 20 * time.Second
+
+// gangAdmissionBackoff is how long a stalled gang is skipped for slot
+// selection after it loses the slot, giving other contenders a clear run.
+// After it elapses the gang is eligible again — so a genuinely-impossible gang
+// cycles (claim → stall → backoff) rather than failing fast, but it never
+// blocks others for more than gangAdmissionTimeout at a time.
+const gangAdmissionBackoff = 15 * time.Second
+
+// CheckSliceWithCohort answers whether bind is permitted for this slice,
+// updating the gate's per-gang readiness state in the process.
+//
+// nodeName and bytes describe the speculative reservation the slice already
+// holds in the cache (via AssumeSlice). The gate records them so that on
+// reaping or rejection it can release the right capacity.
+func (g *GangBindingGate) CheckSliceWithCohort(
+	ctx context.Context,
+	slice *vgpuv1alpha1.VGPUSlice,
+	nodeName string,
+	bytes int64,
+) (GangCheckResult, string, error) {
+	if slice == nil || slice.Annotations == nil {
+		return GangNotApplicable, "no annotations", nil
+	}
+	rsvName, ok := slice.Annotations[vgpuv1alpha1.AnnotationReservationRef]
+	if !ok || rsvName == "" {
+		return GangNotApplicable, "no reservation annotation", nil
+	}
+
+	// Look up the reservation CRD only to (a) get gangSize and (b) catch
+	// terminal phases that should reject this slice.
+	var rsv vgpuv1alpha1.VGPUGangReservation
+	err := g.client.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: rsvName}, &rsv)
+	if errors.IsNotFound(err) {
+		// NotFound is AMBIGUOUS: the gang may be torn down — or it may be being
+		// BORN. At gang creation the slice events and the reservation object
+		// arrive on different watch streams, and a slice can reach the
+		// scheduler before its reservation has ever been seen by the informer.
+		// Rejecting here misread a being-born gang as dead (seen live in the
+		// 2.3 crash battery: the first member burned its early attempts on
+		// "gang torn down" while its 3 siblings, milliseconds later, found the
+		// reservation fine). Retry quickly instead: a genuinely torn-down
+		// gang's slices are cascade-deleted moments later, which ends the
+		// retries; a being-born gang's reservation appears within milliseconds.
+		return GangRetry,
+			fmt.Sprintf("reservation %s not yet visible (gang being born, or torn down — retrying)", rsvName),
+			nil
+	}
+	if err != nil {
+		// Cache not synced or transient failure. The gang state is UNDETERMINED
+		// and must fail closed: GangRetry tells the caller to requeue without
+		// binding. (Returning NotApplicable here let a gang member bind SOLO on
+		// a transient error — breaking all-or-nothing admission.)
+		return GangRetry, "", fmt.Errorf("getting reservation: %w", err)
+	}
+
+	switch rsv.Status.Phase {
+	case vgpuv1alpha1.ReservationPhaseFailed,
+		vgpuv1alpha1.ReservationPhaseReleased:
+		// Terminal. Forget any cohort state for this gang and reject.
+		g.forgetCohort(slice.Namespace + "/" + rsvName)
+		telemetry.GangAdmissionDecisions.WithLabelValues("rejected").Inc()
+		return GangBindRejected,
+			fmt.Sprintf("reservation %s in terminal phase %s", rsvName, rsv.Status.Phase),
+			nil
+	}
+
+	gangSize := rsv.Spec.GangSize
+	if gangSize <= 0 {
+		return GangNotApplicable,
+			fmt.Sprintf("invalid gangSize %d", gangSize),
+			nil
+	}
+
+	cohortKey := slice.Namespace + "/" + rsvName
+
+	// Priority rides the slice as a propagated annotation (see
+	// AnnotationGangPriority). Missing/garbled → priority 0 (lowest), so older
+	// gangs still admit first by the age tiebreaker.
+	priority := int32(0)
+	if ps := slice.Annotations[vgpuv1alpha1.AnnotationGangPriority]; ps != "" {
+		if p, perr := strconv.Atoi(ps); perr == nil {
+			priority = int32(p)
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// Reflect whether the admission slot is held once this decision settles
+	// (runs before the Unlock defer, so g.admitting is read under the lock).
+	defer func() {
+		if g.admitting != "" {
+			telemetry.GangAdmissionSlotHeld.Set(1)
+		} else {
+			telemetry.GangAdmissionSlotHeld.Set(0)
+		}
+	}()
+
+	// Reap stale cohorts proactively (cheap; runs on every gate call).
+	g.reapStaleCohortsLocked(time.Now())
+
+	now := time.Now()
+
+	cohort, exists := g.cohorts[cohortKey]
+	if exists && cohort.rsvUID != rsv.UID {
+		// Same gang NAME, different reservation object: a previous incarnation's
+		// cohort. A successful gang's cohort is released=true and deliberately
+		// never reaped, and its reservation is cascade-deleted without a
+		// terminal-phase observation — so without this check a re-created gang
+		// (CI re-runs the same manifest) hit the stale released fast-path below
+		// and every member bound SOLO, no quorum, no all-or-nothing (scan S1).
+		// A stale cohort also carries the OLD gangSize. Purge and start fresh.
+		log.Printf("[gang] cohort %s belongs to a previous incarnation of the reservation (cohort uid=%s, live uid=%s) — forgetting it",
+			cohortKey, cohort.rsvUID, rsv.UID)
+		delete(g.cohorts, cohortKey)
+		delete(g.backoff, cohortKey)
+		if g.admitting == cohortKey {
+			g.admitting = ""
+		}
+		exists = false
+	}
+	if !exists {
+		cohort = &gangCohort{
+			gangSize:  gangSize,
+			priority:  priority,
+			members:   make(map[string]gangMember, gangSize),
+			createdAt: now,
+			rsvUID:    rsv.UID,
+		}
+		g.cohorts[cohortKey] = cohort
+	} else {
+		cohort.priority = priority // keep fresh; cheap and tolerant of spec edits
+	}
+
+	// If the cohort is already released, this slice may bind regardless of
+	// whether it's been seen before. Tip from previous reconciles already
+	// committed the cohort.
+	if cohort.released {
+		telemetry.GangAdmissionDecisions.WithLabelValues("admitted").Inc()
+		return GangBindAllowed,
+			fmt.Sprintf("gang %s cohort released (siblings ready)", rsvName),
+			nil
+	}
+
+	// ── Serialized admission ──────────────────────────────────────────────
+	// Free the slot if the current holder has stalled past the timeout, then
+	// (if free) hand it to the head of the contending set. Only the gang
+	// holding the slot may keep capacity; everyone else is told to release.
+	if g.admitting != "" && now.Sub(g.admittingSince) > gangAdmissionTimeout {
+		holder := g.cohorts[g.admitting]
+		if holder != nil && len(holder.members) == 0 {
+			// GHOST holder (battery 2.7 starvation bug): a live gang registers
+			// its first member in the very check that granted it the slot, so a
+			// holder that stalls the full timeout with ZERO members is a gang
+			// whose slices no longer exist (e.g. its namespace was deleted —
+			// nothing re-enters the scheduler on deletion, so forgetCohort's
+			// terminal-phase path never fires). Backing it off used to let it
+			// RE-WIN the slot after every backoff — its old createdAt beat every
+			// live gang under age-asc ordering — starving feasible gangs until
+			// the 90s reaper caught up. Forget it outright: cohort state is
+			// fully reconstructible from slice checks if the gang is alive.
+			log.Printf("[gang] admitting gang %s stalled %v with no members — forgetting ghost cohort",
+				g.admitting, now.Sub(g.admittingSince).Round(time.Second))
+			telemetry.GangAdmissionBackoffs.Inc()
+			delete(g.cohorts, g.admitting)
+			delete(g.backoff, g.admitting)
+		} else {
+			log.Printf("[gang] admitting gang %s stalled (%v without quorum) — backing off, freeing slot",
+				g.admitting, now.Sub(g.admittingSince).Round(time.Second))
+			telemetry.GangAdmissionBackoffs.Inc()
+			g.backoff[g.admitting] = now.Add(gangAdmissionBackoff)
+			if holder != nil {
+				// A staller forfeits its age seniority: under priority-desc →
+				// age-asc ordering, an old repeatedly-stalling cohort would
+				// otherwise out-rank every younger feasible gang each time its
+				// backoff elapsed. Re-stamping createdAt sends it to the back
+				// of its priority class instead (round-robin among stallers).
+				holder.createdAt = now
+			}
+			g.releaseHoldsLocked(g.admitting)
+		}
+		g.admitting = ""
+	}
+	if g.admitting == "" {
+		if head := g.pickAdmissionHeadLocked(now, cohortKey); head != "" {
+			g.admitting = head
+			g.admittingSince = now
+		}
+	}
+
+	if g.admitting != cohortKey {
+		// Another gang owns the admission slot (or no slot could be claimed for
+		// us this round). Do NOT hold capacity — the caller releases this
+		// slice's reservation so non-admitted gangs never fragment capacity.
+		// Drop any prior membership we may have recorded while admitted.
+		delete(cohort.members, string(slice.UID))
+		telemetry.GangAdmissionDecisions.WithLabelValues("wait").Inc()
+		reason := "no gang eligible for admission"
+		if g.admitting != "" {
+			reason = fmt.Sprintf("gang %s admitting first", g.admitting)
+		}
+		return GangBindWait,
+			fmt.Sprintf("gang %s waiting for admission slot (%s)", rsvName, reason),
+			nil
+	}
+
+	// We hold the admission slot. Register or refresh this slice's membership.
+	cohort.members[string(slice.UID)] = gangMember{
+		sliceUID: string(slice.UID),
+		nodeName: nodeName,
+		bytes:    bytes,
+		heldAt:   now,
+	}
+
+	if int32(len(cohort.members)) >= gangSize {
+		// Quorum! Tip the cohort and free the admission slot for the next gang.
+		cohort.released = true
+		g.admitting = ""
+		delete(g.backoff, cohortKey)
+		telemetry.GangAdmissionDecisions.WithLabelValues("admitted").Inc()
+		telemetry.GangQuorumWait.Observe(now.Sub(cohort.createdAt).Seconds())
+		log.Printf("[gang] cohort %s reached quorum (%d/%d) — releasing for bind, freeing admission slot",
+			cohortKey, len(cohort.members), gangSize)
+		return GangBindAllowed,
+			fmt.Sprintf("gang %s quorum reached (%d/%d)", rsvName, len(cohort.members), gangSize),
+			nil
+	}
+
+	// Not yet quorum. Slice's reservation should be HELD by the caller.
+	telemetry.GangAdmissionDecisions.WithLabelValues("deferred").Inc()
+	return GangBindDeferred,
+		fmt.Sprintf("gang %s holding %d/%d members", rsvName, len(cohort.members), gangSize),
+		nil
+}
+
+// pickAdmissionHeadLocked returns the cohort key that should claim the free
+// admission slot, ordered priority desc → age asc → name asc. Released cohorts
+// and cohorts in active backoff are skipped. Returns "" if none are eligible.
+// Caller must hold g.mu.
+//
+// callerKey is the cohort of the slice whose check is running. A cohort with
+// ZERO members may claim the slot only through its OWN slice's check (battery
+// 2.7 starvation, round 2): cohort creation and first-member registration
+// happen inside the same check, so any OTHER member-less cohort is either a
+// freshly-wiped staller (in backoff — skipped anyway) or a GHOST whose slices
+// no longer exist. The stall path alone cost 20s per ghost SERIALLY — with two
+// dead tests' cohorts queued, a feasible gang's whole 60s reservation deadline
+// burned before it ever held the slot. Live gangs self-revive via their own
+// checks; ghosts can't, and the 90s reaper collects them.
+func (g *GangBindingGate) pickAdmissionHeadLocked(now time.Time, callerKey string) string {
+	best := ""
+	var bestCohort *gangCohort
+	for key, cohort := range g.cohorts {
+		if cohort.released {
+			continue
+		}
+		if key != callerKey && len(cohort.members) == 0 {
+			continue // possible ghost: only its own slice's check may revive it
+		}
+		if until, backed := g.backoff[key]; backed {
+			if now.Before(until) {
+				continue
+			}
+			delete(g.backoff, key) // backoff elapsed; eligible again
+		}
+		if bestCohort == nil || admissionLess(cohort, key, bestCohort, best) {
+			best, bestCohort = key, cohort
+		}
+	}
+	return best
+}
+
+// admissionLess reports whether cohort a (keyed aKey) outranks cohort b (keyed
+// bKey) for admission: higher priority first, then older (earlier createdAt),
+// then lexicographically smaller key as a stable tiebreaker.
+func admissionLess(a *gangCohort, aKey string, b *gangCohort, bKey string) bool {
+	if a.priority != b.priority {
+		return a.priority > b.priority
+	}
+	if !a.createdAt.Equal(b.createdAt) {
+		return a.createdAt.Before(b.createdAt)
+	}
+	return aKey < bKey
+}
+
+// releaseHoldsLocked forgets the membership of a gang that lost the admission
+// slot so its slots no longer count toward quorum. The cache reservations the
+// members held are released by the caller's rollback path (GangBindWait) and
+// the cache TTL reaper. Caller must hold g.mu.
+func (g *GangBindingGate) releaseHoldsLocked(key string) {
+	if cohort, ok := g.cohorts[key]; ok && !cohort.released {
+		cohort.members = make(map[string]gangMember, cohort.gangSize)
+	}
+}
+
+// forgetCohort removes the gate's state for a gang. Used when the gang's
+// reservation reaches a terminal phase. Held reservations from members will
+// be released by the cache TTL reaper or by the slice reconciler advancing
+// the slice into Failed phase.
+func (g *GangBindingGate) forgetCohort(key string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.cohorts, key)
+	delete(g.backoff, key)
+	if g.admitting == key {
+		g.admitting = "" // free the slot so the next gang can be admitted
+		telemetry.GangAdmissionSlotHeld.Set(0)
+	}
+}
+
+// reapStaleCohortsLocked removes cohorts whose oldest member registration is
+// older than gateMaxHoldAge AND haven't reached quorum. Released cohorts are
+// kept indefinitely (until the controller transitions the reservation to
+// terminal and forgetCohort() runs). Caller must hold g.mu.
+func (g *GangBindingGate) reapStaleCohortsLocked(now time.Time) {
+	for key, cohort := range g.cohorts {
+		if cohort.released {
+			continue
+		}
+		if now.Sub(cohort.createdAt) > gateMaxHoldAge {
+			log.Printf("[gang] reaping stale cohort %s (members=%d/%d, age=%v)",
+				key, len(cohort.members), cohort.gangSize, now.Sub(cohort.createdAt))
+			delete(g.cohorts, key)
+			delete(g.backoff, key)
+			if g.admitting == key {
+				g.admitting = "" // freed a stale holder; let the next gang in
+			}
+		}
+	}
+}
+
+// CheckSlice is the legacy entry point (no node/bytes) — preserved for any
+// non-Schedule caller. Routes through CheckSliceWithCohort with empty node
+// info so the cohort tracks membership but can't release capacity itself.
+func (g *GangBindingGate) CheckSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) (GangCheckResult, string, error) {
+	return g.CheckSliceWithCohort(ctx, slice, "", 0)
+}

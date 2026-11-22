@@ -1,0 +1,73 @@
+# Recommendation enforcement (Phase 3.7a) — requireOverride, by example.
+#
+# Story: this workload was profiled (peak ~21.5 GiB) and the platform recommends
+# ~24.7 GiB. On a cluster running in `requireOverride` mode, re-submitting it with
+# only 16 GiB is REJECTED at admission — unless it carries the override annotation
+# below, which says "I know it's undersized; run it anyway."
+#
+# Full guide: docs/recommendation-policy.md
+#
+# ── 1. Admin: put the cluster in requireOverride mode (one-time) ──────────────
+#
+#   kubectl set env deployment/vgpu-controller -n vgpu-system \
+#     VGPU_RECOMMENDATION_MODE=requireOverride
+#
+#   Safety: only blocks at Medium+ profile confidence; the webhook is fail-open
+#   (failurePolicy: Ignore); a 10% tolerance applies. Default mode is recommendOnly.
+#
+# ── 2. User: this is REJECTED (undersized, confident profile, no override) ─────
+#
+#   apiVersion: infrastructure.pranav2910.com/v1alpha1
+#   kind: VGPUJob
+#   metadata:
+#     name: llama-infer
+#     namespace: default
+#   spec:
+#     priority: 50
+#     workloadClass: Inference
+#     claimTemplate:
+#       spec:
+#         requestedVramBytes: 17179869184   # 16 GiB — below the ~24.7 GiB recommendation
+#         serviceTier: Guaranteed
+#     podTemplate:
+#       spec:
+#         runtimeClassName: nvidia
+#         restartPolicy: Never
+#         containers:
+#           - name: workload
+#             image: my-model:latest
+#
+#   → admission webhook "vvgpujob.vgpu.pranav2910.com" denied the request:
+#       requested 16384 MiB is below this workload's recommended 25325 MiB ...
+#       Raise the request, or set annotation .../override-recommendation="true".
+#
+# ── 3. User: this is ADMITTED — the override annotation acknowledges the undersize ─
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: llama-infer
+  namespace: default
+  annotations:
+    # "I know this is below the learned recommendation — run it undersized anyway."
+    # The job still gets an Underprovisioned condition (reason
+    # RequestBelowRecommendationOverridden) for audit, but it is admitted.
+    infrastructure.pranav2910.com/override-recommendation: "true"
+spec:
+  priority: 50
+  workloadClass: Inference
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB (intentionally below recommendation)
+      serviceTier: Guaranteed
+  podTemplate:
+    spec:
+      runtimeClassName: nvidia
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: my-model:latest
+          command: ["python", "serve.py"]
+# Equivalent via the CLI:
+#   vgpu submit --name llama-infer --vram 16Gi --image my-model:latest \
+#     --class Inference --command 'python serve.py' --runtime-class nvidia --override

@@ -1,0 +1,202 @@
+package nodeagent
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/gpu"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	// overuseToleranceBytes is the slack before a GPU's process-used VRAM is
+	// treated as exceeding its granted budget — absorbs measurement noise.
+	overuseToleranceBytes = int64(256) << 20 // 256 MiB
+	// overuseStreakThreshold is how many consecutive observation cycles a GPU
+	// must be over budget before it is flagged (hysteresis — no flapping on
+	// transient allocation spikes).
+	overuseStreakThreshold = 3
+)
+
+// ViolationDetector is the Phase 3.4a observe-only over-use detector. Each cycle
+// it compares each GPU's observed process-used VRAM against the VRAM the
+// scheduler granted to bound slices on this node, and surfaces sustained
+// over-use via metrics and a Kubernetes Event. It NEVER evicts, throttles, or
+// mutates a workload — detection only.
+//
+// This product models one GPU per node, so all of a node's slice grants map to
+// its GPU; "granted on the node" is therefore that GPU's budget. Per-slice
+// attribution (which slice is over-using) arrives in Phase 3.4b.
+type ViolationDetector struct {
+	client   client.Client
+	nodeName string
+	inv      *gpu.Inventory
+	recorder record.EventRecorder
+	interval time.Duration
+
+	// per-GPU hysteresis state, keyed by GPU UUID.
+	streak map[string]int
+	active map[string]bool
+
+	// now is a clock hook for tests (defaults to time.Now).
+	now func() time.Time
+}
+
+// NewViolationDetector builds the detector. interval <= 0 defaults to 30s.
+func NewViolationDetector(c client.Client, nodeName string, inv *gpu.Inventory, recorder record.EventRecorder, interval time.Duration) *ViolationDetector {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	return &ViolationDetector{
+		client:   c,
+		nodeName: nodeName,
+		inv:      inv,
+		recorder: recorder,
+		interval: interval,
+		streak:   map[string]int{},
+		active:   map[string]bool{},
+		now:      time.Now,
+	}
+}
+
+// Start satisfies controller-runtime's Runnable. It never returns an error
+// (detection failures degrade visibly via logs; they don't crash the agent).
+func (d *ViolationDetector) Start(ctx context.Context) error {
+	log.Printf("[violation] over-use detector started: node=%s interval=%s (observe-only)", d.nodeName, d.interval)
+	t := time.NewTicker(d.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := d.detectOnce(ctx); err != nil {
+				log.Printf("[violation] detect cycle error: %v", err)
+			}
+		}
+	}
+}
+
+func (d *ViolationDetector) detectOnce(ctx context.Context) error {
+	devices, observedAt, errStr := d.inv.Snapshot()
+	// Fail LOUD on stale/errored snapshots. A silent skip froze every overuse
+	// gauge at its pre-blindness value for minutes on an 8xV100 (tier-3 torture
+	// finding): the detector was blind and NOTHING said so. Skipping evaluation
+	// is still correct — garbage in must not flag violations — but the skip must
+	// be visible on metrics and in logs.
+	age := d.now().Sub(observedAt)
+	telemetry.NodeObservationAgeSeconds.WithLabelValues(d.nodeName).Set(age.Seconds())
+	stale := errStr != "" || len(devices) == 0 || age > 3*d.interval
+	if stale {
+		telemetry.NodeObservationStale.WithLabelValues(d.nodeName).Set(1)
+		log.Printf("[violation] BLIND CYCLE: snapshot stale (age=%s, err=%q, devices=%d) — over-use detection skipped; gauges may be frozen",
+			age.Round(time.Second), errStr, len(devices))
+		return nil
+	}
+	telemetry.NodeObservationStale.WithLabelValues(d.nodeName).Set(0)
+	grantedByCard, err := d.grantedBytesByCard(ctx)
+	if err != nil {
+		return fmt.Errorf("computing granted bytes: %w", err)
+	}
+	for _, dev := range devices {
+		if !dev.Healthy {
+			continue
+		}
+		// Scan #15: compare THIS card's usage against THIS card's grant, not the
+		// node-wide sum. On a multi-GPU node the old node-wide grant made every
+		// per-card overuse undetectable (one 16 GiB card's use vs a 128 GiB
+		// node grant is always hugely negative → the detector was a silent
+		// no-op on exactly the 8×GPU nodes it most needed to watch).
+		granted := grantedByCard[dev.UUID]
+		onset, overuse, violating := d.evaluate(dev.UUID, dev.UsedMemoryBytes, granted)
+		if os.Getenv("VGPU_VIOLATION_DEBUG") == "1" {
+			log.Printf("[violation-debug] card=%s used=%d granted=%d overuse=%d streak=%d violating=%v",
+				dev.UUID, dev.UsedMemoryBytes, granted, overuse, d.streak[dev.UUID], violating)
+		}
+		telemetry.NodeMemoryOveruseBytes.WithLabelValues(d.nodeName, dev.UUID).Set(float64(overuse))
+		telemetry.NodeMemoryViolationActive.WithLabelValues(d.nodeName, dev.UUID).Set(boolToFloat01(violating))
+		if onset {
+			d.emitEvent(dev.UUID, overuse, granted)
+		}
+	}
+	return nil
+}
+
+// evaluate applies the tolerance + hysteresis to one GPU and returns:
+//
+//	onset     — true exactly on the cycle the GPU transitions INTO violation
+//	overuse   — max(0, used - granted)
+//	violating — current sustained-violation state
+//
+// Pure except for the per-GPU streak/active maps, so it is directly unit-testable.
+func (d *ViolationDetector) evaluate(uuid string, used, granted int64) (onset bool, overuse int64, violating bool) {
+	if used > granted {
+		overuse = used - granted
+	}
+	if used-granted > overuseToleranceBytes {
+		d.streak[uuid]++
+	} else {
+		d.streak[uuid] = 0
+	}
+	violating = d.streak[uuid] >= overuseStreakThreshold
+	was := d.active[uuid]
+	d.active[uuid] = violating
+	onset = violating && !was
+	return onset, overuse, violating
+}
+
+// grantedBytesByCard sums RequestedVRAMBytes of capacity-holding slices bound to
+// this node, keyed by the PHYSICAL card each slice landed on (Status.DeviceUUID).
+// A slice not yet placed on a specific card (no DeviceUUID) holds no card's VRAM
+// and is skipped. On a single-GPU node this collapses to one entry equal to the
+// old node-wide total, so single-GPU behavior is unchanged.
+func (d *ViolationDetector) grantedBytesByCard(ctx context.Context) (map[string]int64, error) {
+	var slices vgpuv1alpha1.VGPUSliceList
+	if err := d.client.List(ctx, &slices); err != nil {
+		return nil, err
+	}
+	byCard := make(map[string]int64)
+	for i := range slices.Items {
+		s := &slices.Items[i]
+		if s.Spec.NodeName != d.nodeName {
+			continue
+		}
+		switch string(s.Status.Phase) {
+		case "", "Pending", "Released", "Failed":
+			continue
+		}
+		if s.Status.DeviceUUID == "" {
+			continue // not yet assigned a physical card
+		}
+		byCard[s.Status.DeviceUUID] += s.Spec.RequestedVRAMBytes
+	}
+	return byCard, nil
+}
+
+func (d *ViolationDetector) emitEvent(uuid string, overuse, granted int64) {
+	log.Printf("[violation] node=%s gpu=%s OVER-USE: process-used exceeds granted by %d MiB (granted=%d MiB) — observe-only, no eviction",
+		d.nodeName, uuid, overuse>>20, granted>>20)
+	if d.recorder == nil {
+		return
+	}
+	// Reference the Node by name without fetching it (no extra RBAC/Get).
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: d.nodeName}}
+	d.recorder.Eventf(node, corev1.EventTypeWarning, "MemoryViolation",
+		"Observed GPU %s memory usage exceeded granted VRAM by %d MiB for ~%ds (observe-only, no eviction)",
+		uuid, overuse>>20, overuseStreakThreshold*int(d.interval.Seconds()))
+}
+
+func boolToFloat01(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}

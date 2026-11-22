@@ -1,0 +1,50 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vgpu-nodeagent-role
+rules:
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuslices"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuslices/status"]
+    verbs: ["get", "patch", "update"]
+  # Phase 3.4b: attribute GPU processes to slices and mark violations.
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpuclaims", "vgpujobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["infrastructure.pranav2910.com"]
+    resources: ["vgpujobs/status"]
+    verbs: ["get", "patch", "update"]
+  # Phase 3.4c: soft enforcement stamps over-using pods with a violation label +
+  # annotations (and removes them on recovery) — labels/annotations only, never
+  # the pod spec, never eviction. "patch" is the merge-patch verb used for both.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch"]
+  # Phase 3.4d: opt-in eviction uses the PDB-respecting Eviction API (a create on
+  # the pods/eviction subresource — never a raw pod delete). Namespace read backs
+  # the enforcement-exempt opt-out at the namespace level.
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vgpu-nodeagent-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vgpu-nodeagent-role
+subjects:
+  - kind: ServiceAccount
+    name: vgpu-nodeagent-sa
+    namespace: vgpu-system

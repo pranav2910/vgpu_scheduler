@@ -1,0 +1,13 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vgpu-system
+  labels:
+    # Bug #30 — Pod Security Admission enforcement on the control-plane namespace.
+    # "privileged" profile is required because the NodeAgent DaemonSet needs
+    # privileged containers to talk to NVML. User workload namespaces should
+    # use "restricted" instead.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

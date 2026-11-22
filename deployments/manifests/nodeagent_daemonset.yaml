@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vgpu-nodeagent
+  namespace: vgpu-system
+  labels:
+    app: vgpu-nodeagent
+spec:
+  selector:
+    matchLabels:
+      app: vgpu-nodeagent
+  template:
+    metadata:
+      labels:
+        app: vgpu-nodeagent
+    spec:
+      serviceAccountName: vgpu-nodeagent-sa
+      containers:
+      - name: nodeagent
+        image: vgpu-nodeagent:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName # Dynamically injects the physical server's name
+        # Phase 3.1: the default (kind) image uses the fake GPU provider. Model
+        # the node's advertised 80 GiB so observed truth matches scheduler-
+        # assumed capacity (drift = 0). On real hardware, build -tags nvml and
+        # drop these — the NVML provider reports actual VRAM.
+        - name: VGPU_FAKE_GPU_MEM_BYTES
+          value: "85899345920"   # 80 GiB
+        - name: VGPU_EXPECTED_VRAM_BYTES
+          value: "85899345920"   # scheduler-assumed capacity, for the drift gauge
+        ports:
+        - name: metrics
+          containerPort: 8083
+        securityContext:
+          privileged: true # Required to talk directly to NVML and write to host directories
+        volumeMounts:
+        - name: cdi-dir
+          mountPath: /var/run/cdi
+        # Checkpoint persistence (scan fix): without this mount the allocator's
+        # restart-survival file dies with the container -> over-commit on restart.
+        - name: checkpoint-dir
+          mountPath: /var/lib/vgpu-state
+        - name: dev-dir
+          mountPath: /dev
+      # Land on tainted GPU nodes (gpu-operator sets nvidia.com/gpu:NoSchedule
+      # by default). Without this the agent never schedules onto the very nodes
+      # it must manage, and slices silently never become Ready (scan finding —
+      # the monitor DaemonSet already tolerated; the agent did not).
+      tolerations:
+        - operator: Exists
+      volumes:
+      - name: cdi-dir
+        hostPath:
+          path: /var/run/cdi
+      - name: checkpoint-dir
+        hostPath:
+          path: /var/lib/vgpu-state
+          type: DirectoryOrCreate
+          type: DirectoryOrCreate
+      - name: dev-dir
+        hostPath:
+          path: /dev
+          type: Directory

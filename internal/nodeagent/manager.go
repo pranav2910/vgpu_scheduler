@@ -1,0 +1,170 @@
+package nodeagent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"time"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/cdi"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/checkpoint"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/drift"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/nvml"
+	"github.com/pranav2910/vgpu-scheduler/internal/state"
+	"github.com/pranav2910/vgpu-scheduler/internal/telemetry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type Manager struct {
+	NodeName  string
+	Allocator *nvml.Allocator
+	Store     *checkpoint.Store
+	Reporter  *Reporter
+	Detector  *drift.Detector
+}
+
+// NewManager builds the node-agent manager. mock selects the allocator's
+// hardware mode; callers derive it from the build tag (gpu.RealBuild) so the
+// allocation path and the observation path agree on whether real hardware is
+// present.
+func NewManager(nodeName string, k8sClient client.Client, mock bool) *Manager {
+	store := checkpoint.NewStore()
+	allocator := nvml.NewAllocator(mock)
+	// Re-seed the allocator's per-card ledger from persisted checkpoints, so an
+	// agent restart doesn't forget which cards already host slices — a blank
+	// ledger would let best-fit over-promise cards that are actually committed.
+	if records, err := store.LoadAll(); err != nil {
+		log.Printf("[allocator] WARNING: could not load checkpoints to seed the per-card ledger (%v) — proceeding with an empty ledger", err)
+	} else {
+		for id, rec := range records {
+			allocator.RestoreAllocation(id, rec.SliceUID, rec.DeviceUUID, rec.AllocatedBytes)
+		}
+		if len(records) > 0 {
+			log.Printf("[allocator] per-card ledger re-seeded from %d checkpoint record(s)", len(records))
+		}
+	}
+	return &Manager{
+		NodeName:  nodeName,
+		Store:     store,
+		Allocator: allocator,
+		Reporter:  NewReporter(k8sClient),
+		Detector:  drift.NewDetector(store, allocator, k8sClient),
+	}
+}
+
+// ReconcileSlice drives a Slice through allocation or release based on its phase.
+func (m *Manager) ReconcileSlice(ctx context.Context, slice *vgpuv1alpha1.VGPUSlice) error {
+	// ALLOCATION PATH — Scheduled, and ALSO Allocating: a status write racing
+	// the controller/scheduler can fail with a conflict AFTER the Allocating
+	// phase persisted (seen live in a 32-slice burst). The retry then arrives
+	// at phase=Allocating; handling only Scheduled left it wedged forever,
+	// holding a committed ledger allocation its status never recorded. The
+	// whole sequence below is idempotent (the allocator returns the slice's
+	// existing allocation; CDI + checkpoint writes are same-name atomic), so
+	// re-driving from Allocating is safe.
+	if slice.DeletionTimestamp.IsZero() &&
+		(slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseScheduled) ||
+			slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseAllocating)) {
+		// 1. Announce Allocating (observability; no-op when re-driving).
+		if err := m.Reporter.TransitionToAllocating(ctx, slice); err != nil {
+			return fmt.Errorf("transitioning to Allocating: %w", err)
+		}
+
+		// 2. Physically allocate on the GPU.
+		req := nvml.AllocationRequest{
+			SliceUID:           string(slice.UID),
+			ClaimName:          slice.Spec.ClaimRef,
+			RequestedVRAMBytes: slice.Spec.RequestedVRAMBytes,
+		}
+		result, err := m.Allocator.Allocate(ctx, req)
+		if err != nil {
+			telemetry.RecordHardwareAllocation(m.NodeName, false)
+			// Fragmentation is IMPOSSIBLE, not transient: the node-pooled
+			// scheduler admitted a slice no single GPU can host. Fail the slice
+			// loud (terminal, reason on status, mirrored to the job) instead of
+			// retry-looping against the same arithmetic forever.
+			var frag *nvml.FragmentationError
+			if errors.As(err, &frag) {
+				log.Printf("[allocator] slice %s/%s FAILED LOUD: %s", slice.Namespace, slice.Name, frag.Error())
+				return m.Reporter.ReportAllocationFailed(ctx, slice, frag.Error())
+			}
+			return fmt.Errorf("NVML allocate: %w", err)
+		}
+		telemetry.RecordHardwareAllocation(m.NodeName, true)
+
+		// 3. Write the CDI firewall so containerd can bind the container to
+		//    this specific partition. The device is named by AllocationID to
+		//    match exactly what the mutating webhook requests (mutating_pod.go).
+		if err := cdi.GenerateFirewall(result.AllocationID, result.DeviceUUID); err != nil {
+			return fmt.Errorf("generating CDI firewall: %w", err)
+		}
+
+		// 4. Persist durable checkpoint for drift-detection after reboot.
+		if err := m.Store.Save(checkpoint.CheckpointRecord{
+			AllocationID:   result.AllocationID,
+			SliceUID:       req.SliceUID,
+			SliceName:      slice.Name,
+			Namespace:      slice.Namespace,
+			ClaimName:      req.ClaimName,
+			DeviceUUID:     result.DeviceUUID,
+			AllocatedBytes: result.AllocatedBytes,
+			NodeName:       m.NodeName,
+			CreatedAt:      time.Now(),
+		}); err != nil {
+			return fmt.Errorf("saving checkpoint: %w", err)
+		}
+
+		log.Printf("Successfully allocated hardware for %s (alloc=%s uuid=%s)",
+			req.SliceUID, result.AllocationID, result.DeviceUUID)
+		return m.Reporter.ReportAllocationReady(ctx, slice, result)
+	}
+
+	// RELEASE PATH
+	if slice.Status.Phase == vgpuv1alpha1.VGPUSlicePhase(state.SlicePhaseReleasing) ||
+		!slice.DeletionTimestamp.IsZero() {
+
+		// Guard: a slice deleted before ever reaching Allocating has no
+		// DeviceUUID / AllocationID. Bug C + Bug #8 co-fix.
+		//
+		// CDI teardown is keyed by AllocationID (the spec file is per-allocation;
+		// keying by DeviceUUID deleted the file SHARED by every slice on the GPU,
+		// revoking innocent neighbors — see cdi.GenerateFirewall).
+		if slice.Status.AllocationID != "" {
+			if err := cdi.TeardownFirewall(slice.Status.AllocationID); err != nil {
+				return fmt.Errorf("tearing down CDI firewall: %w", err)
+			}
+			if err := m.Allocator.Release(ctx, slice.Status.AllocationID); err != nil {
+				return fmt.Errorf("NVML release: %w", err)
+			}
+			if err := m.Store.Delete(slice.Status.AllocationID); err != nil {
+				return fmt.Errorf("deleting checkpoint: %w", err)
+			}
+		} else {
+			// WEDGE RECOVERY: a conflict-wedged slice can hold a committed
+			// allocation its status never recorded (AllocationID empty). The
+			// ledger remembers by slice UID — without this, deleting such a
+			// slice leaked its card bytes permanently (seen live: phantom
+			// commitments starving later allocations into fragmentation
+			// failures), plus an orphan CDI spec and checkpoint record.
+			if allocID, err := m.Allocator.ReleaseBySlice(ctx, string(slice.UID)); err != nil {
+				return fmt.Errorf("NVML release by slice: %w", err)
+			} else if allocID != "" {
+				log.Printf("[allocator] wedge recovery for %s/%s: released untracked allocation %s",
+					slice.Namespace, slice.Name, allocID)
+				if err := cdi.TeardownFirewall(allocID); err != nil {
+					return fmt.Errorf("tearing down CDI firewall (wedge recovery): %w", err)
+				}
+				if err := m.Store.Delete(allocID); err != nil {
+					return fmt.Errorf("deleting checkpoint (wedge recovery): %w", err)
+				}
+			}
+		}
+
+		log.Printf("Successfully released hardware for %s", slice.UID)
+		return m.Reporter.ReportReleaseComplete(ctx, slice)
+	}
+
+	return nil
+}
