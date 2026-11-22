@@ -1,0 +1,102 @@
+# AFTER: vGPU scheduler, byte-granular slices. 4 jobs x 16 GiB = 64 GiB,
+# all packed onto ONE 80 GiB GPU. Nothing Pending. Same hardware, 4x the work.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-0
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+  # podTemplate makes the controller create a real workload Pod once the slice is
+  # allocated (so the jobs reach Running, not just Scheduled). busybox on kind;
+  # on a real GPU node add  runtimeClassName: nvidia  so the device is injected.
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo 'packed onto a shared 80 GiB GPU'; sleep 3600"]
+          resources: {}
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-1
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+  # podTemplate makes the controller create a real workload Pod once the slice is
+  # allocated (so the jobs reach Running, not just Scheduled). busybox on kind;
+  # on a real GPU node add  runtimeClassName: nvidia  so the device is injected.
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo 'packed onto a shared 80 GiB GPU'; sleep 3600"]
+          resources: {}
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-2
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+  # podTemplate makes the controller create a real workload Pod once the slice is
+  # allocated (so the jobs reach Running, not just Scheduled). busybox on kind;
+  # on a real GPU node add  runtimeClassName: nvidia  so the device is injected.
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo 'packed onto a shared 80 GiB GPU'; sleep 3600"]
+          resources: {}
+---
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: packed-3
+  namespace: vgpu-demo
+  labels: { demo: after, group: packed }
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184   # 16 GiB
+      serviceTier: Guaranteed
+  # podTemplate makes the controller create a real workload Pod once the slice is
+  # allocated (so the jobs reach Running, not just Scheduled). busybox on kind;
+  # on a real GPU node add  runtimeClassName: nvidia  so the device is injected.
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workload
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo 'packed onto a shared 80 GiB GPU'; sleep 3600"]
+          resources: {}
+

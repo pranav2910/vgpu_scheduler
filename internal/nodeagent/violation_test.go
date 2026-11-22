@@ -1,0 +1,193 @@
+package nodeagent
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	vgpuv1alpha1 "github.com/pranav2910/vgpu-scheduler/api/v1alpha1"
+	"github.com/pranav2910/vgpu-scheduler/internal/nodeagent/gpu"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+)
+
+const giB = int64(1) << 30
+
+func TestEvaluate_HysteresisAndOnset(t *testing.T) {
+	d := NewViolationDetector(nil, "node-a", nil, nil, time.Second)
+	const uuid = "GPU-x"
+	granted := 40 * giB
+	over := granted + (512 << 20) // 512 MiB over → beyond the 256 MiB tolerance
+
+	// Under budget → never flagged, no overuse.
+	for i := 0; i < 3; i++ {
+		if onset, ov, viol := d.evaluate(uuid, 30*giB, granted); onset || viol || ov != 0 {
+			t.Fatalf("under budget should not flag: onset=%v ov=%d viol=%v", onset, ov, viol)
+		}
+	}
+
+	// Over budget must PERSIST overuseStreakThreshold cycles before flagging.
+	for i := 1; i <= overuseStreakThreshold; i++ {
+		onset, ov, viol := d.evaluate(uuid, over, granted)
+		if ov != over-granted {
+			t.Fatalf("cycle %d overuse: got %d want %d", i, ov, over-granted)
+		}
+		wantViol := i >= overuseStreakThreshold
+		if viol != wantViol {
+			t.Fatalf("cycle %d: viol=%v want %v", i, viol, wantViol)
+		}
+		if i == overuseStreakThreshold && !onset {
+			t.Fatalf("onset must fire on the threshold cycle")
+		}
+		if i < overuseStreakThreshold && onset {
+			t.Fatalf("onset fired early at cycle %d", i)
+		}
+	}
+
+	// Sustained → still violating, but onset is false (already active).
+	if onset, _, viol := d.evaluate(uuid, over, granted); onset || !viol {
+		t.Fatalf("sustained: onset=%v viol=%v (want false,true)", onset, viol)
+	}
+	// Back under budget → clears.
+	if _, _, viol := d.evaluate(uuid, 10*giB, granted); viol {
+		t.Fatalf("should clear once back under budget")
+	}
+}
+
+func TestEvaluate_WithinToleranceNotFlagged(t *testing.T) {
+	d := NewViolationDetector(nil, "node-a", nil, nil, time.Second)
+	granted := 40 * giB
+	// 100 MiB over — within the 256 MiB tolerance: reported as overuse, never flagged.
+	for i := 0; i < overuseStreakThreshold+2; i++ {
+		_, ov, viol := d.evaluate("g", granted+(100<<20), granted)
+		if viol {
+			t.Fatalf("within tolerance must not flag a violation")
+		}
+		if ov != 100<<20 {
+			t.Fatalf("overuse should still report 100 MiB, got %d", ov)
+		}
+	}
+}
+
+func nodeAgentScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatalf("clientgo AddToScheme: %v", err)
+	}
+	if err := vgpuv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	return s
+}
+
+func mkSlice(name, node, phase string, req int64) *vgpuv1alpha1.VGPUSlice {
+	return mkSliceOnCard(name, node, phase, req, "GPU-card-default")
+}
+
+func mkSliceOnCard(name, node, phase string, req int64, uuid string) *vgpuv1alpha1.VGPUSlice {
+	return &vgpuv1alpha1.VGPUSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       vgpuv1alpha1.VGPUSliceSpec{NodeName: node, RequestedVRAMBytes: req},
+		Status:     vgpuv1alpha1.VGPUSliceStatus{Phase: vgpuv1alpha1.VGPUSlicePhase(phase), DeviceUUID: uuid},
+	}
+}
+
+func TestGrantedBytes_SumsBoundActiveSlicesOnNode(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(nodeAgentScheme(t)).WithObjects(
+		mkSlice("a", "node-a", "Ready", 10*giB),      // counts
+		mkSlice("b", "node-a", "Allocating", 10*giB), // counts (bound + active)
+		mkSlice("c", "node-a", "Pending", 10*giB),    // skip (not bound)
+		mkSlice("d", "node-a", "Failed", 10*giB),     // skip (terminal)
+		mkSlice("e", "node-b", "Ready", 10*giB),      // skip (other node)
+	).Build()
+	d := NewViolationDetector(c, "node-a", nil, nil, time.Second)
+
+	byCard, err := d.grantedBytesByCard(context.Background())
+	if err != nil {
+		t.Fatalf("grantedBytesByCard: %v", err)
+	}
+	var total int64
+	for _, v := range byCard {
+		total += v
+	}
+	if total != 20*giB {
+		t.Fatalf("granted total: got %d want %d (a + b only)", total, 20*giB)
+	}
+}
+
+// Scan #15 regression: on a MULTI-GPU node the grant must be per-card. Two 16 GiB
+// cards, each granted 10 GiB. Card A physically uses 12 GiB — 2 GiB over ITS OWN
+// grant. The old node-wide grant (20 GiB) made 12 GiB look 8 GiB UNDER budget, so
+// the detector never fired on any multi-GPU node. Per-card, card A must flag while
+// card B (using 4 GiB, under its 10 GiB) stays clean.
+func TestGrantedBytesByCard_MultiGPU_PerCardIsolatesOveruse(t *testing.T) {
+	const cardA, cardB = "GPU-aaaa", "GPU-bbbb"
+	c := fake.NewClientBuilder().WithScheme(nodeAgentScheme(t)).WithObjects(
+		mkSliceOnCard("a", "node-a", "Ready", 10*giB, cardA),
+		mkSliceOnCard("b", "node-a", "Ready", 10*giB, cardB),
+	).Build()
+	d := NewViolationDetector(c, "node-a", nil, nil, time.Second)
+
+	byCard, err := d.grantedBytesByCard(context.Background())
+	if err != nil {
+		t.Fatalf("grantedBytesByCard: %v", err)
+	}
+	if byCard[cardA] != 10*giB || byCard[cardB] != 10*giB {
+		t.Fatalf("per-card grant: got A=%d B=%d, want 10Gi each (node-wide sum would be 20Gi and hide overuse)", byCard[cardA], byCard[cardB])
+	}
+	// Card A 2 GiB over its own grant → flags after the streak; card B clean.
+	for i := 0; i < overuseStreakThreshold; i++ {
+		d.evaluate(cardA, 12*giB, byCard[cardA])
+		d.evaluate(cardB, 4*giB, byCard[cardB])
+	}
+	if _, _, viol := d.evaluate(cardA, 12*giB, byCard[cardA]); !viol {
+		t.Fatal("card A over its per-card grant must violate (the whole point of scan #15)")
+	}
+	if _, _, viol := d.evaluate(cardB, 4*giB, byCard[cardB]); viol {
+		t.Fatal("card B under its per-card grant must NOT violate")
+	}
+}
+
+// Tier-3 torture finding: the detector consumed stale/errored snapshots as a
+// SILENT nil — gauges froze at pre-blindness values for minutes with nothing
+// on metrics or logs. Staleness must skip evaluation AND be loudly visible.
+func TestDetectOnce_StaleSnapshotSkipsLoudly(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(nodeAgentScheme(t)).WithObjects(
+		mkSliceOnCard("a", "node-a", "Ready", 10*giB, "GPU-x"),
+	).Build()
+	inv := gpu.NewInventory()
+	d := NewViolationDetector(c, "node-a", inv, nil, 30*time.Second)
+	base := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return base }
+
+	// 1. errored snapshot (MarkError retains stale devices) → skip, no streak
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base.Add(-10*time.Second))
+	inv.MarkError(base, "nvml exploded")
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 0 {
+		t.Fatalf("errored snapshot must not advance streaks (got %d)", d.streak["GPU-x"])
+	}
+
+	// 2. old-but-error-free snapshot (age > 3x interval) → also skip
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base.Add(-5*time.Minute))
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 0 {
+		t.Fatalf("stale snapshot must not advance streaks (got %d)", d.streak["GPU-x"])
+	}
+
+	// 3. fresh snapshot → evaluation resumes and the streak builds
+	inv.Update([]gpu.GPUDevice{{UUID: "GPU-x", Healthy: true, UsedMemoryBytes: 15 * giB}}, base)
+	if err := d.detectOnce(context.Background()); err != nil {
+		t.Fatalf("detectOnce: %v", err)
+	}
+	if d.streak["GPU-x"] != 1 {
+		t.Fatalf("fresh snapshot must evaluate (streak got %d, want 1)", d.streak["GPU-x"])
+	}
+}

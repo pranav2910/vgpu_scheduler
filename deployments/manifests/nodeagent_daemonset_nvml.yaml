@@ -1,0 +1,104 @@
+# Real-GPU node agent (Phase 3.1b validation on g5 / any NVIDIA node).
+#
+# Differs from nodeagent_daemonset.yaml (the default fake-provider DaemonSet):
+#   - uses the NVML-tagged image (build: make docker-build-nodeagent-nvml)
+#   - requests driver + device injection from the NVIDIA container toolkit
+#     (NVIDIA_VISIBLE_DEVICES + NVIDIA_DRIVER_CAPABILITIES=utility) so go-nvml can
+#     dlopen libnvidia-ml.so.1 and read the GPUs — WITHOUT exclusively allocating
+#     a GPU via the device plugin (this agent only OBSERVES).
+#   - drops the VGPU_FAKE_* knobs (the real provider reads actual hardware).
+#
+# Apply ON the GPU node's cluster, replacing the fake DaemonSet:
+#   make docker-build-nodeagent-nvml
+#   # load/push vgpu-nodeagent:nvml to the node's registry
+#   kubectl apply -f deployments/manifests/nodeagent_daemonset_nvml.yaml
+#
+# If your cluster's default container runtime is NOT the nvidia runtime, also set
+# spec.template.spec.runtimeClassName: nvidia (uncommented below).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vgpu-nodeagent
+  namespace: vgpu-system
+  labels:
+    app: vgpu-nodeagent
+spec:
+  selector:
+    matchLabels:
+      app: vgpu-nodeagent
+  template:
+    metadata:
+      labels:
+        app: vgpu-nodeagent
+    spec:
+      serviceAccountName: vgpu-nodeagent-sa
+      # Phase 3.4b: see host PIDs so the agent can read /proc/<pid>/cgroup and
+      # attribute NVML-reported GPU processes (host PIDs) to their pod/slice.
+      hostPID: true
+      # Uncomment if the nvidia runtime is not the node default:
+      # runtimeClassName: nvidia
+      containers:
+      - name: nodeagent
+        image: vgpu-nodeagent:nvml
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Ask the NVIDIA container toolkit to inject the driver + all GPUs.
+        # "utility" exposes NVML + nvidia-smi (no compute/graphics needed here).
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "utility"
+        # Runtime enforcement mode:
+        #   off      — 3.4b marking only (no pod surfaces)
+        #   softwarn — (default, 3.4c) label/annotate over-using pods + record the
+        #              decision on the slice/job; NEVER evicts/throttles/phase-fails,
+        #              and reverses every surface on recovery
+        #   evict    — (3.4d, opt-in) everything softwarn does, PLUS evicting a pod
+        #              that stays over-budget past the eviction deadline. Uses the
+        #              PDB-respecting Eviction API (never a raw delete), is rate-
+        #              limited per node, and skips pods/namespaces labeled
+        #              infrastructure.pranav2910.com/enforcement-exempt=true.
+        # Default is the non-destructive softwarn; set "evict" only deliberately.
+        - name: VGPU_ENFORCEMENT_MODE
+          value: "softwarn"
+        # Optional: scheduler-assumed capacity for the drift gauge. Set to the
+        # node's advertised vgpu-bytes if you want vgpu_gpu_capacity_drift_bytes.
+        # - name: VGPU_EXPECTED_VRAM_BYTES
+        #   value: "23609344000"   # e.g. one A10G (~22 GiB) — match your node
+        ports:
+        - name: metrics
+          containerPort: 8083
+        securityContext:
+          privileged: true # direct NVML + host device access
+        volumeMounts:
+        - name: cdi-dir
+          mountPath: /var/run/cdi
+        # Checkpoint persistence (scan fix): without this mount the allocator's
+        # restart-survival file dies with the container -> over-commit on restart.
+        - name: checkpoint-dir
+          mountPath: /var/lib/vgpu-state
+        - name: dev-dir
+          mountPath: /dev
+      # Land on tainted GPU nodes (gpu-operator sets nvidia.com/gpu:NoSchedule
+      # by default). Without this the agent never schedules onto the very nodes
+      # it must manage, and slices silently never become Ready (scan finding —
+      # the monitor DaemonSet already tolerated; the agent did not).
+      tolerations:
+        - operator: Exists
+      volumes:
+      - name: cdi-dir
+        hostPath:
+          path: /var/run/cdi
+      - name: checkpoint-dir
+        hostPath:
+          path: /var/lib/vgpu-state
+          type: DirectoryOrCreate
+          type: DirectoryOrCreate
+      - name: dev-dir
+        hostPath:
+          path: /dev
+          type: Directory

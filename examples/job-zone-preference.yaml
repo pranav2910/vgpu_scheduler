@@ -1,0 +1,17 @@
+# Soft zone placement. First label your nodes (admin, once):
+#   kubectl label node <node-a> topology.vgpu.pranav2910.com/zone=zone-fast
+#   kubectl label node <node-b> topology.vgpu.pranav2910.com/zone=zone-cheap
+# The hint is a PREFERENCE, not a pin: if zone-fast is full, the job still
+# runs elsewhere, and the slice's TopologyPreferenceSatisfied condition
+# records honestly whether the hint was honored.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: prefers-fast-zone
+  annotations:
+    topology.vgpu.pranav2910.com/preferred-zone: zone-fast
+spec:
+  claimTemplate:
+    spec:
+      requestedVramBytes: 4294967296       # 4 GiB
+      serviceTier: Guaranteed

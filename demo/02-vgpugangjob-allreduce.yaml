@@ -1,0 +1,31 @@
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUGangJob
+metadata:
+  name: ddp-allreduce
+  namespace: vgpu-demo
+  labels:
+    app: ddp-allreduce
+    demo: gang
+spec:
+  # N identical workers that must be scheduled together (2-256).
+  gangSize: 4
+  # v1 strict gang: minAvailable MUST equal gangSize (webhook enforces it).
+  # The field exists for forward-compat with elastic gangs (v2); set it == gangSize.
+  minAvailable: 4
+  # How long the gang may sit in 'Reserving' before it fails back and frees
+  # whatever it tentatively held (10-600s, default 60). Keeps a too-big gang
+  # from squatting on capacity forever.
+  reservationTimeoutSeconds: 60
+  # Applied to every child rank (0-1000).
+  priority: 200
+  # Propagated to every child. Gangs default to Training; be explicit.
+  workloadClass: Training
+  preemptible: false
+  # Per-WORKER resource shape. Every rank gets an identical slice
+  # (gang scheduling assumes homogeneous members).
+  podTemplate:
+    spec:
+      # 12 GiB per rank (12 * 1024^3). 4 ranks x 12 GiB = 48 GiB total.
+      requestedVramBytes: 12884901888
+      serviceTier: Guaranteed
+

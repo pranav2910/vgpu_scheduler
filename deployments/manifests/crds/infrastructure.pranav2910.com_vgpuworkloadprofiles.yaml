@@ -1,0 +1,80 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vgpuworkloadprofiles.infrastructure.pranav2910.com
+spec:
+  group: infrastructure.pranav2910.com
+  names:
+    kind: VGPUWorkloadProfile
+    listKind: VGPUWorkloadProfileList
+    plural: vgpuworkloadprofiles
+    singular: vgpuworkloadprofile
+    shortNames: [vgpuprofile, vgpuprof]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Requested
+          type: integer
+          jsonPath: .status.requestedVramBytes
+        - name: Peak
+          type: integer
+          jsonPath: .status.peakObservedVramBytes
+        - name: Recommended
+          type: integer
+          jsonPath: .status.recommendedVramBytes
+        - name: Confidence
+          type: string
+          jsonPath: .status.confidence
+        - name: Evictions
+          type: integer
+          jsonPath: .status.evictionCount
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: Learned GPU-memory behavior of a workload (observe-only, Phase 3.5).
+          properties:
+            apiVersion: { type: string }
+            kind:       { type: string }
+            metadata:   { type: object }
+            spec:
+              type: object
+              properties:
+                workloadRef:
+                  type: string
+                  description: Name of the VGPUJob this profile aggregates.
+            status:
+              type: object
+              properties:
+                observations:          { type: integer, format: int64 }
+                requestedVramBytes:    { type: integer, format: int64 }
+                peakObservedVramBytes: { type: integer, format: int64 }
+                avgObservedVramBytes:  { type: integer, format: int64 }
+                recommendedVramBytes:  { type: integer, format: int64 }
+                violationCount:        { type: integer, format: int64 }
+                softWarnCount:         { type: integer, format: int64 }
+                evictionCount:         { type: integer, format: int64 }
+                confidence:
+                  type: string
+                  enum: [Low, Medium, High]
+                lastUpdated: { type: string, format: date-time }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, lastTransitionTime, reason, message]
+                    properties:
+                      type:    { type: string, maxLength: 316 }
+                      status:  { type: string, enum: ["True", "False", "Unknown"] }
+                      observedGeneration: { type: integer, format: int64, minimum: 0 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      reason:  { type: string, minLength: 1, maxLength: 1024 }
+                      message: { type: string, maxLength: 32768 }

@@ -1,0 +1,1053 @@
+#!/usr/bin/env bash
+# vgpu — a thin, zero-dependency CLI for the infrastructure.pranav2910.com vGPU
+# scheduler. It wraps kubectl so an ML engineer never has to hand-author a
+# VGPUJob, a claim-ref pod, or remember the CRD field names.
+#
+#   vgpu submit --name llama --vram 16Gi --image pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+#   vgpu status  llama
+#   vgpu profile llama
+#
+# Install: cp to scripts/vgpu, chmod +x. Requires kubectl on PATH with a working
+# context. (jq is not required — all reads use kubectl jsonpath.)
+set -euo pipefail
+
+GROUP="infrastructure.pranav2910.com"
+APIVERSION="${GROUP}/v1alpha1"
+CLAIM_ANNOTATION="${GROUP}/claim-ref"
+RECOMMENDED_ANNOTATION="${GROUP}/recommended-vram-bytes"
+OVERRIDE_ANNOTATION="${GROUP}/override-recommendation"
+AUTORESIZED_ANNOTATION="${GROUP}/autoresized"
+ORIGINAL_VRAM_ANNOTATION="${GROUP}/original-vram-bytes"
+AUTORESIZED_VRAM_ANNOTATION="${GROUP}/autoresized-vram-bytes"
+CLAIM_LABEL="vgpu-claim"
+NS_DEFAULT="default"
+VGPU_VERSION="dev"   # replaced with the git tag at release time (see .github/workflows/release.yaml)
+
+die()  { printf 'vgpu: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# kubectl is required only by the cluster commands (submit/status/profile), NOT by
+# `version`/`help` — so the published CLI can be downloaded and inspected without a
+# cluster (and CI can run `vgpu version` on a runner that has no kubectl).
+need_kubectl() { have kubectl || die "kubectl not found on PATH"; }
+
+# ── byte parsing: "16Gi" / "512Mi" / "8G" / "1073741824" -> integer bytes ─────
+# Ki/Mi/Gi/Ti are 1024-based, K/M/G/T are 1000-based (Kubernetes quantity rules),
+# case-insensitive. A plain integer passes through unchanged.
+to_bytes() {
+    local q="$1" num unit
+    [[ "$q" =~ ^([0-9]+)([KkMmGgTt]i?|[Bb])?$ ]] \
+        || die "invalid VRAM quantity '$q' (use e.g. 16Gi, 512Mi, 8G, or a raw byte count)"
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    # Overflow guard: bash arithmetic wraps silently at 2^64 (a 2^64+1 input
+    # wrapped to 1 and sailed past validation — scan finding). 15 digits
+    # (~900 TiB as raw bytes, absurdly high with any unit) is a safe ceiling.
+    [[ ${#num} -le 15 ]] || die "VRAM quantity '$q' is beyond any plausible value"
+    case "$unit" in
+        ""|B|b)        echo  "$num" ;;
+        Ki|ki)         echo "$(( num * 1024 ))" ;;
+        Mi|mi)         echo "$(( num * 1024 * 1024 ))" ;;
+        Gi|gi)         echo "$(( num * 1024 * 1024 * 1024 ))" ;;
+        Ti|ti)         echo "$(( num * 1024 * 1024 * 1024 * 1024 ))" ;;
+        K|k)           echo "$(( num * 1000 ))" ;;
+        M|m)           echo "$(( num * 1000000 ))" ;;
+        G|g)           echo "$(( num * 1000000000 ))" ;;
+        T|t)           echo "$(( num * 1000000000000 ))" ;;
+        *)             die "invalid VRAM unit in '$q'" ;;
+    esac
+}
+
+# Human-readable bytes for display (GiB to 1 decimal, MiB whole, else raw).
+human() {
+    local b="${1:-0}"
+    [[ "$b" =~ ^[0-9]+$ ]] || { echo "$b"; return; }
+    if (( b >= 1073741824 )); then
+        awk -v b="$b" 'BEGIN{ printf "%.1f GiB", b/1073741824 }'
+    elif (( b >= 1048576 )); then
+        awk -v b="$b" 'BEGIN{ printf "%.0f MiB", b/1048576 }'
+    else
+        echo "${b} B"
+    fi
+}
+
+# kubectl get <type> <name> -n <ns> -o jsonpath=<path>; empty string if absent.
+kget() {
+    local type="$1" name="$2" ns="$3" path="$4"
+    kubectl get "$type" "$name" -n "$ns" -o jsonpath="$path" 2>/dev/null || true
+}
+
+usage() {
+    cat <<EOF
+vgpu — submit and observe GPU workloads on the vGPU scheduler
+
+USAGE:
+  vgpu submit --name NAME --vram SIZE --image IMAGE [options]
+  vgpu status  NAME [-n NAMESPACE]
+  vgpu profile NAME [-n NAMESPACE]
+  vgpu report  [--price-per-gpu-hour N] [-o table|csv|json]
+               [--filter-ns NS] [--top N] [-n MONITOR_NS]  # read-only GPU waste report: per-pod
+                                                           # requested-vs-used + node + GPU UUID,
+                                                           # top wasting pods/namespaces/teams
+                                                           # (teams: namespace label, VGPU_TEAM_LABEL)
+  vgpu install monitor [--no-wait] [--manifest PATH]     # install the read-only monitor DaemonSet
+  vgpu uninstall monitor                                 # remove it COMPLETELY (verified; incl. cluster-scoped RBAC)
+  vgpu doctor                                            # diagnose the cluster: every missing dependency, with a fix
+  vgpu support-bundle [--out FILE]                       # collect redacted diagnostics into a tar.gz
+  vgpu security audit                                    # print the blast radius — VERIFIED against live RBAC
+  vgpu version
+
+SUBMIT OPTIONS:
+  --name NAME          workload name (required; becomes the VGPUJob name)
+  --vram SIZE          VRAM request, e.g. 16Gi / 512Mi / 8G (required)
+  --image IMAGE        container image to run (required)
+  --priority N         scheduling priority 0-1000 (default 50)
+  --class CLASS        Training|Inference|Batch|Interactive (default Training)
+  --tier TIER          Guaranteed|BestEffort (default Guaranteed)
+  -n, --namespace NS   target namespace (default ${NS_DEFAULT})
+  --command 'CMD'      override container command (shell string)
+  --node NODE          pin the pod to a node (demo/no-scheduler setups)
+  --runtime-class RC   pod runtimeClassName (real GPU nodes: --runtime-class nvidia)
+  --override           run under a requireOverride policy even if below the
+                       profile's recommended VRAM (i.e. submit undersized on purpose)
+  --wait SECONDS       how long to wait for the controller to place the pod (default 120)
+  --no-wait            return immediately after applying the VGPUJob
+  --dry-run            print the VGPUJob manifest, do not apply
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# submit: render ONE VGPUJob (claimTemplate + podTemplate) and apply it. The
+# controller OWNS the workload Pod — once the slice is allocated it creates the
+# Pod from podTemplate (stamping the claim-ref the mutating webhook injects the
+# GPU into). So `vgpu submit` and a hand-written `kubectl apply -f job.yaml` are
+# identical: the VGPUJob is the single source of truth. No separate pod, no
+# wait-then-apply dance — that all moved into the controller.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_submit() {
+    need_kubectl
+    local name="" vram="" image="" priority=50 class="Training" tier="Guaranteed"
+    local ns="$NS_DEFAULT" command_override="" node="" runtime_class="" dry_run=0 wait_secs=120 override=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)            name="$2"; shift 2 ;;
+            --vram)            vram="$2"; shift 2 ;;
+            --image)           image="$2"; shift 2 ;;
+            --priority)        priority="$2"; shift 2 ;;
+            --class)           class="$2"; shift 2 ;;
+            --tier)            tier="$2"; shift 2 ;;
+            -n|--namespace)    ns="$2"; shift 2 ;;
+            --command)         command_override="$2"; shift 2 ;;
+            --node)            node="$2"; shift 2 ;;
+            --runtime-class)   runtime_class="$2"; shift 2 ;;
+            --override)        override=1; shift ;;
+            --wait)            wait_secs="$2"; shift 2 ;;
+            --no-wait)         wait_secs=0; shift ;;
+            --dry-run)         dry_run=1; shift ;;
+            -h|--help)         usage; exit 0 ;;
+            *)                 die "unknown submit flag: $1" ;;
+        esac
+    done
+    [[ -n "$name"  ]] || die "submit requires --name"
+    [[ "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "invalid --name '$name': must be lowercase alphanumeric/dashes (RFC 1123), e.g. my-job-2"
+    [[ -n "$vram"  ]] || die "submit requires --vram"
+    [[ -n "$image" ]] || die "submit requires --image"
+
+    local bytes; bytes="$(to_bytes "$vram")"
+    # No upper bound HERE: card sizes grow (H100 NVL 94G, H200 141G, B200 192G)
+    # and the fleet's real ceiling is enforced server-side by the validating
+    # webhook. The client only rejects the nonsensical.
+    (( bytes >= 1 )) || die "VRAM $vram must be at least 1 byte"
+
+    # A workload's size is immutable once admitted (the claim/slice/pod are
+    # materialized from the template exactly once) — re-submitting an existing
+    # name would at best no-op and at worst mislead. Fail loud with the fix.
+    if [[ "$dry_run" != 1 ]] && kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1; then
+        local curbytes
+        curbytes="$(kget vgpujob "$name" "$ns" '{.spec.claimTemplate.spec.requestedVramBytes}')"
+        die "a VGPUJob '$name' already exists in namespace '$ns' (requested $(human "${curbytes:-0}")).
+       Its size is immutable after admission. To change it:
+           kubectl delete vgpujob $name -n $ns    # then re-run this submit
+       To inspect it instead:  vgpu status $name -n $ns"
+    fi
+
+    # Deterministic names mirror the controller exactly:
+    #   job=NAME -> claim=NAME-claim -> slice=NAME-claim-slice -> pod=NAME-workload
+    local claim="${name}-claim"
+    local slice="${claim}-slice"
+    local pod="${name}-workload"
+
+    # Optional container command block (YAML), only emitted when overridden.
+    # JSON-escape so it is a valid YAML flow-sequence string (JSON is valid YAML);
+    # %q would emit shell escaping (backslashes), which is NOT valid YAML. Indented
+    # 8 spaces to sit under spec.podTemplate.spec.containers[].
+    local cmd_block=""
+    if [[ -n "$command_override" ]]; then
+        local esc="${command_override//\\/\\\\}"   # backslash -> \\
+        esc="${esc//\"/\\\"}"                       # double-quote -> \"
+        esc="${esc//$'\n'/\\n}"                     # newline -> \n : YAML folds raw
+        esc="${esc//$'\r'/\\r}"                     # newlines in a "..." scalar into
+        esc="${esc//$'\t'/\\t}"                     # SPACES, space-joining multi-line
+                                                    # programs into a syntax error
+        cmd_block='        command: ["/bin/sh","-c"]'$'\n''        args: ["'"$esc"'"]'$'\n'
+    fi
+    # Optional pod-spec fields, indented 6 spaces (under spec.podTemplate.spec).
+    # runtimeClassName is required on real GPU nodes so the NVIDIA runtime acts on
+    # the injected device (--runtime-class nvidia); omit on kind. nodeName pins the
+    # pod (demo/no-scheduler clusters).
+    local node_block="" rtc_block=""
+    [[ -n "$node" ]]          && node_block="      nodeName: ${node}"$'\n'
+    [[ -n "$runtime_class" ]] && rtc_block="      runtimeClassName: ${runtime_class}"$'\n'
+
+    # 3.7: --override stamps the VGPUJob so a `requireOverride` policy admits an
+    # under-provisioned request (i.e. "I know it's below the recommendation — run it").
+    local override_block=""
+    [[ $override -eq 1 ]] && override_block="  annotations:"$'\n'"    ${OVERRIDE_ANNOTATION}: \"true\""$'\n'
+
+    # ONE manifest: the VGPUJob now carries the podTemplate, so the controller
+    # owns the whole chain (claim -> slice -> pod). The controller stamps the
+    # claim-ref label+annotation on the pod itself, so we don't need them here.
+    local job_manifest
+    job_manifest=$(cat <<EOF
+apiVersion: ${APIVERSION}
+kind: VGPUJob
+metadata:
+  name: ${name}
+  namespace: ${ns}
+${override_block}spec:
+  priority: ${priority}
+  workloadClass: ${class}
+  claimTemplate:
+    spec:
+      requestedVramBytes: ${bytes}
+      serviceTier: ${tier}
+  podTemplate:
+    spec:
+      restartPolicy: Never
+${rtc_block}${node_block}      containers:
+      - name: workload
+        image: ${image}
+${cmd_block}        resources: {}
+EOF
+)
+
+    if (( dry_run )); then
+        printf '%s\n' "$job_manifest"
+        return 0
+    fi
+
+    # Apply the single VGPUJob. The controller materializes VGPUClaim/${claim},
+    # the scheduler binds VGPUSlice/${slice}, and once it is allocated the
+    # controller creates Pod/${pod} (the mutating webhook injects the GPU).
+    local apply_out
+    if ! apply_out="$(printf '%s\n' "$job_manifest" | kubectl apply -f - 2>&1)"; then
+        # 3.7: a requireOverride policy rejects an under-provisioned request — turn
+        # the raw admission error into an actionable hint.
+        if printf '%s' "$apply_out" | grep -qiE 'denied|override-recommendation|recommended'; then
+            printf 'vgpu: submission rejected by the recommendation policy:\n  %s\n' \
+                "$(printf '%s' "$apply_out" | tail -1)" >&2
+            printf '  → raise --vram to the recommended size (see: vgpu profile %s), or\n' "$name" >&2
+            printf '    re-submit with --override to run undersized on purpose.\n' >&2
+            exit 1
+        fi
+        die "applying VGPUJob failed: $(printf '%s' "$apply_out" | tail -1)"
+    fi
+    printf 'submitted: %s  (%s VRAM, class=%s, tier=%s, ns=%s%s)\n' \
+        "$name" "$(human "$bytes")" "$class" "$tier" "$ns" "$( ((override)) && printf ', override=on' )"
+    printf '  VGPUJob/%s  ->  VGPUClaim/%s  ->  VGPUSlice/%s  ->  Pod/%s  (all by the controller)\n' \
+        "$name" "$claim" "$slice" "$pod"
+
+    if (( wait_secs > 0 )); then
+        printf '  waiting up to %ss for the controller to place the workload...\n' "$wait_secs"
+        local waited=0 podphase=""
+        while (( waited < wait_secs )); do
+            podphase="$(kget pod "$pod" "$ns" '{.status.phase}')"
+            [[ -n "$podphase" ]] && break
+            sleep 3; waited=$((waited+3))
+        done
+        if [[ -n "$podphase" ]]; then
+            printf '  workload pod created by the controller (phase=%s)\n' "$podphase"
+        else
+            local sp; sp="$(kget vgpuslice "$slice" "$ns" '{.status.phase}')"
+            printf '  pod not created yet (slice phase=%s) after %ss — the controller\n' "${sp:-<none>}" "$wait_secs" >&2
+            printf '  creates it once the slice is allocated. Inspect:  vgpu status %s\n' "$name" >&2
+        fi
+    fi
+    printf '  next:  vgpu status %s\n' "$name"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# status: one line per layer of the stack — Job -> Claim -> Slice -> Pod — so an
+# engineer can see exactly where a workload is in the pipeline and on which node.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+    need_kubectl
+    local name="" ns="$NS_DEFAULT"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace) ns="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            -*)             die "unknown status flag: $1" ;;
+            *)              name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "status requires a NAME"
+
+    local claim slice pod
+    claim="${name}-claim"; slice="${claim}-slice"; pod="${name}-workload"
+
+    kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1 \
+        || die "no VGPUJob '$name' in namespace '$ns' (did you 'vgpu submit'?)"
+
+    local job_phase claim_phase bound slice_phase node alloc pod_phase req
+    job_phase="$(kget vgpujob   "$name"  "$ns" '{.status.phase}')"
+    req="$(kget vgpujob "$name" "$ns" '{.spec.claimTemplate.spec.requestedVramBytes}')"
+    claim_phase="$(kget vgpuclaim "$claim" "$ns" '{.status.phase}')"
+    bound="$(kget vgpuclaim "$claim" "$ns" '{.status.boundSliceName}')"
+    slice_phase="$(kget vgpuslice "$slice" "$ns" '{.status.phase}')"
+    node="$(kget vgpuslice "$slice" "$ns" '{.spec.nodeName}')"
+    alloc="$(kget vgpuslice "$slice" "$ns" '{.status.allocationId}')"
+    pod_phase="$(kget pod "$pod" "$ns" '{.status.phase}')"
+
+    printf 'workload %s  (ns=%s, requested %s)\n' "$name" "$ns" "$(human "${req:-0}")"
+    printf '  Job    %-12s %s\n' "${job_phase:-<none>}"   "VGPUJob/$name"
+    # A finished workload's grant is auto-released (claim+slice torn down, VRAM
+    # returned). Say so — '<none>' would read like something went missing.
+    if [[ -z "$claim_phase" && ( "$job_phase" == "Succeeded" || "$job_phase" == "Failed" || "$job_phase" == "Completed" ) ]]; then
+        printf '  Claim  %-12s %s\n' "Released" "VGPUClaim/$claim  (workload finished — VRAM grant returned)"
+        printf '  Slice  %-12s %s\n' "Released" "VGPUSlice/$slice  (freed for other workloads)"
+    else
+        printf '  Claim  %-12s %s%s\n' "${claim_phase:-<none>}" "VGPUClaim/$claim" \
+            "$( [[ -n "$bound" ]] && printf '  bound=%s' "$bound" )"
+        printf '  Slice  %-12s %s%s%s\n' "${slice_phase:-<none>}" "VGPUSlice/$slice" \
+            "$( [[ -n "$node"  ]] && printf '  node=%s'  "$node" )" \
+            "$( [[ -n "$alloc" ]] && printf '  alloc=%s' "$alloc" )"
+    fi
+    printf '  Pod    %-12s Pod/%s\n' "${pod_phase:-<none>}" "$pod"
+
+    # Surface the learned advisory inline if the feedback loop has flagged it.
+    local adv
+    adv="$(kget vgpujob "$name" "$ns" \
+        '{.status.conditions[?(@.type=="Underprovisioned")].status}')"
+    if [[ "$adv" == "True" ]]; then
+        local rec
+        rec="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${RECOMMENDED_ANNOTATION//./\\.}}")"
+        printf '  ! underprovisioned — recommended %s  (run: vgpu profile %s)\n' \
+            "$(human "${rec:-0}")" "$name"
+    fi
+
+    # 3.7b: surface an autoResize if the mutating webhook raised this job's request.
+    local ar
+    ar="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${AUTORESIZED_ANNOTATION//./\\.}}")"
+    if [[ "$ar" == "true" ]]; then
+        local orig newv capd
+        orig="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${ORIGINAL_VRAM_ANNOTATION//./\\.}}")"
+        newv="$(kget vgpujob "$name" "$ns" "{.metadata.annotations.${AUTORESIZED_VRAM_ANNOTATION//./\\.}}")"
+        printf '  ^ auto-resized %s -> %s  (policy raised your request to the recommendation)\n' \
+            "$(human "${orig:-0}")" "$(human "${newv:-0}")"
+        capd="$(kget vgpujob "$name" "$ns" '{.status.conditions[?(@.type=="AutoResizeCapped")].status}')"
+        [[ "$capd" == "True" ]] && \
+            printf '    (capped at fleet max — workload may need a larger GPU class or model parallelism)\n'
+    fi
+    # Trailing `[[ ]] &&` chains above return 1 when their condition is false —
+    # under set -e that made `vgpu status` EXIT 1 for perfectly healthy jobs
+    # (every autoresized-but-not-capped job; scan finding). Status reporting
+    # succeeded if we got here.
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# profile: the learned GPU-memory behavior — recommended vs requested, peak,
+# confidence, and the under-provisioning verdict. The product's edge:
+# "you asked for X, you actually need Y." Reads the VGPUWorkloadProfile named
+# after the job.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_profile() {
+    need_kubectl
+    local name="" ns="$NS_DEFAULT"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace) ns="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            -*)             die "unknown profile flag: $1" ;;
+            *)              name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "profile requires a NAME"
+
+    kubectl get vgpuworkloadprofile "$name" -n "$ns" >/dev/null 2>&1 || die \
+        "no profile for '$name' yet — profiles appear once the node agent has
+       observed the running workload (a minute or two after it starts).
+       Check it is running:  vgpu status $name"
+
+    local requested peak recommended avg conf obs evictions adv
+    requested="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.requestedVramBytes}')"
+    peak="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.peakObservedVramBytes}')"
+    recommended="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.recommendedVramBytes}')"
+    avg="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.avgObservedVramBytes}')"
+    conf="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.confidence}')"
+    obs="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.observations}')"
+    evictions="$(kget vgpuworkloadprofile "$name" "$ns" '{.status.evictionCount}')"
+    adv="$(kget vgpuworkloadprofile "$name" "$ns" \
+        '{.status.conditions[?(@.type=="Underprovisioned")].status}')"
+
+    printf 'profile %s  (ns=%s)\n' "$name" "$ns"
+    # A profile OUTLIVES its job by design (the data loop: the next run of this
+    # workload starts informed) — but label history as history instead of
+    # rendering it as if the job were still live.
+    kubectl get vgpujob "$name" -n "$ns" >/dev/null 2>&1 || printf \
+        '  note         VGPUJob %s no longer exists — this is its SAVED history (profiles outlive jobs)\n' "$name"
+    printf '  requested    %s\n'              "$(human "${requested:-0}")"
+    printf '  peak observed%s\n'              "  $(human "${peak:-0}")"
+    printf '  avg observed %s\n'              "  $(human "${avg:-0}")"
+    if [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
+        printf '  recommended  %s   <- request this next time\n' "$(human "$recommended")"
+    else
+        printf '  recommended  (none yet — no VRAM usage observed to learn from)\n'
+    fi
+    printf '  confidence   %s  (%s observations)\n' "${conf:-<none>}" "${obs:-0}"
+    [[ "${evictions:-0}" != "0" ]] && printf '  evictions    %s\n' "$evictions"
+
+    # Best-effort: surface the cluster's enforcement mode (needs read access to the
+    # control-plane namespace; silently skipped if the caller can't see it).
+    local pmode
+    pmode="$(kubectl get deploy vgpu-controller -n vgpu-system \
+        -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VGPU_RECOMMENDATION_MODE")].value}' 2>/dev/null)"
+    [[ -n "$pmode" ]] && printf '  policy mode  %s\n' "$pmode"
+
+    if [[ "$adv" == "True" ]]; then
+        local msg
+        msg="$(kget vgpuworkloadprofile "$name" "$ns" \
+            '{.status.conditions[?(@.type=="Underprovisioned")].message}')"
+        printf '  VERDICT      UNDERPROVISIONED — %s\n' "${msg:-request is below the observed peak}"
+        printf '  next time    request %s  —  or keep this size and add --override\n' "$(human "${recommended:-0}")"
+        { [[ "$pmode" == "requireOverride" ]] && \
+            printf '               (this cluster enforces requireOverride: an undersized re-submit is rejected without --override)\n'; } || true
+    elif [[ -n "${recommended:-}" && "${recommended:-0}" != "0" ]]; then
+        printf '  VERDICT      OK — request covers the observed peak (with headroom)\n'
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# report: the read-only "GPU waste" report (the monitor-mode wedge). Scrapes the
+# monitor agents' vgpu_monitor_* metrics and prints per-pod requested-vs-used
+# VRAM, utilization, and an ESTIMATED $ waste/month. Reads metrics only — works
+# beside ANY scheduler (KAI/Volcano/vanilla); no CRDs, no mutation.
+# ─────────────────────────────────────────────────────────────────────────────
+report_scrape() { # namespace — scrape every monitor agent's :8083/metrics via API proxy
+    local ns="$1" pods p
+    # Running only: during a DaemonSet rollout the Terminating pod still answers
+    # /proxy/metrics, and duplicated series double `used` (waste collapsed to 0
+    # mid-upgrade — scan finding).
+    pods="$(kubectl get pods -n "$ns" -l app=vgpu-monitor --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    [[ -n "$pods" ]] || die "no monitor agents (label app=vgpu-monitor) in namespace '$ns' — install: kubectl apply -f deployments/monitor/"
+    for p in $pods; do
+        kubectl get --raw "/api/v1/namespaces/${ns}/pods/${p}:8083/proxy/metrics" 2>/dev/null
+    done
+}
+
+cmd_report() {
+    # Gate 3: the report as a product. One scrape → one awk that joins
+    # requested/used per pod (with node + GPU UUIDs), then renders table, CSV,
+    # or JSON from the SAME rows so the three outputs can never disagree.
+    set +e
+    local ns="vgpu-monitor" price="3.00" metrics_file="" output="table" filter_ns="" top=5
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--namespace|--monitor-ns) ns="$2"; shift 2 ;;   # where the monitor DaemonSet lives
+            --price-per-gpu-hour)  price="$2"; shift 2 ;;
+            --metrics-file)        metrics_file="$2"; shift 2 ;;  # read metrics from a file (testing)
+            -o|--output)           output="$2"; shift 2 ;;        # table | csv | json
+            --filter-ns)           filter_ns="$2"; shift 2 ;;     # only workloads in this namespace
+            --top)                 top="$2"; shift 2 ;;           # size of the top-wasters lists
+            -h|--help)             usage; exit 0 ;;
+            *)                     die "unknown report flag: $1" ;;
+        esac
+    done
+    case "$output" in table|csv|json) ;; *) die "--output must be table, csv, or json" ;; esac
+
+    local metrics
+    if [[ -n "$metrics_file" ]]; then
+        [[ -f "$metrics_file" ]] || die "metrics file not found: $metrics_file"
+        metrics="$(grep '^vgpu_monitor_' "$metrics_file" || true)"
+    else
+        need_kubectl
+        metrics="$(report_scrape "$ns" | grep '^vgpu_monitor_' || true)"
+    fi
+    [[ -n "$metrics" ]] || die "no vgpu_monitor_* metrics found (is the monitor DaemonSet installed in ns '$ns'? see docs/monitor-mode.md)"
+
+    # Pod-less committed grants (dogfood find #11): gang members and claim-only
+    # holds have NO pod, so pod-based metrics cannot see their committed VRAM —
+    # the report once said "$0 wasted" while 18Gi sat committed to a gang.
+    # Best-effort CRD read; silently empty on monitor-only clusters (no CRDs /
+    # no RBAC). NEVER folded into the totals (they must keep matching the
+    # dashboard's pod-based numbers) — rendered as a clearly-labeled addendum.
+    local podless_list="" podless_bytes=0 podless_count=0
+    if command -v kubectl >/dev/null 2>&1; then
+        local _podded _claims _cns _cnm _cby _cph
+        _podded=$'\n'"$(kubectl get pods -A -l vgpu-claim -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.labels.vgpu-claim}{"\n"}{end}' 2>/dev/null)"$'\n'
+        _claims="$(kubectl get vgpuclaim -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.spec.requestedVramBytes}{"|"}{.status.phase}{"\n"}{end}' 2>/dev/null)"
+        while IFS='|' read -r _cns _cnm _cby _cph; do
+            [[ -n "$_cns" && "$_cph" == "Bound" ]] || continue
+            [[ -n "$filter_ns" && "$_cns" != "$filter_ns" ]] && continue
+            [[ "$_podded" == *$'\n'"$_cns/$_cnm"$'\n'* ]] && continue
+            podless_list+="${_cns}/${_cnm}|${_cby};"
+            podless_bytes=$((podless_bytes + _cby)); podless_count=$((podless_count + 1))
+        done <<< "$_claims"
+    fi
+
+    # Optional team map: "ns=team,ns2=team2". Live clusters derive it from the
+    # namespace label (VGPU_TEAM_LABEL, default "team"); tests inject VGPU_TEAM_MAP.
+    local team_map="${VGPU_TEAM_MAP:-}"
+    if [[ -z "$team_map" && -z "$metrics_file" ]]; then
+        local tl="${VGPU_TEAM_LABEL:-team}"
+        team_map="$(kubectl get namespaces -o jsonpath="{range .items[*]}{.metadata.name}={.metadata.labels.$tl},{end}" 2>/dev/null \
+            | tr ',' '\n' | grep -vE '=$|^$' | paste -sd, - 2>/dev/null)"
+    fi
+
+    printf '%s\n' "$metrics" | awk -v price="$price" -v output="$output" -v filter_ns="$filter_ns" \
+                                   -v topn="$top" -v team_map="$team_map" \
+                                   -v podless_count="$podless_count" -v podless_bytes="$podless_bytes" -v podless_list="$podless_list" '
+        function lbl(line, name,   re, m) {
+            re = name "=\"[^\"]*\""
+            if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub(name "=\"", "", m); sub("\"$", "", m); return m }
+            return ""
+        }
+        function val(line,   n) { n = line; sub(/^[^ ]+ /, "", n); return n + 0 }
+        function gib(b) { return sprintf("%.1f", b / 1073741824) }
+        BEGIN {
+            nteams = split(team_map, tm_pairs, ",")
+            for (i = 1; i <= nteams; i++) {
+                split(tm_pairs[i], kv, "=")
+                if (kv[1] != "") team_of[kv[1]] = kv[2]
+            }
+        }
+        /^vgpu_monitor_pod_requested_vram_bytes\{/ {
+            k = lbl($0,"namespace") "/" lbl($0,"pod")
+            req[k] = val($0); src[k] = lbl($0,"source"); nodeof[k] = lbl($0,"node"); seen[k] = 1
+        }
+        /^vgpu_monitor_pod_used_vram_bytes\{/ {
+            k = lbl($0,"namespace") "/" lbl($0,"pod")
+            used[k] += val($0); seen[k] = 1
+            if (nodeof[k] == "") nodeof[k] = lbl($0,"node")
+            u = lbl($0,"gpu_uuid")
+            if (u != "" && index(uuids[k], u) == 0) uuids[k] = (uuids[k] == "" ? u : uuids[k] ";" u)
+        }
+        /^vgpu_monitor_gpu_total_vram_bytes\{/ { v = val($0); gtotal += v; if (v > card) card = v }
+        END {
+            # ── one pass: rows + aggregates (identical for every output mode) ──
+            n = 0
+            for (k in seen) {
+                split(k, parts, "/"); kns = parts[1]
+                if (filter_ns != "" && kns != filter_ns) continue
+                r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                ut = (r > 0) ? (u * 100.0 / r) : 0
+                treq += r; tused += u; twaste += w
+                n++; key[n] = k; kw[n] = w
+                nsreq[kns] += r; nsused[kns] += u; nswaste[kns] += w
+                t = (kns in team_of) ? team_of[kns] : ""
+                if (t != "") { teamreq[t] += r; teamused[t] += u; teamwaste[t] += w; have_teams = 1 }
+            }
+            # order row indices by waste desc (simple selection sort; n is small)
+            for (i = 1; i <= n; i++) order[i] = i
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
+                if (kw[order[j]] > kw[order[i]]) { tmp = order[i]; order[i] = order[j]; order[j] = tmp }
+            ut_all = (treq > 0) ? (tused * 100.0 / treq) : 0
+            cards  = (card > 0) ? (twaste / card) : 0
+            permo  = cards * price * 730.0
+
+            # ── CSV ──────────────────────────────────────────────────────────
+            if (output == "csv") {
+                print "namespace,pod,node,gpu_uuids,source,requested_bytes,used_bytes,waste_bytes,utilization_pct,team"
+                for (i = 1; i <= n; i++) {
+                    k = key[order[i]]; split(k, parts, "/")
+                    r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                    ut = (r > 0) ? (u * 100.0 / r) : 0
+                    t = (parts[1] in team_of) ? team_of[parts[1]] : ""
+                    printf "%s,%s,%s,%s,%s,%.0f,%.0f,%.0f,%.1f,%s\n", parts[1], parts[2], nodeof[k], uuids[k], (src[k]==""?"unknown":src[k]), r, u, w, ut, t
+                }
+                printf "_total_,,,,,%.0f,%.0f,%.0f,%.1f,\n", treq, tused, twaste, ut_all
+                exit
+            }
+            # ── JSON ─────────────────────────────────────────────────────────
+            if (output == "json") {
+                printf "{\n  \"price_per_gpu_hour\": %s,\n  \"pods\": [", price
+                for (i = 1; i <= n; i++) {
+                    k = key[order[i]]; split(k, parts, "/")
+                    r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                    ut = (r > 0) ? (u * 100.0 / r) : 0
+                    t = (parts[1] in team_of) ? team_of[parts[1]] : ""
+                    printf "%s\n    {\"namespace\": \"%s\", \"pod\": \"%s\", \"node\": \"%s\", \"gpu_uuids\": \"%s\", \"source\": \"%s\", \"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"team\": \"%s\"}", (i>1?",":""), parts[1], parts[2], nodeof[k], uuids[k], (src[k]==""?"unknown":src[k]), r, u, w, ut, t
+                }
+                printf "\n  ],\n  \"namespaces\": ["
+                first = 1
+                for (kns in nsreq) {
+                    printf "%s\n    {\"namespace\": \"%s\", \"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f}", (first?"":","), kns, nsreq[kns], nsused[kns], nswaste[kns]
+                    first = 0
+                }
+                printf "\n  ],\n  \"podless_grants\": {\"count\": %d, \"total_bytes\": %.0f, \"claims\": [", podless_count, podless_bytes
+                pn = split(podless_list, pl, ";"); first = 1
+                for (i = 1; i <= pn; i++) {
+                    if (pl[i] == "") continue
+                    split(pl[i], pp, "|")
+                    printf "%s{\"claim\": \"%s\", \"requested_bytes\": %s}", (first?"":", "), pp[1], pp[2]
+                    first = 0
+                }
+                printf "]},\n  \"totals\": {\"requested_bytes\": %.0f, \"used_bytes\": %.0f, \"waste_bytes\": %.0f, \"utilization_pct\": %.1f, \"estimated_waste_per_month_usd\": %.0f, \"cards_idle_equivalent\": %.2f}\n}\n", treq, tused, twaste, ut_all, permo, cards
+                exit
+            }
+            # ── table (default) ──────────────────────────────────────────────
+            print ""
+            print "Cluster GPU Waste Report  (read-only — no scheduling, no mutation, no eviction)"
+            if (filter_ns != "") printf "  [filtered to namespace: %s]\n", filter_ns
+            print ""
+            printf "  %-26s %12s %12s %12s %6s  %s\n", "WORKLOAD (ns/pod)", "REQUESTED", "USED", "WASTE", "UTIL", "SOURCE"
+            for (i = 1; i <= n; i++) {
+                k = key[order[i]]
+                r = req[k] + 0; u = used[k] + 0; w = (r > u) ? r - u : 0
+                ut = (r > 0) ? (u * 100.0 / r) : 0
+                printf "  %-26s %9s GiB %9s GiB %9s GiB %5.0f%%  %s\n", k, gib(r), gib(u), gib(w), ut, (src[k] == "" ? "unknown" : src[k])
+            }
+            if (n == 0) print "  (no pod-attached GPU workloads observed" (filter_ns != "" ? " in namespace " filter_ns : "") (podless_count > 0 ? " — but committed grants exist, see below" : " yet") ")"
+            print ""
+            # top wasting pods
+            shown = 0
+            for (i = 1; i <= n && shown < topn; i++) {
+                k = key[order[i]]
+                if (kw[order[i]] <= 0) break
+                if (shown == 0) print "  Top wasting pods:"
+                shown++
+                printf "    %d. %-30s %8s GiB wasted\n", shown, k, gib(kw[order[i]])
+            }
+            # top wasting namespaces
+            m = 0
+            for (kns in nsreq) { m++; nk[m] = kns }
+            for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++)
+                if (nswaste[nk[j]] > nswaste[nk[i]]) { tmp = nk[i]; nk[i] = nk[j]; nk[j] = tmp }
+            shown = 0
+            for (i = 1; i <= m && shown < topn; i++) {
+                if (nswaste[nk[i]] <= 0) break
+                if (shown == 0) print "  Top wasting namespaces:"
+                shown++
+                printf "    %d. %-30s %8s GiB wasted\n", shown, nk[i], gib(nswaste[nk[i]])
+            }
+            if (have_teams) {
+                tn = 0
+                for (t in teamwaste) { tn++; tk[tn] = t }
+                for (i = 1; i <= tn; i++) for (j = i + 1; j <= tn; j++)
+                    if (teamwaste[tk[j]] > teamwaste[tk[i]]) { tmp = tk[i]; tk[i] = tk[j]; tk[j] = tmp }
+                shown = 0
+                for (i = 1; i <= tn && shown < topn; i++) {
+                    if (teamwaste[tk[i]] <= 0) break
+                    if (shown == 0) print "  Top wasting teams (namespace label):"
+                    shown++
+                    printf "    %d. %-30s %8s GiB wasted\n", shown, tk[i], gib(teamwaste[tk[i]])
+                }
+            }
+            print ""
+            printf "  GPU memory requested:     %s GiB\n", gib(treq)
+            printf "  GPU memory actually used: %s GiB\n", gib(tused)
+            printf "  Estimated waste:          %s GiB\n", gib(twaste)
+            printf "  Utilization:              %.1f%%\n", ut_all
+            printf "  Estimated waste/month:    $%.0f   (at $%.2f/GPU-hr, ~%.2f cards idle)\n", permo, price, cards
+            if (podless_count > 0) {
+                print ""
+                print "  Committed grants WITHOUT pods (gang members / claim-only holds — NOT in the totals above):"
+                pn = split(podless_list, pl, ";"); shown = 0
+                for (i = 1; i <= pn; i++) {
+                    if (pl[i] == "") continue
+                    split(pl[i], pp, "|")
+                    if (shown < 4) printf "    %-38s %8s GiB\n", pp[1], gib(pp[2])
+                    shown++
+                }
+                if (shown > 4) printf "    ...and %d more\n", shown - 4
+                printf "    TOTAL committed, pod-less:             %8s GiB across %d claim(s)\n", gib(podless_bytes), podless_count
+            }
+            print ""
+            print "  Estimated, not guaranteed savings. Read-only; runs alongside Kubernetes, KAI, Volcano, or Slurm-on-K8s."
+        }'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# install / uninstall / doctor / support-bundle — the "platform team" verbs.
+# Monitor mode only for now: it is the zero-risk front door, and its uninstall
+# is VERIFIED (the ClusterRole/Binding are cluster-scoped, so a naive
+# namespace-delete silently leaves them behind — the exact residue these verbs
+# exist to prevent).
+# ─────────────────────────────────────────────────────────────────────────────
+
+MONITOR_NS="vgpu-monitor"
+MONITOR_RAW_URL="https://raw.githubusercontent.com/pranav2910/vgpu_scheduler/main/deployments/monitor/monitor.yaml"
+
+# monitor_manifest: repo-local file when running from a checkout, else the
+# pinned raw URL (downloaded to a temp file so kubectl sees a real path).
+monitor_manifest() {
+    local override="$1"
+    if [[ -n "$override" ]]; then
+        [[ -f "$override" ]] || die "manifest not found: $override"
+        printf '%s' "$override"; return
+    fi
+    local local_path
+    local_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/deployments/monitor/monitor.yaml"
+    if [[ -f "$local_path" ]]; then printf '%s' "$local_path"; return; fi
+    local tmp; tmp="$(mktemp /tmp/vgpu-monitor.XXXXXX.yaml)"
+    curl -fsSL "$MONITOR_RAW_URL" -o "$tmp" || die "no local manifest and download failed: $MONITOR_RAW_URL"
+    printf '%s' "$tmp"
+}
+
+cmd_install() {
+    need_kubectl
+    local what="${1:-}"; shift || true
+    [[ "$what" == "monitor" ]] || die "usage: vgpu install monitor  (full-stack install: make install from a repo checkout)"
+    local no_wait=0 manifest=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-wait)  no_wait=1; shift ;;
+            --manifest) manifest="$2"; shift 2 ;;
+            -h|--help)  usage; exit 0 ;;
+            *)          die "unknown install flag: $1" ;;
+        esac
+    done
+    local mf; mf="$(monitor_manifest "$manifest")"
+    printf 'installing monitor mode from %s\n' "$mf"
+    kubectl apply -f "$mf" || die "kubectl apply failed"
+    printf '  applied: Namespace/%s, ServiceAccount, ClusterRole, ClusterRoleBinding, DaemonSet\n' "$MONITOR_NS"
+    (( no_wait )) && { printf '  --no-wait: not waiting for rollout. Check with: vgpu doctor\n'; return 0; }
+    printf '  waiting up to 90s for the monitor DaemonSet to become ready...\n'
+    if kubectl rollout status ds/vgpu-monitor -n "$MONITOR_NS" --timeout=90s >/dev/null 2>&1; then
+        printf '  monitor is READY on %s node(s). Next:  vgpu report\n' \
+            "$(kubectl get ds vgpu-monitor -n "$MONITOR_NS" -o jsonpath='{.status.numberReady}' 2>/dev/null)"
+    else
+        printf '  monitor NOT ready yet — diagnosing is one command away:\n' >&2
+        printf '     vgpu doctor\n' >&2
+        printf '  (most common cause: the vgpu-nodeagent:nvml image is not built/imported on the node)\n' >&2
+        exit 1
+    fi
+}
+
+cmd_uninstall() {
+    need_kubectl
+    local what="${1:-}"
+    [[ "$what" == "monitor" ]] || die "usage: vgpu uninstall monitor  (full stack: make uninstall/undeploy from a repo checkout)"
+    printf 'removing monitor mode (all 5 resources, incl. cluster-scoped RBAC)...\n'
+    kubectl delete daemonset/vgpu-monitor -n "$MONITOR_NS" --ignore-not-found >/dev/null 2>&1
+    kubectl delete serviceaccount/vgpu-monitor -n "$MONITOR_NS" --ignore-not-found >/dev/null 2>&1
+    kubectl delete clusterrolebinding/vgpu-monitor-readonly --ignore-not-found >/dev/null 2>&1
+    kubectl delete clusterrole/vgpu-monitor-readonly --ignore-not-found >/dev/null 2>&1
+    kubectl delete namespace/"$MONITOR_NS" --ignore-not-found >/dev/null 2>&1
+    printf '  waiting for the namespace to terminate...\n'
+    local waited=0
+    while kubectl get namespace "$MONITOR_NS" >/dev/null 2>&1; do
+        sleep 3; waited=$((waited+3))
+        (( waited >= 120 )) && break
+    done
+    # VERIFY: nothing left. This is the enterprise-grade part — every resource
+    # is checked gone, including the cluster-scoped ones a namespace delete
+    # would have silently orphaned.
+    local residue=0
+    kubectl get namespace "$MONITOR_NS"                    >/dev/null 2>&1 && { printf '  ✗ namespace still present (stuck finalizer?)\n' >&2; residue=1; }
+    kubectl get clusterrole vgpu-monitor-readonly          >/dev/null 2>&1 && { printf '  ✗ ClusterRole left behind\n' >&2; residue=1; }
+    kubectl get clusterrolebinding vgpu-monitor-readonly   >/dev/null 2>&1 && { printf '  ✗ ClusterRoleBinding left behind\n' >&2; residue=1; }
+    if (( residue )); then
+        printf 'uninstall INCOMPLETE — see above.\n' >&2; exit 1
+    fi
+    printf '  verified: namespace, DaemonSet, ServiceAccount, ClusterRole, ClusterRoleBinding all gone.\n'
+    printf 'monitor mode fully removed. Your workloads were never touched.\n'
+}
+
+# doctor: read-only diagnosis. Prints ✓/!/✗ per check with a concrete fix for
+# every failure. Exit code = number of hard failures.
+cmd_doctor() {
+    # Diagnosis tolerates failing probes and reports them as findings; it must
+    # not abort mid-scan on the first non-zero kubectl. Manages its own exit code.
+    set +e
+    local fails=0 warns=0
+    okc()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+    warnc() { printf '  \033[1;33m!\033[0m %s\n' "$*"; warns=$((warns+1)); }
+    badc()  { printf '  \033[1;31m✗\033[0m %s\n' "$*"; fails=$((fails+1)); }
+
+    printf 'vgpu doctor — %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '─ kubectl + cluster\n'
+    if ! have kubectl; then
+        badc "kubectl not found on PATH — install kubectl and set KUBECONFIG"
+        printf '\n%d failure(s).\n' "$fails"; exit 1
+    fi
+    okc "kubectl present"
+    local ctx; ctx="$(kubectl config current-context 2>/dev/null)"
+    if [[ -z "$ctx" ]]; then
+        badc "no current kubectl context — export KUBECONFIG=<your kubeconfig>"
+        printf '\n%d failure(s).\n' "$fails"; exit 1
+    fi
+    okc "context: $ctx"
+    if kubectl get --raw /readyz >/dev/null 2>&1; then
+        okc "API server reachable"
+    else
+        badc "API server unreachable — is the cluster up? does your kubeconfig point at it?"
+        printf '\n%d failure(s).\n' "$fails"; exit "$fails"
+    fi
+
+    printf '\n─ GPU nodes\n'
+    local gpu_nodes
+    gpu_nodes="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" gpu="}{.status.capacity.nvidia\.com/gpu}{" vgpu="}{.status.capacity.infrastructure\.pranav2910\.com/vgpu-bytes}{"\n"}{end}' 2>/dev/null | grep -vE 'gpu= vgpu=$' )"
+    if [[ -n "$gpu_nodes" ]]; then
+        okc "GPU-capable node(s):"
+        printf '%s\n' "$gpu_nodes" | sed 's/^/      /'
+    else
+        warnc "no node advertises nvidia.com/gpu or vgpu-bytes capacity — on a plain-pod cluster the monitor still works (it reads NVML directly); the full scheduler needs the node agent to advertise capacity"
+    fi
+    if kubectl get runtimeclass nvidia >/dev/null 2>&1; then
+        okc "RuntimeClass 'nvidia' exists"
+    else
+        warnc "RuntimeClass 'nvidia' missing — the monitor DaemonSet requests it; on clusters where the NVIDIA runtime is the containerd default, edit monitor.yaml to drop runtimeClassName"
+    fi
+
+    printf '\n─ monitor mode\n'
+    if ! kubectl get namespace "$MONITOR_NS" >/dev/null 2>&1; then
+        warnc "monitor not installed — install with: vgpu install monitor"
+    else
+        local desired ready
+        desired="$(kubectl get ds vgpu-monitor -n "$MONITOR_NS" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)"
+        ready="$(kubectl get ds vgpu-monitor -n "$MONITOR_NS" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)"
+        if [[ -z "$desired" || "$desired" == "0" ]]; then
+            badc "monitor DaemonSet present but scheduled on 0 nodes — check node taints/selectors"
+        elif [[ "$ready" == "$desired" ]]; then
+            okc "monitor DaemonSet ready ($ready/$desired node(s))"
+        else
+            badc "monitor DaemonSet NOT ready ($ready/$desired)"
+            local pod reason
+            pod="$(kubectl get pods -n "$MONITOR_NS" -l app=vgpu-monitor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+            if [[ -z "$pod" ]]; then
+                # No pods AT ALL: the DS controller's create was rejected at
+                # admission (e.g. a nonexistent RuntimeClass). The reason lives
+                # in the DaemonSet's own events, not on any pod.
+                local dsmsg
+                dsmsg="$(kubectl get events -n "$MONITOR_NS" --field-selector involvedObject.name=vgpu-monitor \
+                    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null | grep -v '^$' | tail -1)"
+                printf '      cause: DaemonSet cannot create pods: %s\n' "${dsmsg:-see kubectl describe ds -n $MONITOR_NS vgpu-monitor}"
+                if printf '%s' "$dsmsg" | grep -qi 'RuntimeClass'; then
+                    printf '      fix:   this cluster has no "nvidia" RuntimeClass. Either install the NVIDIA\n'
+                    printf '             container toolkit (k3s/GPU nodes), or for clusters where nvidia is the\n'
+                    printf '             default runtime (or non-GPU test clusters), remove the runtimeClassName\n'
+                    printf '             line:  kubectl patch ds vgpu-monitor -n %s --type=json \\\n' "$MONITOR_NS"
+                    printf '                      -p '"'"'[{"op":"remove","path":"/spec/template/spec/runtimeClassName"}]'"'"'\n'
+                fi
+            else
+            reason="$(kubectl get pods -n "$MONITOR_NS" -l app=vgpu-monitor -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)"
+            case "$reason" in
+                ErrImageNeverPull|ImagePullBackOff|ErrImagePull)
+                    printf '      cause: image %s not present on the node\n' "$(kubectl get ds vgpu-monitor -n "$MONITOR_NS" -o jsonpath='{.spec.template.spec.containers[0].image}')"
+                    printf '      fix:   build + import it on each GPU node:\n'
+                    printf '             make docker-build-nodeagent-nvml && docker save vgpu-nodeagent:nvml | sudo k3s ctr images import -\n'
+                    printf '             (kind: make docker-build && kind load docker-image vgpu-nodeagent:latest)\n' ;;
+                CrashLoopBackOff)
+                    printf '      cause: agent crash-looping — inspect:\n'
+                    printf '             kubectl logs -n %s %s --previous | tail -30\n' "$MONITOR_NS" "$pod" ;;
+                *)
+                    printf '      inspect: kubectl describe pod -n %s %s\n' "$MONITOR_NS" "$pod" ;;
+            esac
+            fi
+        fi
+        # metrics probe: proves `vgpu report` will have data
+        local pods p have_metrics=0
+        pods="$(kubectl get pods -n "$MONITOR_NS" -l app=vgpu-monitor --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+        for p in $pods; do
+            if kubectl get --raw "/api/v1/namespaces/${MONITOR_NS}/pods/${p}:8083/proxy/metrics" 2>/dev/null | grep -q '^vgpu_monitor_'; then
+                have_metrics=1; break
+            fi
+        done
+        if [[ -n "$pods" ]]; then
+            if (( have_metrics )); then okc "monitor metrics responding — 'vgpu report' will work"
+            else badc "monitor pods Running but no vgpu_monitor_* metrics yet — NVML may have failed to init (check: kubectl logs -n $MONITOR_NS <pod> | grep -i nvml)"; fi
+        fi
+    fi
+
+    printf '\n─ full vGPU stack (optional — monitor works without it)\n'
+    if ! kubectl get namespace vgpu-system >/dev/null 2>&1; then
+        warnc "full stack not installed (that's fine for monitor-only). Install: make install from a repo checkout"
+    else
+        local comp
+        for comp in vgpu-scheduler vgpu-controller; do
+            if ! kubectl get deploy "$comp" -n vgpu-system >/dev/null 2>&1; then
+                warnc "$comp not installed (agent-only setup — fine for monitor/enforcement without scheduling)"
+                continue
+            fi
+            local r a
+            r="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
+            a="$(kubectl get deploy "$comp" -n vgpu-system -o jsonpath='{.spec.replicas}' 2>/dev/null)"
+            [[ -n "$r" && "$r" == "$a" ]] && okc "$comp ready ($r/$a)" || badc "$comp not ready (${r:-0}/${a:-?}) — kubectl logs -n vgpu-system deploy/$comp"
+        done
+        local crds
+        crds="$(kubectl get crd -o name 2>/dev/null | grep -c 'infrastructure.pranav2910.com' || true)"
+        [[ "$crds" -ge 6 ]] && okc "CRDs installed ($crds)" || badc "only $crds vGPU CRDs found (expect 6+) — kubectl apply -f deployments/manifests/crds/"
+    fi
+
+    printf '\n%d failure(s), %d warning(s).\n' "$fails" "$warns"
+    exit "$fails"
+}
+
+# support-bundle: everything a maintainer needs to debug remotely — with NO
+# Secrets collected and password/token/key-looking env values redacted.
+cmd_support_bundle() {
+    need_kubectl
+    # A diagnostics collector must survive any single failing probe (a missing
+    # namespace, a pod with no previous container, an RBAC-denied get). The CLI
+    # runs under `set -e`; turn it off here so one non-zero kubectl doesn't
+    # abort the whole bundle. Every step already tolerates failure via `|| true`.
+    set +e
+    local out=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --out) out="$2"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown support-bundle flag: $1" ;;
+        esac
+    done
+    local ts dir
+    ts="$(date -u +%Y%m%d-%H%M%S)"
+    [[ -n "$out" ]] || out="vgpu-support-bundle-${ts}.tgz"
+    dir="$(mktemp -d /tmp/vgpu-bundle.XXXXXX)"
+    printf 'collecting (read-only; no Secrets are ever read)...\n'
+
+    redact() { sed -E 's/(password|token|secret|apikey|api_key|key)([=: "]+)[^ ",}]+/\1\2[REDACTED]/Ig'; }
+
+    kubectl version 2>/dev/null                >"$dir/version.txt" || true
+    kubectl get nodes -o wide 2>/dev/null      >"$dir/nodes.txt" || true
+    kubectl describe nodes 2>/dev/null | redact >"$dir/nodes-describe.txt" || true
+    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -200 >"$dir/events.txt" || true
+
+    local ns
+    for ns in "$MONITOR_NS" vgpu-system; do
+        kubectl get namespace "$ns" >/dev/null 2>&1 || continue
+        mkdir -p "$dir/$ns"
+        kubectl get all -n "$ns" -o wide 2>/dev/null              >"$dir/$ns/all.txt" || true
+        kubectl get ds,deploy -n "$ns" -o yaml 2>/dev/null | redact >"$dir/$ns/workloads.yaml" || true
+        local p
+        for p in $(kubectl get pods -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+            kubectl logs -n "$ns" "$p" --tail=400 2>/dev/null | redact >"$dir/$ns/log-$p.txt" || true
+            kubectl logs -n "$ns" "$p" --tail=100 --previous 2>/dev/null | redact >"$dir/$ns/log-$p.previous.txt" || true
+        done
+    done
+    # vGPU CRs (if the full stack's CRDs exist)
+    if kubectl get crd vgpuslices.infrastructure.pranav2910.com >/dev/null 2>&1; then
+        kubectl get vgpujobs,vgpuclaims,vgpuslices,vgpugangjobs,vgpugangreservations -A -o yaml 2>/dev/null \
+            | redact >"$dir/vgpu-resources.yaml" || true
+    fi
+    # monitor metrics snapshot
+    local mp
+    mp="$(kubectl get pods -n "$MONITOR_NS" -l app=vgpu-monitor --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+    [[ -n "$mp" ]] && kubectl get --raw "/api/v1/namespaces/${MONITOR_NS}/pods/${mp}:8083/proxy/metrics" 2>/dev/null \
+        | grep '^vgpu_' >"$dir/monitor-metrics.txt" || true
+
+    tar -czf "$out" -C "$(dirname "$dir")" "$(basename "$dir")" || die "tar failed"
+    rm -rf "$dir"
+    printf 'wrote %s\n' "$out"
+    printf '  contents: versions, nodes, events, vgpu workloads+logs (redacted), CRs, monitor metrics\n'
+    printf '  redaction: no Secrets collected; env values matching password/token/key are [REDACTED]\n'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# security audit: print the honest blast radius — and VERIFY every permission
+# claim against the LIVE cluster RBAC, so the printout can never drift from
+# reality. Read-only.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_security() {
+    local sub="${1:-}"; shift || true
+    [[ "$sub" == "audit" ]] || die "usage: vgpu security audit"
+    need_kubectl
+    set +e
+    local fails=0
+    okc()  { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+    badc() { printf '  \033[1;31m✗\033[0m %s\n' "$*"; fails=$((fails+1)); }
+
+    printf 'vgpu security audit — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '\n─ monitor mode (the read-only wedge)\n'
+    if ! kubectl get namespace "$MONITOR_NS" >/dev/null 2>&1; then
+        printf '  (not installed — static facts below describe what WOULD be deployed)\n'
+    fi
+    cat <<'EOF'
+  Mode:            monitor (observe/attribute/report only)
+  Mutates pods:    no
+  Evicts pods:     no
+  Creates CRDs:    no
+  Schedules:       no  (runs BESIDE your scheduler)
+  External egress: none (metrics are scraped FROM it; it calls only the k8s API)
+  Data collected:  pod names/namespaces + GPU memory requested/used. No Secrets,
+                   no env values, no container images' contents.
+  Host access:     hostPID (PID→pod attribution) + /dev + privileged
+                   → the AGENT POD IS NODE-ROOT. "Read-only" means read-only to
+                   your CLUSTER (one RBAC verb set), not an unprivileged process
+                   — same trade every GPU telemetry agent (DCGM etc.) makes.
+EOF
+    # ── live verification: the RBAC on the cluster must equal the claim ──────
+    if kubectl get clusterrole vgpu-monitor-readonly >/dev/null 2>&1; then
+        printf '\n  live RBAC verification (clusterrole/vgpu-monitor-readonly):\n'
+        local rules
+        rules="$(kubectl get clusterrole vgpu-monitor-readonly -o jsonpath='{range .rules[*]}{.apiGroups}{"|"}{.resources}{"|"}{.verbs}{"\n"}{end}' 2>/dev/null)"
+        printf '%s\n' "$rules" | sed 's/^/      /'
+        local nrules
+        nrules="$(printf '%s\n' "$rules" | grep -c '|')"
+        if [[ "$nrules" == "1" ]] && printf '%s' "$rules" | grep -qE '^\[""\]\|\["pods"\]\|\["get","list","watch"\]$'; then
+            okc "LIVE RBAC MATCHES THE CLAIM: exactly pods get/list/watch, nothing else"
+        else
+            badc "LIVE RBAC DIFFERS FROM THE CLAIM ABOVE — someone changed the ClusterRole; re-apply deployments/monitor/monitor.yaml and investigate"
+        fi
+        # No write verbs anywhere in the role
+        if printf '%s' "$rules" | grep -qE 'create|update|patch|delete|deletecollection|impersonate|escalate|bind'; then
+            badc "write/escalation verbs found in the monitor role"
+        else
+            okc "no write, delete, impersonate, escalate, or bind verbs"
+        fi
+    else
+        printf '  (clusterrole not present — live verification skipped; install first for a verified audit)\n'
+    fi
+
+    printf '\n─ full stack (only if installed)\n'
+    if kubectl get namespace vgpu-system >/dev/null 2>&1; then
+        cat <<'EOF'
+  Scheduler/controller: distroless, non-root, leader-elected. Mutating webhook
+    injects GPU devices ONLY into pods carrying the vgpu-claim label; validating
+    webhooks enforce VRAM bounds/immutability/gang invariants.
+  Node agent: privileged DaemonSet (NVML + CDI + cgroup attribution) = node-root
+    on GPU nodes. Enforcement default is softwarn (never destructive); eviction
+    is opt-in (VGPU_ENFORCEMENT_MODE=evict) via the PDB-respecting Eviction API,
+    exemptible ONLY by namespace label (a pod cannot self-exempt).
+  Isolation: SOFT governance (observe→warn→opt-in evict→right-size). NOT
+    hardware memory-fencing; MIG-backed hard isolation is roadmap. Fit for
+    trusted single-tenant clusters, NOT hostile multi-tenancy.
+EOF
+        # quick live checks on the stack's own claims
+        local sec
+        sec="$(kubectl get deploy vgpu-scheduler -n vgpu-system -o jsonpath='{.spec.template.spec.securityContext.runAsNonRoot}' 2>/dev/null)"
+        [[ "$sec" == "true" ]] && okc "scheduler runs runAsNonRoot=true" || printf '  ! scheduler runAsNonRoot not set to true (check deployment)\n'
+    else
+        printf '  (not installed)\n'
+    fi
+
+    printf '\n─ verdict\n'
+    if (( fails == 0 )); then
+        printf '  every verifiable claim matches the live cluster. Full write-up: docs/SECURITY.md\n'
+    else
+        printf '  %d MISMATCH(ES) between claims and live state — treat as an incident.\n' "$fails"
+    fi
+    exit "$fails"
+}
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+sub="$1"; shift
+case "$sub" in
+    submit)         cmd_submit  "$@" ;;
+    status)         cmd_status  "$@" ;;
+    profile)        cmd_profile "$@" ;;
+    report)         cmd_report  "$@" ;;
+    install)        cmd_install "$@" ;;
+    uninstall)      cmd_uninstall "$@" ;;
+    doctor)         cmd_doctor  "$@" ;;
+    support-bundle) cmd_support_bundle "$@" ;;
+    security)       cmd_security "$@" ;;
+    version|--version|-v) printf 'vgpu %s\n' "$VGPU_VERSION" ;;
+    -h|--help|help) usage ;;
+    *)             die "unknown command '$sub' (try: submit, status, profile, report, install, uninstall, doctor, support-bundle, version)" ;;
+esac

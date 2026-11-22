@@ -1,0 +1,25 @@
+# Cheap filler work that YIELDS: low priority + preemptible. If a job with
+# priority >= 110 (gap of 100) needs the space, this one is evicted — with
+# 30s of grace to checkpoint. Anything below priority 110 must wait instead.
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: nightly-embed-backfill
+spec:
+  priority: 10
+  workloadClass: Batch
+  preemptible: true
+  preemptionGraceSeconds: 30               # time to checkpoint before eviction
+  claimTemplate:
+    spec:
+      requestedVramBytes: 25769803776      # 24 GiB
+      serviceTier: BestEffort
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+      - name: workload
+        image: my-batch:latest
+        command: ["/bin/sh","-c"]
+        args: ["python backfill.py --resume-from-checkpoint"]

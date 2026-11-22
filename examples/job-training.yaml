@@ -1,0 +1,28 @@
+# A normal training job: 16 GiB slice + the container to run.
+# The controller owns the pod: once the slice is allocated it creates
+# "train-llama-workload" pinned to the assigned physical GPU.
+# CLI equivalent:
+#   vgpu submit --name train-llama --vram 16Gi \
+#     --image pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime \
+#     --command 'python train.py' --runtime-class nvidia
+apiVersion: infrastructure.pranav2910.com/v1alpha1
+kind: VGPUJob
+metadata:
+  name: train-llama
+  namespace: default
+spec:
+  priority: 50
+  workloadClass: Training
+  claimTemplate:
+    spec:
+      requestedVramBytes: 17179869184      # 16 GiB
+      serviceTier: Guaranteed
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia             # required on real GPU nodes; drop on kind
+      containers:
+      - name: workload
+        image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+        command: ["/bin/sh","-c"]
+        args: ["python train.py"]

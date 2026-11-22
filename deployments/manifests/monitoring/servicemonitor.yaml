@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vgpu-scheduler-monitor
+  namespace: default
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      control-plane: vgpu-scheduler
+  endpoints:
+  - port: metrics
+    interval: 5s
+    path: /metrics
